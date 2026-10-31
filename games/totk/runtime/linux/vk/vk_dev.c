@@ -171,14 +171,15 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     VKCHECK(vkBindBufferMemory(V.dev, o->buf, o->mem, 0));
     pthread_mutex_lock(&g_pool_mu);
     if (g_npool == g_cappool) { g_cappool = g_cappool ? g_cappool * 2 : 256; g_pools = realloc(g_pools, g_cappool * sizeof *g_pools); }
-    g_pools[g_npool++] = *o; free(o);
+    int at = g_npool; while (at > 0 && g_pools[at - 1].lo > o->lo) { g_pools[at] = g_pools[at - 1]; at--; }   /* sorted by address */
+    g_pools[at] = *o; g_npool++; free(o);
     pthread_mutex_unlock(&g_pool_mu);
 }
 void mtl_pool_del(const void *mem) {
     pthread_mutex_lock(&g_pool_mu);
     for (int i = 0; i < g_npool; i++) if (g_pools[i].lo == (uintptr_t)mem) {
         void vk_tex_release_range(uintptr_t lo, uintptr_t hi); vk_tex_release_range(g_pools[i].lo, g_pools[i].hi);
-        vk_pool *o = malloc(sizeof *o); *o = g_pools[i]; g_pools[i] = g_pools[--g_npool];
+        vk_pool *o = malloc(sizeof *o); *o = g_pools[i]; memmove(&g_pools[i], &g_pools[i + 1], (g_npool - i - 1) * sizeof *g_pools); g_npool--;
         pthread_mutex_unlock(&g_pool_mu); vk_defer_free(pool_destroy, o); return;
     }
     pthread_mutex_unlock(&g_pool_mu);
@@ -187,6 +188,10 @@ int vk_pool_find(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) 
     pthread_mutex_lock(&g_pool_mu);
     int h = g_pool_hint;
     if (h < g_npool && addr >= g_pools[h].lo && addr + len <= g_pools[h].hi) { *buf = g_pools[h].buf; *off = addr - g_pools[h].base; pthread_mutex_unlock(&g_pool_mu); return 1; }
+    /* the last pool starting at or below addr, then the ones before it (pools may nest: a buffer inside a bigger pool) */
+    int lo = 0, hi = g_npool; while (lo < hi) { int m = (lo + hi) / 2; if (g_pools[m].lo <= addr) lo = m + 1; else hi = m; }
+    for (int i = lo - 1; i >= 0 && i >= lo - 8; i--) if (addr >= g_pools[i].lo && addr + len <= g_pools[i].hi) {
+        g_pool_hint = i; *buf = g_pools[i].buf; *off = addr - g_pools[i].base; pthread_mutex_unlock(&g_pool_mu); return 1; }
     for (int i = 0; i < g_npool; i++) if (addr >= g_pools[i].lo && addr + len <= g_pools[i].hi) {
         g_pool_hint = i; *buf = g_pools[i].buf; *off = addr - g_pools[i].base; pthread_mutex_unlock(&g_pool_mu); return 1; }
     pthread_mutex_unlock(&g_pool_mu); return 0;

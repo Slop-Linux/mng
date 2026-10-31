@@ -378,7 +378,17 @@ static memo_t *g_memo[4096];
 static uint64_t state_sig(int st) {
     uint64_t h = 1469598103934665603ull;
 #define MIX(ptr, n) do { const uint8_t *q_ = (const uint8_t *)(ptr); for (size_t i_ = 0; i_ < (n); i_++) h = (h ^ q_[i_]) * 1099511628211ull; } while (0)
-    MIX(S.tex[st], sizeof S.tex[st]); MIX(S.img[st], sizeof S.img[st]);
+    tex_t t; view_t v; int hv;
+    for (int r = 0; r < 128; r++) if (S.tex[st][r]) {   /* a bound slot's target is what the translation depends on, not the handle */
+        uint8_t k[2] = {(uint8_t)r, 0xff};
+        if (vk_tex_registry_get((int)(S.tex[st][r] & 0xfffff), &t, &v, &hv)) k[1] = (uint8_t)(hv && v.set_target ? v.target : t.d.target);
+        MIX(k, 2);
+    }
+    for (int r = 0; r < 32; r++) if (S.img[st][r]) {
+        uint8_t k[3] = {(uint8_t)r, 0xff, 0};
+        if (vk_tex_registry_get((int)(S.img[st][r] & 0xfffff), &t, &v, &hv)) { k[1] = (uint8_t)(hv && v.set_target ? v.target : t.d.target); k[2] = (uint8_t)(hv && v.set_format ? v.format : t.d.format); }
+        MIX(k, 3);
+    }
     if (st == 0) { MIX(&S.nattr, sizeof S.nattr); for (int i = 0; i < S.nattr && i < 16; i++) { uint8_t f = ((va_st *)&S.attr[i])->fmt; MIX(&f, 1); } }
     if (st == 1 && S.has_rt) for (int i = 0; i < S.rt.n && i < 8; i++) { int f = S.rt.color[i] ? (S.rt.has_cview[i] && S.rt.cview[i].set_format ? S.rt.cview[i].format : S.rt.color[i]->d.format) : 0; MIX(&f, sizeof f); }
 #undef MIX

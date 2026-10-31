@@ -310,6 +310,9 @@ void vk_tex_stage_rendered(VkCommandBuffer cb, uint64_t fence) {
 static void writeback(vtex *v) {
     int sbw = 1, sbh = 1, sbpb = nvn_fmt_bpb(v->d.format, &sbw, &sbh);
     v->wb_count++;
+    static int log = -1; if (log < 0) log = getenv("TOTK_VK_WB_LOG") != NULL;
+    if (log) VKLOG("write-back fmt %#x %ux%ux%u levels %u layers %u (%llu bytes) count %d %s", v->d.format, v->w, v->h, v->depth, v->levels, v->layers, (unsigned long long)v->gsize, v->wb_count,
+                   v->stage && v->stage_fence && v->stage_fence == v->render_fence ? "staged" : "sync");
     if (sbpb && v->gmem && v->stage && v->stage_fence && v->stage_fence == v->render_fence) {
         mtl_wait(v->stage_fence, UINT64_MAX); wb_swizzle(v, v->stage_cpu, sbw, sbh, sbpb);
         v->gpu_dirty = 0; g_wb++; g_wb_staged++; g_wb_bytes += v->stage_size; return;
