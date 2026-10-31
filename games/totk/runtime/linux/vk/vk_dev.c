@@ -250,10 +250,11 @@ vk_span vk_ring(VkDeviceSize size, VkDeviceSize align) {
     c->used = o + size;
     return (vk_span){c->buf, c->cpu + o, o};
 }
-static VkCommandBuffer cb_new(void) {
-    VkCommandBuffer cb; VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = V.cmdpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+static VkCommandBuffer cb_new_in(VkCommandPool pool) {
+    VkCommandBuffer cb; VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
     VKCHECK(vkAllocateCommandBuffers(V.dev, &ai, &cb)); return cb;
 }
+static VkCommandBuffer cb_new(void) { return cb_new_in(V.cmdpool); }
 static void cb_begin(VkCommandBuffer cb) { VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; VKCHECK(vkBeginCommandBuffer(cb, &bi)); }
 static pthread_mutex_t g_cmdpool_mu = PTHREAD_MUTEX_INITIALIZER;
 void vk_sub_open(void) {
@@ -319,6 +320,52 @@ static void *done_thread(void *arg) {
     return NULL;
 }
 void vk_replay_end_pass(void);   /* vk_replay.c */
+/* the submit thread: the ICD encodes a command buffer for the hardware inside vkQueueSubmit (about 37 % of the game's CPU time
+   in the world), so submissions and presents are queued to a thread of their own, in order, and the game thread goes on
+   replaying the next frame. Every queue operation runs there or under g_queue_mu after the jobs before it. */
+typedef struct { int kind; sub_t *s; VkImage img; uint32_t w, h; VkFormat fmt; } job_t;
+#define JOBS 64
+static job_t g_jobs[JOBS]; static unsigned g_job_head, g_job_tail; static int g_job_busy;
+static pthread_mutex_t g_job_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_job_cv = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t g_queue_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t g_submit_thread;
+static VkCommandPool g_pool2;   /* command buffers recorded on the submit thread (present, screenshots) */
+static void submit_now(sub_t *s) {
+    VkCommandBufferSubmitInfo cbs[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->up}, {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main}};
+    VkSemaphoreSubmitInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = V.timeline, .value = s->fence, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = s->up_used ? 2 : 1, .pCommandBufferInfos = s->up_used ? cbs : cbs + 1,
+        .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
+    pthread_mutex_lock(&g_queue_mu); VKCHECK(vkQueueSubmit2(V.queue, 1, &si, VK_NULL_HANDLE)); pthread_mutex_unlock(&g_queue_mu);
+    pthread_mutex_lock(&g_sub_mu);
+    if (!g_done_thread) pthread_create(&g_done_thread, NULL, done_thread, NULL);
+    if (g_inflight_tail) g_inflight_tail->next = s; else g_inflight_head = s;
+    g_inflight_tail = s; pthread_cond_broadcast(&g_sub_cv);
+    pthread_mutex_unlock(&g_sub_mu);
+}
+static void present_now(VkImage img, uint32_t w, uint32_t h, VkFormat fmt);
+static void *submit_thread(void *arg) {
+    (void)arg; pthread_setname_np("vk-submit");
+    VkCommandPoolCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = V.qfam};
+    VKCHECK(vkCreateCommandPool(V.dev, &cpi, NULL, &g_pool2));
+    for (;;) {
+        pthread_mutex_lock(&g_job_mu);
+        while (g_job_head == g_job_tail) { g_job_busy = 0; pthread_cond_broadcast(&g_job_cv); pthread_cond_wait(&g_job_cv, &g_job_mu); }
+        job_t j = g_jobs[g_job_tail % JOBS]; g_job_busy = 1; pthread_mutex_unlock(&g_job_mu);
+        if (j.kind == 1) submit_now(j.s); else present_now(j.img, j.w, j.h, j.fmt);
+        pthread_mutex_lock(&g_job_mu); g_job_tail++; pthread_cond_broadcast(&g_job_cv); pthread_mutex_unlock(&g_job_mu);
+    }
+    return NULL;
+}
+static void job_push(job_t j) {
+    pthread_mutex_lock(&g_job_mu);
+    if (!g_submit_thread) pthread_create(&g_submit_thread, NULL, submit_thread, NULL);
+    while (g_job_head - g_job_tail >= JOBS) pthread_cond_wait(&g_job_cv, &g_job_mu);
+    g_jobs[g_job_head % JOBS] = j; g_job_head++; pthread_cond_broadcast(&g_job_cv);
+    pthread_mutex_unlock(&g_job_mu);
+}
+static void jobs_drain(void) {   /* every queued submission and present has reached the queue */
+    pthread_mutex_lock(&g_job_mu); while (g_job_head != g_job_tail) pthread_cond_wait(&g_job_cv, &g_job_mu); pthread_mutex_unlock(&g_job_mu);
+}
 uint64_t vk_sub_submit(void) {
     if (!g_open) vk_sub_open();
     vk_replay_end_pass();
@@ -332,17 +379,8 @@ uint64_t vk_sub_submit(void) {
     }
     vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_ts, (uint32_t)(s->fence % TS_RING) * 2 + 1);
     VKCHECK(vkEndCommandBuffer(s->up)); VKCHECK(vkEndCommandBuffer(s->main));
-    VkCommandBufferSubmitInfo cbs[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->up}, {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main}};
-    VkSemaphoreSubmitInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = V.timeline, .value = s->fence, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
-    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = s->up_used ? 2 : 1, .pCommandBufferInfos = s->up_used ? cbs : cbs + 1,
-        .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
-    VKCHECK(vkQueueSubmit2(V.queue, 1, &si, VK_NULL_HANDLE));
     atomic_store(&g_submitted, s->fence);
-    pthread_mutex_lock(&g_sub_mu);
-    if (!g_done_thread) pthread_create(&g_done_thread, NULL, done_thread, NULL);
-    if (g_inflight_tail) g_inflight_tail->next = s; else g_inflight_head = s;
-    g_inflight_tail = s; pthread_cond_broadcast(&g_sub_cv);
-    pthread_mutex_unlock(&g_sub_mu);
+    job_push((job_t){.kind = 1, .s = s});
     return s->fence;
 }
 /* a command buffer run at once, outside the submissions (write-backs) */
@@ -351,7 +389,9 @@ void vk_oneshot_end(VkCommandBuffer cb) {
     VKCHECK(vkEndCommandBuffer(cb));
     VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence f; VKCHECK(vkCreateFence(V.dev, &fi, NULL, &f));
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
-    VKCHECK(vkQueueSubmit(V.queue, 1, &si, f)); VKCHECK(vkWaitForFences(V.dev, 1, &f, 1, UINT64_MAX)); vkDestroyFence(V.dev, f, NULL);
+    jobs_drain();
+    pthread_mutex_lock(&g_queue_mu); VKCHECK(vkQueueSubmit(V.queue, 1, &si, f)); pthread_mutex_unlock(&g_queue_mu);
+    VKCHECK(vkWaitForFences(V.dev, 1, &f, 1, UINT64_MAX)); vkDestroyFence(V.dev, f, NULL);
     pthread_mutex_lock(&g_cmdpool_mu); vkFreeCommandBuffers(V.dev, V.cmdpool, 1, &cb); pthread_mutex_unlock(&g_cmdpool_mu);
 }
 uint64_t mtl_last_fence(void) { return atomic_load(&g_submitted); }
@@ -392,7 +432,6 @@ void vk_window_open(void) {
     for (int i = 0; i < 8; i++) if (!g_acq[i]) {
         VkSemaphoreCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO}; VKCHECK(vkCreateSemaphore(V.dev, &si, NULL, &g_acq[i])); VKCHECK(vkCreateSemaphore(V.dev, &si, NULL, &g_rel[i]));
         VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT}; VKCHECK(vkCreateFence(V.dev, &fi, NULL, &g_pfence[i]));
-        pthread_mutex_lock(&g_cmdpool_mu); g_pcb[i] = cb_new(); pthread_mutex_unlock(&g_cmdpool_mu);
     }
     VKLOG("swapchain %ux%u format %d, %u images, present mode %d", g_sw, g_sh, f.format, g_nswap, mode);
 }
@@ -412,13 +451,13 @@ static void shot(VkImage img, uint32_t w, uint32_t h, VkFormat fmt, uint64_t n) 
     VkBuffer b; VKCHECK(vkCreateBuffer(V.dev, &bi, NULL, &b)); VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, b, &req);
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = vk_memtype(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
     VkDeviceMemory m; VKCHECK(vkAllocateMemory(V.dev, &ai, NULL, &m)); VKCHECK(vkBindBufferMemory(V.dev, b, m, 0));
-    pthread_mutex_lock(&g_cmdpool_mu); VkCommandBuffer cb = cb_new(); pthread_mutex_unlock(&g_cmdpool_mu);
+    VkCommandBuffer cb = cb_new_in(g_pool2);
     cb_begin(cb);
     VkBufferImageCopy r = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
     vkCmdCopyImageToBuffer(cb, img, VK_IMAGE_LAYOUT_GENERAL, b, 1, &r);
     VKCHECK(vkEndCommandBuffer(cb));
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
-    VKCHECK(vkQueueSubmit(V.queue, 1, &si, VK_NULL_HANDLE)); VKCHECK(vkQueueWaitIdle(V.queue));
+    pthread_mutex_lock(&g_queue_mu); VKCHECK(vkQueueSubmit(V.queue, 1, &si, VK_NULL_HANDLE)); VKCHECK(vkQueueWaitIdle(V.queue)); pthread_mutex_unlock(&g_queue_mu);
     uint8_t *p; VKCHECK(vkMapMemory(V.dev, m, 0, VK_WHOLE_SIZE, 0, (void **)&p));
     char path[4096]; snprintf(path, sizeof path, "%.*s", (int)(strrchr(spec, ':') - spec), spec);
     FILE *f = fopen(path, "wb");
@@ -434,10 +473,11 @@ static void shot(VkImage img, uint32_t w, uint32_t h, VkFormat fmt, uint64_t n) 
         fclose(f); VKLOG("screenshot of present %llu (%ux%u, format %d) -> %s", (unsigned long long)n, w, h, fmt, path);
     }
     vkUnmapMemory(V.dev, m); vkDestroyBuffer(V.dev, b, NULL); vkFreeMemory(V.dev, m, NULL);
-    pthread_mutex_lock(&g_cmdpool_mu); vkFreeCommandBuffers(V.dev, V.cmdpool, 1, &cb); pthread_mutex_unlock(&g_cmdpool_mu);
+    vkFreeCommandBuffers(V.dev, g_pool2, 1, &cb);
 }
 static uint64_t g_presents;
-void vk_present_image(VkImage img, uint32_t w, uint32_t h, VkFormat fmt) {
+void vk_present_image(VkImage img, uint32_t w, uint32_t h, VkFormat fmt) { job_push((job_t){.kind = 2, .img = img, .w = w, .h = h, .fmt = fmt}); }
+static void present_now(VkImage img, uint32_t w, uint32_t h, VkFormat fmt) {
     g_presents++;
     shot(img, w, h, fmt, g_presents);
     if (!g_swap) return;
@@ -447,6 +487,7 @@ void vk_present_image(VkImage img, uint32_t w, uint32_t h, VkFormat fmt) {
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { vkDeviceWaitIdle(V.dev); vk_window_open(); return; }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) VKDIE("acquire: %d", r);
     VKCHECK(vkResetFences(V.dev, 1, &g_pfence[i]));
+    if (!g_pcb[i]) g_pcb[i] = cb_new_in(g_pool2);   /* recorded on the submit thread: its own pool */
     VkCommandBuffer cb = g_pcb[i]; vkResetCommandBuffer(cb, 0); cb_begin(cb);
     barrier_img(cb, g_swap_img[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int)w, (int)h, 1}},
@@ -457,9 +498,9 @@ void vk_present_image(VkImage img, uint32_t w, uint32_t h, VkFormat fmt) {
     VkPipelineStageFlags ws = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .waitSemaphoreCount = 1, .pWaitSemaphores = &g_acq[i], .pWaitDstStageMask = &ws,
         .commandBufferCount = 1, .pCommandBuffers = &cb, .signalSemaphoreCount = 1, .pSignalSemaphores = &g_rel[i]};
-    VKCHECK(vkQueueSubmit(V.queue, 1, &si, g_pfence[i]));
+    pthread_mutex_lock(&g_queue_mu); VKCHECK(vkQueueSubmit(V.queue, 1, &si, g_pfence[i]));
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &g_rel[i], .swapchainCount = 1, .pSwapchains = &g_swap, .pImageIndices = &idx};
-    r = vkQueuePresentKHR(V.queue, &pi);
+    r = vkQueuePresentKHR(V.queue, &pi); pthread_mutex_unlock(&g_queue_mu);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) { vkDeviceWaitIdle(V.dev); vk_window_open(); }
     else if (r != VK_SUCCESS) VKDIE("present: %d", r);
 }
