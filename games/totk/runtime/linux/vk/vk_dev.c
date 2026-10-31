@@ -210,6 +210,10 @@ static chunk_t *g_free_chunks; static int g_nfree_chunks;
 static pthread_mutex_t g_sub_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_sub_cv = PTHREAD_COND_INITIALIZER;
 static _Atomic uint64_t g_fence_next = 1, g_applied, g_submitted;
 static pthread_t g_done_thread;
+/* GPU time: a timestamp at the start and the end of every submission's main command buffer */
+#define TS_RING 512
+static VkQueryPool g_ts; static _Atomic uint64_t g_gpu_ns;
+uint64_t vk_gpu_ns(void) { return atomic_load(&g_gpu_ns); }
 
 static void chunk_new(chunk_t *c, VkDeviceSize size) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -253,6 +257,8 @@ void vk_sub_open(void) {
     pthread_mutex_unlock(&g_cmdpool_mu);
     s->fence = atomic_fetch_add(&g_fence_next, 1); s->nchunks = 0; s->nposts = 0; s->nfrees = 0; s->up_used = 0; s->next = NULL;
     cb_begin(s->up); cb_begin(s->main);
+    if (!g_ts) { VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 * TS_RING}; VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &g_ts)); vkResetQueryPool(V.dev, g_ts, 0, 2 * TS_RING); }
+    vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g_ts, (uint32_t)(s->fence % TS_RING) * 2);
     g_open = s;
 }
 VkCommandBuffer vk_cb(void) { vk_sub_open(); return g_open->main; }
@@ -285,6 +291,9 @@ static void *done_thread(void *arg) {
             if (o->kind == 1) { if (o->mode == NVN_EVENT_SIGNAL_MODE_ADD) *o->val += o->v; else *o->val = o->v; }
             else { uint64_t rec[2] = {o->kind == 3 ? 1u << 20 : 0, gpu_ticks()}; memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec); }   /* counters: samples passed reports visible (no queries yet) */
         }
+        { uint64_t t[2]; uint32_t q = (uint32_t)(s->fence % TS_RING) * 2;
+          if (vkGetQueryPoolResults(V.dev, g_ts, q, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0]) atomic_fetch_add(&g_gpu_ns, (uint64_t)((t[1] - t[0]) * V.props.limits.timestampPeriod));
+          vkResetQueryPool(V.dev, g_ts, q, 2); }
         for (int i = 0; i < s->nfrees; i++) s->frees[i].fn(s->frees[i].p);
         pthread_mutex_lock(&g_sub_mu);
         for (int i = 0; i < s->nchunks; i++) {
@@ -310,6 +319,7 @@ uint64_t vk_sub_submit(void) {
         VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
         vkCmdPipelineBarrier2(s->up, &di);
     }
+    vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_ts, (uint32_t)(s->fence % TS_RING) * 2 + 1);
     VKCHECK(vkEndCommandBuffer(s->up)); VKCHECK(vkEndCommandBuffer(s->main));
     VkCommandBufferSubmitInfo cbs[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->up}, {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main}};
     VkSemaphoreSubmitInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = V.timeline, .value = s->fence, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};

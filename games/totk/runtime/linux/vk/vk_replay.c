@@ -121,6 +121,9 @@ static void upd_flush(void) {
     }
     full_barrier(); g_nupd = 0;
 }
+/* renamed copies made in this submission, by range and the number of updates they include */
+typedef struct { uint64_t addr, size; int nupd; VkBuffer buf; VkDeviceSize off; } shadow_t;
+static shadow_t g_shadow[1024]; static uint64_t g_shadow_epoch, g_shadow_ep[1024];
 /* a uniform range as the GPU would read it at this point: memory plus the pending updates that overlap it */
 static int ubo_range(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off, VkDeviceSize *range) {
     if (!addr) return 0;
@@ -130,12 +133,17 @@ static int ubo_range(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *
     VkBuffer b; VkDeviceSize o;
     if (!overlap && vk_pool_find(addr, size, &b, &o) && !(o & 255)) { *buf = b; *off = o; *range = size; return 1; }
     if (!vk_pool_find(addr, 1, &b, &o)) return 0;
+    unsigned slot = (unsigned)((addr >> 8) ^ size) & 1023;
+    shadow_t *sh = &g_shadow[slot];
+    if (g_shadow_ep[slot] == g_shadow_epoch && sh->addr == addr && sh->size == size && sh->nupd == g_nupd) { *buf = sh->buf; *off = sh->off; *range = size; return 1; }
     vk_span s = vk_ring(size, 256); memcpy(s.cpu, (const void *)(uintptr_t)addr, size);
     for (int i = 0; i < g_nupd; i++) {
         uint64_t lo = g_upd[i].dst > addr ? g_upd[i].dst : addr, hi = g_upd[i].dst + g_upd[i].n < addr + size ? g_upd[i].dst + g_upd[i].n : addr + size;
         if (lo < hi) memcpy(s.cpu + (lo - addr), g_upd[i].data + (lo - g_upd[i].dst), hi - lo);
     }
-    *buf = s.buf; *off = s.off; *range = size; return 1;
+    *buf = s.buf; *off = s.off; *range = size;
+    *sh = (shadow_t){addr, size, g_nupd, s.buf, s.off}; g_shadow_ep[slot] = g_shadow_epoch;
+    return 1;
 }
 
 /* ---------- shader pairs and descriptors ---------- */
@@ -358,7 +366,29 @@ static void answers(int st, char *out, size_t cap) {
     PUT("}");
 #undef PUT
 }
+/* the variant of a program's stage for the bound state: the answers are built only when a cheap signature of what they
+   are made from (texture / image handles, vertex formats, target formats) changed */
+typedef struct memo_t { const prog_t *p; uint64_t serial; int stage; uint64_t sig; vshader *s; struct memo_t *next; } memo_t;
+static memo_t *g_memo[4096];
+static uint64_t state_sig(int st) {
+    uint64_t h = 1469598103934665603ull;
+#define MIX(ptr, n) do { const uint8_t *q_ = (const uint8_t *)(ptr); for (size_t i_ = 0; i_ < (n); i_++) h = (h ^ q_[i_]) * 1099511628211ull; } while (0)
+    MIX(S.tex[st], sizeof S.tex[st]); MIX(S.img[st], sizeof S.img[st]);
+    if (st == 0) { MIX(&S.nattr, sizeof S.nattr); for (int i = 0; i < S.nattr && i < 16; i++) { uint8_t f = ((va_st *)&S.attr[i])->fmt; MIX(&f, 1); } }
+    if (st == 1 && S.has_rt) for (int i = 0; i < S.rt.n && i < 8; i++) { int f = S.rt.color[i] ? (S.rt.has_cview[i] && S.rt.cview[i].set_format ? S.rt.cview[i].format : S.rt.color[i]->d.format) : 0; MIX(&f, sizeof f); }
+#undef MIX
+    return h;
+}
+static vshader *stage_shader_slow(int want);
 static vshader *stage_shader(int want) {
+    const prog_t *p = S.prog; if (!p) return NULL;
+    uint64_t sig = state_sig(want); unsigned h = (unsigned)(((uintptr_t)p >> 4) ^ p->serial ^ (sig >> 7) ^ (uint64_t)want) & 4095;
+    for (memo_t *m = g_memo[h]; m; m = m->next) if (m->p == p && m->serial == p->serial && m->stage == want && m->sig == sig) return m->s;
+    vshader *s = stage_shader_slow(want);
+    memo_t *m = malloc(sizeof *m); *m = (memo_t){p, p->serial, want, sig, s, g_memo[h]}; g_memo[h] = m;
+    return s;
+}
+static vshader *stage_shader_slow(int want) {
     const prog_t *p = S.prog; if (!p) return NULL;
     for (unsigned i = 0; i < p->nstage && i < 6; i++) {
         const uint8_t *control = p->sd[i].control; if (!control || !p->sd[i].data) continue;
@@ -645,7 +675,23 @@ static void clear_tex(const p_clear_tex *c) {
 
 /* ---------- the stream ---------- */
 static int g_inited;
-static int same_rt(const p_set_rt *a, const p_set_rt *b) { return !memcmp(a, b, sizeof *a); }
+/* the same targets: the same images at the same levels / layers / formats in the same slots */
+static int same_view(const view_t *a, int ha, const view_t *b, int hb) {
+    int la = ha && a->set_levels ? a->base_level : 0, lb = hb && b->set_levels ? b->base_level : 0;
+    int ya = ha && a->set_layers ? a->min_layer : 0, yb = hb && b->set_layers ? b->min_layer : 0;
+    int fa = ha && a->set_format ? a->format : -1, fb = hb && b->set_format ? b->format : -1;
+    return la == lb && ya == yb && fa == fb;
+}
+static int same_rt(const p_set_rt *a, const p_set_rt *b) {
+    int n = a->n > b->n ? a->n : b->n; if (n > 8) n = 8;
+    for (int i = 0; i < n; i++) {
+        const tex_t *x = i < a->n ? a->color[i] : NULL, *y = i < b->n ? b->color[i] : NULL;
+        if ((x ? x->serial : 0) != (y ? y->serial : 0)) return 0;
+        if (x && !same_view(&a->cview[i], a->has_cview[i], &b->cview[i], b->has_cview[i])) return 0;
+    }
+    if ((a->depth ? a->depth->serial : 0) != (b->depth ? b->depth->serial : 0)) return 0;
+    return !a->depth || same_view(&a->dview, a->has_dview, &b->dview, b->has_dview);
+}
 void mtl_exec(const uint8_t *p) {
     if (!g_inited) { g_inited = 1; state_reset(); support_init(); }
     for (;;) {
@@ -662,7 +708,7 @@ void mtl_exec(const uint8_t *p) {
             case OP_RESET_COUNTER: break;
             case OP_COPY_B2B: { uint64_t s, d, n; memcpy(&s, a, 8); memcpy(&d, (const uint8_t *)a + 8, 8); memcpy(&n, (const uint8_t *)a + 16, 8); copy_b2b(s, d, n); break; }
             case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8); upd_add(d, (const uint8_t *)a + 16, n); break; }
-            case OP_SET_RT: { const p_set_rt *r = a; if (S.has_rt && same_rt(r, &S.rt)) break; end_pass(1); S.rt = *r; S.has_rt = 1; break; }
+            case OP_SET_RT: { const p_set_rt *r = a; if (S.has_rt && same_rt(r, &S.rt)) { S.rt = *r; break; } end_pass(1); S.rt = *r; S.has_rt = 1; break; }
             case OP_CLEAR_COLOR: clear_color(a); break;
             case OP_CLEAR_DS: clear_ds(a); break;
             case OP_VIEWPORTS: { const p_viewports *v = a; for (int i = 0; i < v->n && v->first + i < 16; i++) memcpy(S.vp[v->first + i], v->v[i], 24); if (v->first + v->n > S.nvp) S.nvp = v->first + v->n > 16 ? 16 : v->first + v->n; break; }
@@ -707,7 +753,7 @@ void mtl_exec(const uint8_t *p) {
 }
 void mtl_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }
 void mtl_sub_begin(void) { vk_sub_open(); }
-uint64_t mtl_sub_commit(void) { upd_flush(); g_dyn_set = 0; g_dpool = VK_NULL_HANDLE; return vk_sub_submit(); }
+uint64_t mtl_sub_commit(void) { upd_flush(); g_shadow_epoch++; g_dyn_set = 0; g_dpool = VK_NULL_HANDLE; return vk_sub_submit(); }
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) { copy_b2b(src, dst, n); }
 void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { vk_sub_post(1, val, mode, v, 0); }
 void mtl_sub_counter(uint64_t addr, uint32_t type) { vk_sub_post(type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 3 : 2, NULL, 0, 0, addr); }
@@ -730,6 +776,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
               (unsigned long long)g_presents, (unsigned long long)g_passes, (unsigned long long)g_draws, (unsigned long long)g_frame_passes, (unsigned long long)g_frame_draws,
               (unsigned long long)g_dispatches, (unsigned long long)g_copies, (unsigned long long)up, ub / 1e6, (unsigned long long)g_skips[0], (unsigned long long)g_skips[1],
               (unsigned long long)g_skips[2], (unsigned long long)g_skips[3], (unsigned long long)g_skips[4], (unsigned long long)g_skips[5], (unsigned long long)g_skips[6]);
+        { uint64_t vk_gpu_ns(void); static uint64_t pg; uint64_t g = vk_gpu_ns(); VKLOG("GPU busy %.2f ms per present over the last 600", (g - pg) / 1e6 / 600); pg = g; }
         VKLOG("pass ends: submit %llu, targets %llu, buffer copy %llu, texture copy %llu, dispatch %llu, barrier %llu, texture clear %llu, feedback %llu, update flush %llu",
               (unsigned long long)g_end_why[0], (unsigned long long)g_end_why[1], (unsigned long long)g_end_why[2], (unsigned long long)g_end_why[3], (unsigned long long)g_end_why[4],
               (unsigned long long)g_end_why[5], (unsigned long long)g_end_why[6], (unsigned long long)g_end_why[7], (unsigned long long)g_end_why[8]);
