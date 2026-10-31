@@ -12,3 +12,8 @@
 #define PAGEOFF(x) :lo12:x
 #define TP_EL0 tpidr_el0
 #endif
+#ifdef __APPLE__
+#define CSTRING_SECTION .cstring
+#else
+#define CSTRING_SECTION .section .rodata.str1.1,"aMS",%progbits,1
+#endif
