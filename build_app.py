@@ -91,6 +91,7 @@ SPIRV_CROSS_FLAGS = ('-O3', '-DNDEBUG', '-std=c++11', '-arch', 'arm64', '-Wno-de
 # Homebrew first; then the folder of the running interpreter (the Python uv selected, or an activated virtual environment),
 # last so that a system Python's /usr/bin never shadows the Homebrew tools for the build's subprocesses.
 TOOL_PATHS = ['/opt/homebrew/bin', '/usr/local/bin', str(Path(sys.executable).parent)]
+LINUX = platform.system() == 'Linux'   # kalium/linux: aarch64 Linux, Vulkan; tools from the flake's dev shell
 
 
 def contrib_folder():
@@ -277,6 +278,16 @@ def _bfttf_valid(path):
 
 # ---- prerequisites ----
 def prerequisites(args):
+    if LINUX:
+        if platform.machine() != 'aarch64':
+            raise BuildError('needs an aarch64 Linux machine')
+        for tool in ('clang', 'make', 'git', 'rsync'):
+            if not shutil.which(tool):
+                raise BuildError(f'{tool} not found: run the build inside `nix develop`')
+        py = shutil.which('python3.14')
+        if not py:
+            raise BuildError('Python 3.14 not found: run the build inside `nix develop`')
+        return Path(py)
     if platform.system() != 'Darwin' or platform.machine() != 'arm64':
         raise BuildError('needs a Mac with Apple silicon')
     major = int(platform.mac_ver()[0].split('.')[0] or 0)
@@ -351,9 +362,10 @@ def prepare_work(work, py, logs):
         tooling.unlink()
     tooling.mkdir(exist_ok=True)
     src = work / 'src'
-    say('fetching the pinned SPIRV-Cross sources')
-    git_fetch(*SPIRV_CROSS, src / 'SPIRV-Cross', logs / 'fetch-spirv-cross.log')
-    link(tooling / 'spirv-cross', src / 'SPIRV-Cross')
+    if not LINUX:   # the Vulkan path consumes Ryujinx's SPIR-V directly
+        say('fetching the pinned SPIRV-Cross sources')
+        git_fetch(*SPIRV_CROSS, src / 'SPIRV-Cross', logs / 'fetch-spirv-cross.log')
+        link(tooling / 'spirv-cross', src / 'SPIRV-Cross')
     venv = work / 'venv'
     if not (venv / 'bin/python').exists():
         say('Python environment for the build tools')
@@ -811,11 +823,16 @@ def build_hactool(tree, logs):
     # seekable FILE. This avoids a second 17 GB base copy during BKTR merging.
     text = main.read_text()
     if '#define _DARWIN_C_SOURCE 1' not in text:
-        text = '#define _DARWIN_C_SOURCE 1\n' + text
+        text = '#define _DARWIN_C_SOURCE 1\n#define _GNU_SOURCE 1\n' + text
         main.write_text(text)
     hook = 'static FILE *mng_open_base(const char *path)'
     if hook not in text:
         helper = r'''
+#ifdef __linux__
+typedef off_t mng_pos;
+#else
+typedef fpos_t mng_pos;
+#endif
 typedef struct { FILE *file; off_t start, size, position; } mng_base_range;
 static int mng_base_read(void *cookie, char *buffer, int count) {
     mng_base_range *range = cookie;
@@ -828,16 +845,26 @@ static int mng_base_read(void *cookie, char *buffer, int count) {
     range->position += got;
     return got;
 }
-static fpos_t mng_base_seek(void *cookie, fpos_t offset, int whence) {
+static mng_pos mng_base_seek(void *cookie, mng_pos offset, int whence) {
     mng_base_range *range = cookie;
     off_t base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? range->position : whence == SEEK_END ? range->size : -1;
-    if (base < 0 || offset < -base || offset > range->size - base) return (fpos_t)-1;
-    return (fpos_t)(range->position = base + offset);
+    if (base < 0 || offset < -base || offset > range->size - base) return (mng_pos)-1;
+    return (mng_pos)(range->position = base + offset);
 }
 static int mng_base_close(void *cookie) {
     mng_base_range *range = cookie;
     int result = fclose(range->file); free(range); return result;
 }
+#ifdef __linux__
+static ssize_t mng_base_read_linux(void *cookie, char *buffer, size_t count) {
+    return mng_base_read(cookie, buffer, count > 0x40000000 ? 0x40000000 : (int)count);
+}
+static int mng_base_seek_linux(void *cookie, off64_t *offset, int whence) {
+    mng_pos at = mng_base_seek(cookie, (mng_pos)*offset, whence);
+    if (at == (mng_pos)-1) return -1;
+    *offset = (off64_t)at; return 0;
+}
+#endif
 static FILE *mng_open_base(const char *path) {
     const char *start = getenv("MNG_BASE_RANGE_OFFSET"), *size = getenv("MNG_BASE_RANGE_SIZE");
     if (!start && !size) return fopen(path, "rb");
@@ -850,7 +877,12 @@ static FILE *mng_open_base(const char *path) {
     range->file = fopen(path, "rb"); range->start = (off_t)a; range->size = (off_t)n;
     if (!range->file) { free(range); return NULL; }
     if (fseeko(range->file, 0, SEEK_END) || ftello(range->file) < (off_t)(a + n)) { mng_base_close(range); return NULL; }
+#ifdef __linux__
+    cookie_io_functions_t io = {.read = mng_base_read_linux, .seek = mng_base_seek_linux, .close = mng_base_close};
+    FILE *view = fopencookie(range, "rb", io);
+#else
     FILE *view = funopen(range, mng_base_read, NULL, mng_base_seek, mng_base_close);
+#endif
     if (!view) mng_base_close(range);
     return view;
 }
@@ -2022,6 +2054,27 @@ def step_shaders_botw(tree, botw, logs, *, version='botw160'):
         logs / 'prepare-shader-seed-botw.log', cwd=tree)
 
 
+def step_linux(tree, out, logs, env, *, version):
+    """Linux: the game data folder (tables, RomFS / add-on / font configs) and the runtime (Makefile.linux); the game folder
+    links the work folder's extracted RomFS and rewritten modules instead of copying them."""
+    say('3/4 runtime: game data folder')
+    run(['make', f'game-data-{version}'],
+        logs / f'game-data-{version}.log', cwd=tree, env=env)
+    say('4/4 runtime: building the Linux runtime')
+    run(['make', '-f', 'Makefile.linux', f'-j{os.cpu_count() or 4}', f'VERSION={version}'], logs / 'runtime-linux.log', cwd=tree, env=env)
+    out.mkdir(parents=True, exist_ok=True)
+    link(out / 'botw-native', tree / f'build/linux-{version}/botw-native')
+    link(out / 'game-data', tree / f'build/game-data/{version}')
+    link(out / 'modules', tree / f'rewritten/{version}')
+    link(out / 'romfs', tree / f'extracted/{version}/romfs')
+    if (tree / f'extracted/{version}/aoc').is_dir():
+        link(out / 'aoc', tree / f'extracted/{version}/aoc')
+    link(out / 'shared-fonts', tree / 'extracted/firmware/shared-fonts')
+    translator = tree / 'prebuilt/linux-arm64/totk_xlate'
+    if translator.is_file():
+        link(out / 'totk_xlate', translator)
+
+
 def mac_game_data(args, device_app):
     """--mac-game-data and --mac-game-data-folder: 'app' or 'library', and the folder the image goes in (None: the default,
     library_game_data). Naming the folder is enough for 'library'."""
@@ -2042,7 +2095,7 @@ def parse_args(argv):
     ap.add_argument('game', type=Path, help='the game file (.xci or .nsp), base game 1.0.0 (Breath of the Wild: the 1.6.0 card image, or the base NSP with --update)')
     ap.add_argument('--update', type=Path, help='separate supported cumulative update NSP/NSZ; outputs the same single app (Breath of the Wild: the 1.9.0 update NSP, not for a card image)')
     ap.add_argument('--dlc', type=Path, action='append', metavar='DLC.nsp', help='Breath of the Wild with a separate 1.6.0 or 1.9.0 --update: an add-on content (DLC) NSP; repeat for the second pack (01007EF00011F001, 01007EF00011F002); each is optional, and a pack left out is not in the app; such a build takes its packs from --dlc only, also when the game file is a card image')
-    ap.add_argument('--platform', choices=('macos','ios','visionos'), default='macos', help='build a macOS app (default), unsigned iPhone/iPad IPA, or native Vision Pro IPA')
+    ap.add_argument('--platform', choices=('macos','ios','visionos','linux'), default='linux' if LINUX else 'macos', help='build a macOS app (default on a Mac), unsigned iPhone/iPad IPA, native Vision Pro IPA, or an aarch64 Linux / Vulkan game folder (default on Linux; Breath of the Wild only)')
     ap.add_argument('--ios-game-data', choices=('app', 'documents'), default='app',
                     help='iOS: carry the 17 GB RomFS image in the IPA (default), or leave it out for the app\'s Documents/GameData '
                          '(ios/tools/install_device.py --game-data copies it there once; later builds install in minutes)')
@@ -2092,7 +2145,10 @@ def main(argv):
         raise BuildError(f'no such file: {keys}')
     out = (args.out.expanduser().resolve() if args.out else game.parent / (f'{APP_NAME}.ipa' if device_app else f'{APP_NAME}.app'))
     work = (args.work.expanduser().resolve() if args.work else game.parent / 'TOTK_build')
-    if out.suffix.lower() not in (('.ipa', '.app') if device_app else ('.app',)):   # iOS .app: unsigned folder for install_device.py
+    if args.platform == 'linux':
+        if not LINUX:
+            raise BuildError('--platform linux builds on the aarch64 Linux machine it runs on')
+    elif out.suffix.lower() not in (('.ipa', '.app') if device_app else ('.app',)):   # iOS .app: unsigned folder for install_device.py
         raise BuildError(f'the {args.platform} output must end in {".ipa or .app" if device_app else ".app"}: {out}')
     kind = input_kind(game)
     if kind not in ('xci', 'nsp'):
@@ -2160,7 +2216,7 @@ def main(argv):
             logs = work / 'logs'
             tree = prepare_work(work, py, logs)
         if not args.out:
-            out = game.parent / f'{APPS["botw"][0]}.{"ipa" if args.platform == "ios" else "app"}'
+            out = work / 'game' if args.platform == 'linux' else game.parent / f'{APPS["botw"][0]}.{"ipa" if args.platform == "ios" else "app"}'
         check_package(game, 'botw', 'base')
         if update:
             check_package(update, 'botw', 'update')
@@ -2186,6 +2242,10 @@ def main(argv):
         say(f'Breath of the Wild {expected["display_version"]}; work folder {work}')
         step_code_botw(tree, botw, update or game, keys, env, logs, version=version)
         step_data_botw(tree, botw, game, keys, logs, version=version, update=update, dlc=dlcs, firmware=firmware, shared_fonts=shared_fonts)
+        if args.platform == 'linux':
+            step_linux(tree, out, logs, env, version=version)
+            say(f'done in {(time.time() - t0) / 60:.0f} min: {out}')
+            return
         step_shaders_botw(tree, botw, logs, version=version)
         if not device_app:   # the Mac app's metallibs; build_ipa.py compiles the device's own (6 of a 21-minute iPhone build, 2026-10-28)
             step_shader_libs(tree, logs, version=version)
