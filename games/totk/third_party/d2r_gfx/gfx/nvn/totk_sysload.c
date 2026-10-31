@@ -69,6 +69,29 @@ static double now_s(void) {
 }
 
 /* 'P' or 'E' per logical CPU id. */
+#ifdef __linux__
+/* Linux: P / E from the cores' capacities (the biggest = performance), ticks from /proc/stat; no GPU or thread figures. */
+static void classify(int ncpu, char *kind) {
+    for (int i = 0; i < ncpu && i < SYSLOAD_MAX_CORES; i++) {
+        char path[96]; snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpu_capacity", i);
+        FILE *f = fopen(path, "r"); int c = 0; if (f) { if (fscanf(f, "%d", &c) != 1) c = 0; fclose(f); }
+        kind[i] = c >= 1024 || c == 0 ? 'P' : 'E';
+    }
+}
+static int gpu_util(void) { return -1; }
+static int busiest_thread(double wall_us, char name[32]) { (void)wall_us; name[0] = 0; return -1; }
+static int cpu_ticks(uint64_t busy[SYSLOAD_MAX_CORES], uint64_t total[SYSLOAD_MAX_CORES]) {
+    FILE *f = fopen("/proc/stat", "r"); if (!f) return 0;
+    char line[256]; int n = 0;
+    while (fgets(line, sizeof line, f) && n < SYSLOAD_MAX_CORES) {
+        int cpu; unsigned long long v[8] = {0};
+        if (sscanf(line, "cpu%d %llu %llu %llu %llu %llu %llu %llu %llu", &cpu, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]) < 5) continue;
+        uint64_t idle = v[3] + v[4], all = 0; for (int k = 0; k < 8; k++) all += v[k];
+        busy[n] = all - idle; total[n] = all; n++;
+    }
+    fclose(f); return n;
+}
+#else
 static void classify(int ncpu, char *kind) {
     int ne = 0; size_t sz = sizeof ne;
     if (sysctlbyname("hw.perflevel1.logicalcpu", &ne, &sz, NULL, 0) || ne < 0 || ne > ncpu) ne = 0;   // perflevel1 = efficiency
@@ -170,6 +193,7 @@ static int cpu_ticks(uint64_t busy[SYSLOAD_MAX_CORES], uint64_t total[SYSLOAD_MA
     return nc;
 }
 
+#endif
 static void *sampler(void *arg) {
     (void)arg;
     pthread_setname_np("totk-sysload");

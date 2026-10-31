@@ -1,0 +1,47 @@
+# Linux (aarch64, Vulkan) runtime of Breath of the Wild: make -f Makefile.linux VERSION=botw190, inside `nix develop`.
+# The Darwin calls the shared runtime makes go to the shims in runtime/linux/include (force-included darwin_compat.h);
+# the Mac's Objective-C parts (window, controllers, Metal) are replaced by the C files in runtime/linux.
+VERSION ?= botw190
+CC := clang
+OUT := build/linux-$(VERSION)
+GAME_DEFS_botw190 := -DGAME_BOTW=1 -DGAME_BOTW190=1
+GAME_DEFS_botw160 := -DGAME_BOTW=1 -DGAME_BOTW160=1
+DEFS := $(GAME_DEFS_$(VERSION))
+OPT ?= -O2
+PKGS := opus vpx sdl3 vulkan openssl
+CFLAGS := -std=gnu11 $(OPT) -g -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-missing-field-initializers -Wno-sign-compare \
+  -fno-strict-aliasing -D_GNU_SOURCE $(DEFS) -Iruntime/linux/include -include darwin_compat.h -Ithird_party/d2r_gfx/gfx/nvn/include -Ibuild \
+  $(shell pkg-config --cflags $(PKGS)) -I$(shell pkg-config --variable=includedir opus)/opus
+LIBS := $(shell pkg-config --libs $(PKGS)) -lpthread -lm -ldl
+RUNTIME := loader game_data game_patches_botw aoc_romfs settings_service world_survey game_slot services romfs threads hle_stack \
+  gfx_bridge account input hid_feedback motion_fusion autoload gfx_probe memory_probe shared_font ipc audio_renderer audio_mixer \
+  audio_reverb audio_effects fs_host opus_codec movie_host time_host applet_host swkbd_host
+RUNTIME_ASM := gate hle_stack thread_enter
+LINUX := darwin_shim frontend gamepad gfx_null
+GFX := hle_nvn nvn_dirty nvn_tex totk_lifelog totk_nvn_ext totk_sysload totk_timeline totk_vpool
+GFX_ASM := nvn_entry nvn_thunks
+TEX := nvn_bcdec nvn_deswizzle
+OBJS := $(RUNTIME:%=$(OUT)/runtime/%.o) $(RUNTIME_ASM:%=$(OUT)/runtime/%.S.o) $(LINUX:%=$(OUT)/linux/%.o) \
+  $(GFX:%=$(OUT)/gfx/%.o) $(GFX_ASM:%=$(OUT)/gfx/%.S.o) $(TEX:%=$(OUT)/tex/%.o)
+HEADERS := $(wildcard runtime/*.h runtime/linux/*.h runtime/linux/include/*.h runtime/linux/include/*/*.h third_party/d2r_gfx/gfx/nvn/*.h third_party/d2r_gfx/gfx/nvn/include/*.h third_party/d2r_gfx/host/*.h)
+
+$(OUT)/botw-native: $(OBJS)
+	$(CC) $(OBJS) $(LIBS) -o $@
+$(OUT)/runtime/%.o: runtime/%.c $(HEADERS) Makefile.linux
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(OUT)/runtime/%.S.o: runtime/%.S third_party/d2r_gfx/gfx/nvn/include/asm_sym.h
+	@mkdir -p $(dir $@)
+	$(CC) -Ithird_party/d2r_gfx/gfx/nvn/include -c $< -o $@
+$(OUT)/linux/%.o: runtime/linux/%.c $(HEADERS) Makefile.linux
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -Iruntime -c $< -o $@
+$(OUT)/gfx/%.o: third_party/d2r_gfx/gfx/nvn/%.c $(HEADERS) Makefile.linux
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(OUT)/gfx/%.S.o: third_party/d2r_gfx/gfx/nvn/%.S third_party/d2r_gfx/gfx/nvn/include/asm_sym.h
+	@mkdir -p $(dir $@)
+	$(CC) -Ithird_party/d2r_gfx/gfx/nvn/include -c $< -o $@
+$(OUT)/tex/%.o: third_party/d2r_gfx/gfx/tex/%.c $(HEADERS) Makefile.linux
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@

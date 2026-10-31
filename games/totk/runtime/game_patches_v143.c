@@ -1,5 +1,6 @@
 /* 1.4.3 has a new compiler and frame-controller layout. Every adapted game-code
    site below is checked before any write; older versions use game_patches.c. */
+#include "host_context.h"
 #include "aspect_patch.h"
 #include <time.h>
 #include "game_patches.h"
@@ -629,21 +630,21 @@ static void watch_all(int on){
 static int ft_trap(ucontext_t *u,unsigned ec);   /* "frametrace" (below) */
 static int br_trap(ucontext_t *u,unsigned ec);   /* "bpregs" (below) */
 int runtime_diag_watch_trap(void *context){
-    ucontext_t *u=context;uint64_t pc=u->uc_mcontext->__ss.__pc,lr=u->uc_mcontext->__ss.__lr;
-    unsigned ec=(unsigned)(u->uc_mcontext->__es.__esr>>26);
+    ucontext_t *u=context;uint64_t pc=u->UC_PC,lr=u->UC_LR;
+    unsigned ec=(unsigned)(UC_ESR(u)>>26);
     if(ft_trap(u,ec))return 1;
     if(br_trap(u,ec))return 1;
     if(bp_addr&&(ec==0x30||ec==0x31)&&pc==bp_addr){   /* the VR camera search's breakpoint */
-        atomic_store(&bp_x1,u->uc_mcontext->__ss.__x[bp_reg]);atomic_fetch_add(&bp_n,1);
-        if(bp_collect){const uint64_t v=u->uc_mcontext->__ss.__x[bp_reg];   /* "camsrc": every distinct value, counted */
+        atomic_store(&bp_x1,u->UC_X[bp_reg]);atomic_fetch_add(&bp_n,1);
+        if(bp_collect){const uint64_t v=u->UC_X[bp_reg];   /* "camsrc": every distinct value, counted */
             for(unsigned i=0;i<8;i++){uint64_t z=0;if(atomic_compare_exchange_strong(&bp_seen[i].v,&z,v)||z==v){atomic_fetch_add(&bp_seen[i].n,1);if(!bp_hooked(v))atomic_fetch_add(&bp_seen[i].raw,1);break;}}}
         thread_act_t self=mach_thread_self();bp_set(self,0);mach_port_deallocate(mach_task_self(),self);return 1;}
     if(!watch_addr||(ec!=0x34&&ec!=0x35))return 0;   /* watchpoint */
     for(unsigned i=(unsigned)(pc>>2)%WATCH_SLOTS,k=0;k<WATCH_SLOTS;k++,i=(i+1)%WATCH_SLOTS){
         uint64_t z=0;if(atomic_compare_exchange_strong(&watch_hits[i].pc,&z,pc)||z==pc){atomic_store(&watch_hits[i].lr,lr);
-            uint64_t fp=u->uc_mcontext->__ss.__fp;for(int d=0;d<3;d++){uint64_t fr[2]={0,0};if(!fp||(fp&15))break;memcpy(fr,(const void *)(uintptr_t)fp,16);atomic_store(&watch_hits[i].up[d],fr[1]);fp=fr[0];}
-            atomic_store(&watch_hits[i].x1,u->uc_mcontext->__ss.__x[1]);
-            {static const int rn[6]={0,19,20,21,22,8};for(int r=0;r<6;r++)atomic_store(&watch_hits[i].xr[r],u->uc_mcontext->__ss.__x[rn[r]]);}
+            uint64_t fp=u->UC_FP;for(int d=0;d<3;d++){uint64_t fr[2]={0,0};if(!fp||(fp&15))break;memcpy(fr,(const void *)(uintptr_t)fp,16);atomic_store(&watch_hits[i].up[d],fr[1]);fp=fr[0];}
+            atomic_store(&watch_hits[i].x1,u->UC_X[1]);
+            {static const int rn[6]={0,19,20,21,22,8};for(int r=0;r<6;r++)atomic_store(&watch_hits[i].xr[r],u->UC_X[rn[r]]);}
             atomic_fetch_add(&watch_hits[i].n,1);break;}
     }
     thread_act_t self=mach_thread_self();watch_set(self,0);mach_port_deallocate(mach_task_self(),self);
@@ -889,10 +890,10 @@ static void ft_all(int on){
 }
 static int ft_trap(ucontext_t *u,unsigned ec){   /* from runtime_diag_watch_trap: 1 when the breakpoint was one of ours */
     if(!ft_nsite||(ec!=0x30&&ec!=0x31))return 0;   /* by address, not ft_on: a thread can hit a site while the end clears them */
-    const uint64_t pc=u->uc_mcontext->__ss.__pc;int k=0;while(k<ft_nsite&&ft_site[k]!=pc)k++;
+    const uint64_t pc=u->UC_PC;int k=0;while(k<ft_nsite&&ft_site[k]!=pc)k++;
     if(k==ft_nsite)return 0;
-    uint64_t ret[FT_DEPTH];int depth=0;ret[depth++]=u->uc_mcontext->__ss.__lr;
-    const uint64_t sp=u->uc_mcontext->__ss.__sp;uint64_t fp=u->uc_mcontext->__ss.__fp;
+    uint64_t ret[FT_DEPTH];int depth=0;ret[depth++]=u->UC_LR;
+    const uint64_t sp=u->UC_SP;uint64_t fp=u->UC_FP;
     while(depth<FT_DEPTH&&fp&&!(fp&15)&&fp>=sp&&fp<sp+(1u<<20)){uint64_t fr[2];memcpy(fr,(const void *)(uintptr_t)fp,16);
         ret[depth++]=fr[1];if(fr[0]<=fp)break;fp=fr[0];}   /* callers' frames sit higher on the stack */
     ft_record(k,ret,depth);
@@ -1056,13 +1057,13 @@ static void br_all(int on){
    distinct value of the register. */
 static int bv_on,bv_reg;static struct{_Atomic uint64_t v;_Atomic uint32_t n;} bv_seen[32];
 static int br_trap(ucontext_t *u,unsigned ec){
-    if(!br_addr||(ec!=0x30&&ec!=0x31)||u->uc_mcontext->__ss.__pc!=br_addr)return 0;
-    if(bv_on){const uint64_t v=u->uc_mcontext->__ss.__x[bv_reg];
+    if(!br_addr||(ec!=0x30&&ec!=0x31)||u->UC_PC!=br_addr)return 0;
+    if(bv_on){const uint64_t v=u->UC_X[bv_reg];
         for(unsigned i=0;i<32;i++){uint64_t z=0;if(atomic_compare_exchange_strong(&bv_seen[i].v,&z,v)||z==v){atomic_fetch_add(&bv_seen[i].n,1);break;}}
         thread_act_t self=mach_thread_self();br_set(self,0);mach_port_deallocate(mach_task_self(),self);return 1;}
-    if(br_creg>=0){const uint64_t cv=u->uc_mcontext->__ss.__x[br_creg];if(cv<br_clo||cv>=br_chi){thread_act_t self=mach_thread_self();br_set(self,0);mach_port_deallocate(mach_task_self(),self);return 1;}}   /* condition not met: re-armed later */
-    int z=0;if(atomic_compare_exchange_strong(&br_hit,&z,1)){for(int i=0;i<29;i++)br_x[i]=u->uc_mcontext->__ss.__x[i];
-        br_x[29]=u->uc_mcontext->__ss.__fp;br_x[30]=u->uc_mcontext->__ss.__lr;br_x[31]=u->uc_mcontext->__ss.__sp;
+    if(br_creg>=0){const uint64_t cv=u->UC_X[br_creg];if(cv<br_clo||cv>=br_chi){thread_act_t self=mach_thread_self();br_set(self,0);mach_port_deallocate(mach_task_self(),self);return 1;}}   /* condition not met: re-armed later */
+    int z=0;if(atomic_compare_exchange_strong(&br_hit,&z,1)){for(int i=0;i<29;i++)br_x[i]=u->UC_X[i];
+        br_x[29]=u->UC_FP;br_x[30]=u->UC_LR;br_x[31]=u->UC_SP;
         uint64_t fp=br_x[29];for(int d=0;d<2;d++){uint64_t fr[2]={0,0};if(!fp||(fp&15)||!jd_read(fp,fr,16))break;br_x[32+d]=fr[1];fp=fr[0];}
         atomic_store(&br_hit,2);}
     thread_act_t self=mach_thread_self();br_set(self,0);mach_port_deallocate(mach_task_self(),self);return 1;

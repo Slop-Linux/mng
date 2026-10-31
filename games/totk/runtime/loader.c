@@ -1,5 +1,7 @@
 /* Native ARM64 module loader. Guest images and generated metadata stay local. */
 #include "runtime.h"
+#include "host_context.h"
+#include "host_tp.h"
 #include "totk_ui_lang.h"
 #include <TargetConditionals.h>
 #include <dlfcn.h>
@@ -22,7 +24,11 @@
 #include "game_patches.h"
 #include "game_version.h"
 #include <errno.h>
+#ifdef __linux__
+__thread uint64_t runtime_tp_slot[RUNTIME_NSLOT] __attribute__((tls_model("local-exec")));
+#else
 pthread_key_t runtime_keys[8];
+#endif
 static uint64_t timer_calls, svc_calls;
 _Noreturn void runtime_fail(const char *message) { fprintf(stderr,"[totk] FAIL: %s\n",message); exit(1); }
 static void need(bool c,const char *m) { if(!c) runtime_fail(m); }
@@ -245,8 +251,15 @@ static void map_module(Module *m,const char *dir) {
  for(unsigned i=0;i<32;i++)snprintf(hex+i*2,3,"%02x",digest[i]);
  need(!strcmp(hex,m->digest),"image SHA256 differs from verified rewrite");
  need(m->key_off%0x4000==0&&m->key_off+0x4000<=m->patch_off&&m->patch_off<m->size,"key and patch layout");
+#ifdef __linux__
+ /* Linux reads 0 from TPIDRRO_EL0: every thread-slot access the rewriter emitted (mrs Xt, tpidrro_el0, all of them in the
+    patch area; structck.py checks each is followed by its key-slot load / store) reads TPIDR_EL0 instead. */
+ unsigned tp_sites=0;
+ for(size_t o=m->patch_off;o+4<=m->file_size;o+=4){uint32_t w;memcpy(&w,m->base+o,4);if((w&~31u)==0xd53bd060u){w=0xd53bd040u|(w&31);memcpy(m->base+o,&w,4);tp_sites++;}}
+ fprintf(stderr,"[totk] %s: %u thread-pointer reads moved to tpidr_el0\n",m->name,tp_sites);
+#endif
  uint64_t *key=(void *)(m->base+m->key_off);
- for(unsigned i=0;i<8;i++)key[i]=runtime_keys[i]*8;
+ for(unsigned i=0;i<8;i++)key[i]=runtime_slot_offset(i);
  make_hash(m);
  fprintf(stderr,"[totk] mapped %s at %p size=%zu symbols=%u\n",m->name,(void *)m->base,m->size,m->nsym);
 }
@@ -348,15 +361,15 @@ void runtime_thread_init(void) {
  /* Faults and emulated instructions are handled off the guest stack, which can be as small as 4 KiB. */
  e->signal_stack=malloc(SIGNAL_STACK_SIZE);need(e->signal_stack!=NULL,"signal stack allocation");
  stack_t ss={.ss_sp=e->signal_stack,.ss_size=SIGNAL_STACK_SIZE,.ss_flags=0};need(sigaltstack(&ss,NULL)==0,"install signal stack");memcpy((uint8_t *)e->tlr+0x1f8,&e->dummy,8);
- need(pthread_setspecific(environment_key,e)==0&&pthread_setspecific(runtime_keys[0],NULL)==0,"thread ownership");
- need(pthread_setspecific(runtime_keys[1],e->tls)==0&&pthread_setspecific(runtime_keys[2],e->tlr)==0&&pthread_setspecific(runtime_keys[3],(void *)runtime_gate)==0,"thread slots");
- uintptr_t tp;__asm__ volatile("mrs %0,tpidrro_el0":"=r"(tp));
- need((tp&7)==0,"unaligned raw Darwin TSD incompatible with patches");
- for(unsigned i=0;i<4;i++){void *raw;memcpy(&raw,(void *)(tp+runtime_keys[i]*8),8);need(raw==pthread_getspecific(runtime_keys[i]),"Darwin TSD layout");}
+ need(pthread_setspecific(environment_key,e)==0&&runtime_slot_set(0,NULL)==0,"thread ownership");
+ need(runtime_slot_set(1,e->tls)==0&&runtime_slot_set(2,e->tlr)==0&&runtime_slot_set(3,(void *)runtime_gate)==0,"thread slots");
+ uintptr_t tp=runtime_tp();
+ need((tp&7)==0,"unaligned thread pointer incompatible with patches");
+ for(unsigned i=0;i<4;i++){void *raw;memcpy(&raw,(void *)(tp+runtime_slot_offset(i)),8);need(raw==runtime_slot_get(i),"thread slot layout");}
 }
 static void thread_cleanup(void) {
  ThreadEnvironment *e=pthread_getspecific(environment_key);pthread_setspecific(environment_key,NULL);
- for(unsigned i=0;i<4;i++)pthread_setspecific(runtime_keys[i],NULL);environment_destroy(e);
+ for(unsigned i=0;i<4;i++)runtime_slot_set(i,NULL);environment_destroy(e);
 }
 uint64_t runtime_now_ns(void) {mach_timebase_info_data_t tb;mach_timebase_info(&tb);return (uint64_t)((__uint128_t)mach_absolute_time()*tb.numer/tb.denom);}
 /* The system counter (cntpct / cntvct) at the rate the game's SDK converts it with: the Switch's 19.2 MHz, or the Switch 2's
@@ -401,9 +414,9 @@ static void signal_hex(const char *label,uint64_t value) {
 static int stale_target_reference(int num,siginfo_t *info,ucontext_t *u){
  if((num!=SIGSEGV&&num!=SIGBUS)||!modules[0].base)return 0;
  const uint32_t *site=(const uint32_t *)(uintptr_t)(modules[0].base+GAME_ADDR(0x15ecb0c));   /* ldr x21,[x8] */
- uint64_t pc=u->uc_mcontext->__ss.__pc,*x=u->uc_mcontext->__ss.__x;
+ uint64_t pc=u->UC_PC,*x=u->UC_X;
  if(site[-2]!=0xf9435a68u||site[0]!=0xf9400115u||(site[1]&0xff00001fu)!=0xb4000015u||(site[6]&0xfc000000u)!=0x94000000u)return 0;   /* ldr x8,[x19,#0x6b0]; ldr x21,[x8]; cbz x21; bl */
- if(u->uc_mcontext->__ss.__lr!=(uintptr_t)(site+7)||*(const uint32_t *)(uintptr_t)pc!=0xb94012c8u||x[1]!=x[22]||(uintptr_t)info->si_addr!=x[22]+0x10)return 0;
+ if(u->UC_LR!=(uintptr_t)(site+7)||*(const uint32_t *)(uintptr_t)pc!=0xb94012c8u||x[1]!=x[22]||(uintptr_t)info->si_addr!=x[22]+0x10)return 0;
  int32_t bl=(int32_t)(site[6]<<6)>>6,skip=(int32_t)((site[1]>>5)<<13)>>13;
  const uint32_t *callee=site+6+bl,*resume=site+1+skip;
  int64_t frame=0;unsigned saved[32]={0};int nsaved=0;uint64_t at[32];
@@ -412,11 +425,11 @@ static int stale_target_reference(int num,siginfo_t *info,ucontext_t *u){
   else if((w&0xffc00000u)==0xa9000000u&&rn==31&&frame&&nsaved<30){saved[nsaved]=rt;at[nsaved++]=(uint64_t)imm7;saved[nsaved]=rt2;at[nsaved++]=(uint64_t)imm7+8;}   /* stp xa,xb,[sp,#o] */
   else if((w&0xffc00000u)==0xf9000000u&&rn==31&&frame&&nsaved<31){saved[nsaved]=rt;at[nsaved++]=((w>>10)&0xfff)*8;}}   /* str xa,[sp,#o] */
  if(!frame||frame>0x100)return 0;
- uint64_t sp=u->uc_mcontext->__ss.__sp,stack[32];mach_vm_size_t got=0;
+ uint64_t sp=u->UC_SP,stack[32];mach_vm_size_t got=0;
  if(mach_vm_read_overwrite(mach_task_self(),sp,(mach_vm_size_t)frame,(uintptr_t)stack,&got)!=KERN_SUCCESS||got!=(mach_vm_size_t)frame)return 0;
  for(int i=0;i<nsaved;i++){if(at[i]+8>(uint64_t)frame)return 0;uint64_t v=stack[at[i]/8];
-  if(saved[i]==29)u->uc_mcontext->__ss.__fp=v;else if(saved[i]==30)u->uc_mcontext->__ss.__lr=v;else if(saved[i]<29)x[saved[i]]=v;}
- u->uc_mcontext->__ss.__sp=sp+(uint64_t)frame;u->uc_mcontext->__ss.__pc=(uintptr_t)resume;
+  if(saved[i]==29)u->UC_FP=v;else if(saved[i]==30)u->UC_LR=v;else if(saved[i]<29)x[saved[i]]=v;}
+ u->UC_SP=sp+(uint64_t)frame;u->UC_PC=(uintptr_t)resume;
  uint64_t stale=x[21];uintptr_t field=x[19]+0x6b0;uint64_t holder=0,word=0;   /* the caller's x19 = the object, x21 = the stale word */
  if(mach_vm_read_overwrite(mach_task_self(),field,8,(uintptr_t)&holder,&got)==KERN_SUCCESS&&got==8&&holder&&
     mach_vm_read_overwrite(mach_task_self(),holder,8,(uintptr_t)&word,&got)==KERN_SUCCESS&&got==8&&word==stale)
@@ -441,10 +454,10 @@ static void crash(int num,siginfo_t *info,void *context) {
  /* During save load, this optional game object can contain a tagged invalid
     reference. Treat it as absent, as the following cbz path expects (TOTK). */
  if(num==SIGSEGV&&modules[0].base&&
-    u->uc_mcontext->__ss.__pc==(uintptr_t)modules[0].base+GAME_ADDR(0x15ecb0c)&&
+    u->UC_PC==(uintptr_t)modules[0].base+GAME_ADDR(0x15ecb0c)&&
     (uintptr_t)info->si_addr==0xffff0000ffffffffULL&&
-    u->uc_mcontext->__ss.__x[8]==0xffff0000ffffffffULL){
-  uintptr_t field=u->uc_mcontext->__ss.__x[19]+0x6b0;
+    u->UC_X[8]==0xffff0000ffffffffULL){
+  uintptr_t field=u->UC_X[19]+0x6b0;
   uint64_t current=0;mach_vm_size_t got=0;
   if(mach_vm_read_overwrite(mach_task_self(),field,sizeof(current),(uintptr_t)&current,&got)==KERN_SUCCESS&&
      got==sizeof(current)&&current==0xffff0000ffffffffULL){
@@ -452,39 +465,39 @@ static void crash(int num,siginfo_t *info,void *context) {
    if(__atomic_compare_exchange_n((uint64_t *)field,&expected,0,false,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST)){
     static const char note[]="[totk] ignored invalid optional menu reference\n";
     write(2,note,sizeof(note)-1);
-    u->uc_mcontext->__ss.__x[8]=0;
-    u->uc_mcontext->__ss.__pc-=4;
+    u->UC_X[8]=0;
+    u->UC_PC-=4;
     return;
    }
   }
  }
 #endif
  /* EL0 cache maintenance that Darwin traps but Horizon allows: emulate exactly two encodings (SDK only). */
- if(num==SIGILL){uint32_t insn=*(const uint32_t *)(uintptr_t)u->uc_mcontext->__ss.__pc;unsigned rt=insn&31;
-  if((insn&~31u)==0xd53b0020u){if(rt!=31)u->uc_mcontext->__ss.__x[rt]=HOST_CTR_EL0;u->uc_mcontext->__ss.__pc+=4;return;}   /* mrs Xt, CTR_EL0 */
-  if((insn&~31u)==0xd50b7e20u){uintptr_t a=rt==31?0:(uintptr_t)u->uc_mcontext->__ss.__x[rt];sys_dcache_flush((void *)(a&~(uintptr_t)127),128);u->uc_mcontext->__ss.__pc+=4;return;}   /* dc civac, Xt */
+ if(num==SIGILL){uint32_t insn=*(const uint32_t *)(uintptr_t)u->UC_PC;unsigned rt=insn&31;
+  if((insn&~31u)==0xd53b0020u){if(rt!=31)u->UC_X[rt]=HOST_CTR_EL0;u->UC_PC+=4;return;}   /* mrs Xt, CTR_EL0 */
+  if((insn&~31u)==0xd50b7e20u){uintptr_t a=rt==31?0:(uintptr_t)u->UC_X[rt];sys_dcache_flush((void *)(a&~(uintptr_t)127),128);u->UC_PC+=4;return;}   /* dc civac, Xt */
  }
  /* The graphics layer's write tracking first: a guarded write (WriteTexels) to a page it keeps read-only is its fault to
     resolve, not a lost page (2026-10-29: the guard took it first and dropped a 17 MiB texture's update). */
- if(runtime_gfx_fault(info->si_addr,(u->uc_mcontext->__es.__esr>>6)&1,context))return;
+ if(runtime_gfx_fault(info->si_addr,(UC_ESR(u)>>6)&1,context))return;
  if((num==SIGBUS||num==SIGSEGV)&&runtime_fault_guard){sigjmp_buf *g=runtime_fault_guard;runtime_fault_guard=NULL;siglongjmp(*g,1);}   /* guarded host access to guest memory (uniform snapshot copies, texture reads, ReadTexels / WriteTexels) */
- uint64_t pc=u->uc_mcontext->__ss.__pc,fp=u->uc_mcontext->__ss.__fp;
- signal_hex("[totk] signal=",num);signal_hex("fault=",(uintptr_t)info->si_addr);signal_hex("esr=",u->uc_mcontext->__es.__esr);
+ uint64_t pc=u->UC_PC,fp=u->UC_FP;
+ signal_hex("[totk] signal=",num);signal_hex("fault=",(uintptr_t)info->si_addr);signal_hex("esr=",UC_ESR(u));
  {mach_vm_address_t ra=(uintptr_t)info->si_addr;mach_vm_size_t rs=0;vm_region_basic_info_data_64_t ri;mach_msg_type_number_t rc=VM_REGION_BASIC_INFO_COUNT_64;mach_port_t ro=0;
-  if(mach_vm_region(mach_task_self(),&ra,&rs,VM_REGION_BASIC_INFO_64,(vm_region_info_t)&ri,&rc,&ro)==KERN_SUCCESS){signal_hex("region=",ra);signal_hex("region size=",rs);signal_hex("region prot=",(uint64_t)ri.protection|((uint64_t)ri.max_protection<<8));}}signal_hex("pc=",pc);signal_hex("lr=",u->uc_mcontext->__ss.__lr);signal_hex("fp=",fp);
+  if(mach_vm_region(mach_task_self(),&ra,&rs,VM_REGION_BASIC_INFO_64,(vm_region_info_t)&ri,&rc,&ro)==KERN_SUCCESS){signal_hex("region=",ra);signal_hex("region size=",rs);signal_hex("region prot=",(uint64_t)ri.protection|((uint64_t)ri.max_protection<<8));}}signal_hex("pc=",pc);signal_hex("lr=",u->UC_LR);signal_hex("fp=",fp);
 #ifdef GAME_BOTW
- {Dl_info di;for(int k=0;k<2;k++){uint64_t a=k?u->uc_mcontext->__ss.__lr:pc;if(dladdr((void *)(uintptr_t)a,&di)&&di.dli_sname){write(2,k?"lr host ":"pc host ",8);write(2,di.dli_sname,strlen(di.dli_sname));signal_hex(" +",a-(uintptr_t)di.dli_saddr);}}}   /* a fault in a host function: name it */
+ {Dl_info di;for(int k=0;k<2;k++){uint64_t a=k?u->UC_LR:pc;if(dladdr((void *)(uintptr_t)a,&di)&&di.dli_sname){write(2,k?"lr host ":"pc host ",8);write(2,di.dli_sname,strlen(di.dli_sname));signal_hex(" +",a-(uintptr_t)di.dli_saddr);}}}   /* a fault in a host function: name it */
  /* Diagnostics (TOTK_CRASH_THREADS=1): what every other guest thread was doing at the fault (wait states, last SVC chains,
     and the live pc of the ones running), to see a job running into data another thread is rebuilding. Once per process. */
  {static int dumped;if(getenv("TOTK_CRASH_THREADS")&&!__atomic_fetch_add(&dumped,1,__ATOMIC_SEQ_CST)){extern void runtime_dump_threads(void);runtime_dump_threads();}}
 #endif
  for(unsigned i=0;i<NM;i++)if(pc>=(uintptr_t)modules[i].base&&pc<(uintptr_t)modules[i].base+modules[i].size){write(2,modules[i].name,strlen(modules[i].name));signal_hex(" offset=",pc-(uintptr_t)modules[i].base);}
- for(unsigned i=0;i<29;i++)signal_hex("x=",u->uc_mcontext->__ss.__x[i]);signal_hex("sp=",u->uc_mcontext->__ss.__sp);
+ for(unsigned i=0;i<29;i++)signal_hex("x=",u->UC_X[i]);signal_hex("sp=",u->UC_SP);
  for(unsigned depth=0;depth<24&&fp&&!(fp&15);depth++){uint64_t frame[2];mach_vm_size_t got=0;if(mach_vm_read_overwrite(mach_task_self(),fp,16,(uintptr_t)frame,&got)!=KERN_SUCCESS||got!=16)break;signal_hex("frame lr=",frame[1]);for(unsigned i=0;i<NM;i++)if(frame[1]>=(uintptr_t)modules[i].base&&frame[1]<(uintptr_t)modules[i].base+modules[i].size){write(2,modules[i].name,strlen(modules[i].name));signal_hex(" offset=",frame[1]-(uintptr_t)modules[i].base);}if(frame[0]==fp)break;fp=frame[0];   /* host-stack switch: frames may move between stacks */}
  /* TOTK_CRASH_MEM=<reg>[:<signed offset>[:<bytes>]]: dump words at register+offset; TOTK_CRASH_MEM_FOLLOW=k1,k2,...: for each
     listed word index, dump 0x100 bytes at that pointer and the ASCII of every readable pointer inside it (data-structure faults). */
  {const char *e=getenv("TOTK_CRASH_MEM");if(e){unsigned r=(unsigned)strtoul(e,NULL,0);const char *c=strchr(e,':');int64_t off=c?strtoll(c+1,NULL,0):0;const char *c2=c?strchr(c+1,':'):NULL;
-  uint64_t len=c2?strtoull(c2+1,NULL,0):0x100;if(len>0x1000)len=0x1000;if(r<29){uint64_t a=u->uc_mcontext->__ss.__x[r]+(uint64_t)off,w[512];mach_vm_size_t got=0;signal_hex("mem at=",a);
+  uint64_t len=c2?strtoull(c2+1,NULL,0):0x100;if(len>0x1000)len=0x1000;if(r<29){uint64_t a=u->UC_X[r]+(uint64_t)off,w[512];mach_vm_size_t got=0;signal_hex("mem at=",a);
   if(mach_vm_read_overwrite(mach_task_self(),a,len,(uintptr_t)w,&got)==KERN_SUCCESS&&got==len){unsigned nw=(unsigned)(len/8);for(unsigned i=0;i<nw;i++){signal_hex("m=",w[i]);}
    const char *f=getenv("TOTK_CRASH_MEM_FOLLOW");while(f&&*f){unsigned k=(unsigned)strtoul(f,NULL,0);uint64_t v[32];if(k<nw&&mach_vm_read_overwrite(mach_task_self(),w[k],sizeof(v),(uintptr_t)v,&got)==KERN_SUCCESS&&got==sizeof(v)){
      signal_hex("follow word=",k);signal_hex("follow at=",w[k]);for(unsigned i=0;i<32;i++){signal_hex("f=",v[i]);
@@ -493,7 +506,7 @@ static void crash(int num,siginfo_t *info,void *context) {
        if(printable>=3){char b[160];size_t n=0;const char *lab="  str=";while(*lab)b[n++]=*lab++;for(unsigned j=0;j<printable&&j<120;j++)b[n++]=t[j];b[n++]='\n';write(2,b,n);}}}}}
     const char *nx=strchr(f,',');f=nx?nx+1:NULL;}}}}}
  {const char *hw=getenv("TOTK_CRASH_HEAPWALK");if(hw){unsigned r=(unsigned)strtoul(hw,NULL,0);const char *c=strchr(hw,':');int64_t off=c?strtoll(c+1,NULL,0):0;mach_vm_size_t got=0;uint64_t hp=0,hh[32];
-  if(r<29&&mach_vm_read_overwrite(mach_task_self(),u->uc_mcontext->__ss.__x[r]+(uint64_t)off,8,(uintptr_t)&hp,&got)==KERN_SUCCESS&&got==8&&mach_vm_read_overwrite(mach_task_self(),hp,sizeof(hh),(uintptr_t)hh,&got)==KERN_SUCCESS&&got==sizeof(hh)){
+  if(r<29&&mach_vm_read_overwrite(mach_task_self(),u->UC_X[r]+(uint64_t)off,8,(uintptr_t)&hp,&got)==KERN_SUCCESS&&got==8&&mach_vm_read_overwrite(mach_task_self(),hp,sizeof(hh),(uintptr_t)hh,&got)==KERN_SUCCESS&&got==sizeof(hh)){
    uint64_t start=hh[5],size=hh[6];signal_hex("heapwalk heap=",hp);signal_hex("heapwalk start=",start);signal_hex("heapwalk size=",size);
    if(start==hp&&size<0x40000000ULL){uint64_t sentinel=hp+0xc8,p=0;unsigned count=0;   /* sead::ExpHeap use list: OffsetList node at +0xc8, blocks linked by their 16-byte ListNode */
     if(mach_vm_read_overwrite(mach_task_self(),sentinel+8,8,(uintptr_t)&p,&got)!=KERN_SUCCESS)p=0;
@@ -505,7 +518,7 @@ static void crash(int num,siginfo_t *info,void *context) {
      b[n++]='\n';write(2,b,n);p=h[1];count++;}}}}}
  /* TOTK_CRASH_HEAPFIND=<reg>: locate the sead::Heap (self pointer at +0x28, size at +0x30) whose range contains the register's
     address by scanning backwards page by page (resource heaps are page-aligned in the alias region), then walk and dump it. */
- {const char *hf=getenv("TOTK_CRASH_HEAPFIND");if(hf){unsigned r=(unsigned)strtoul(hf,NULL,0);mach_vm_size_t got=0;uint64_t a=r<29?u->uc_mcontext->__ss.__x[r]:0,found=0;
+ {const char *hf=getenv("TOTK_CRASH_HEAPFIND");if(hf){unsigned r=(unsigned)strtoul(hf,NULL,0);mach_vm_size_t got=0;uint64_t a=r<29?u->UC_X[r]:0,found=0;
   for(uint64_t pg=a&~0xfffULL;pg&&a-pg<(256ULL<<20);pg-=0x1000){uint64_t hh[8];if(mach_vm_read_overwrite(mach_task_self(),pg,sizeof hh,(uintptr_t)hh,&got)!=KERN_SUCCESS||got!=sizeof hh)continue;
    if(hh[5]==pg&&hh[6]>=0x1000&&hh[6]<0x40000000ULL&&a<pg+hh[6]){found=pg;break;}}
   signal_hex("heapfind reg value=",a);signal_hex("heapfind heap=",found);
@@ -520,7 +533,7 @@ static void crash(int num,siginfo_t *info,void *context) {
     if(mach_vm_read_overwrite(mach_task_self(),found+done,n,(uintptr_t)buf2,&got)!=KERN_SUCCESS||got!=n)break;if(write(fd,buf2,(size_t)n)!=(ssize_t)n)break;done+=n;}close(fd);signal_hex("heapdump bytes=",done);}}}}}}
  /* TOTK_CRASH_HEAPDUMP=<path>: also write the walked heap's bytes (same heap as TOTK_CRASH_HEAPWALK) to a file for offline comparison. */
  {const char *hw=getenv("TOTK_CRASH_HEAPWALK"),*dp=getenv("TOTK_CRASH_HEAPDUMP");if(hw&&dp){unsigned r=(unsigned)strtoul(hw,NULL,0);const char *c=strchr(hw,':');int64_t off=c?strtoll(c+1,NULL,0):0;mach_vm_size_t got=0;uint64_t hp=0,hh[8];
-  if(r<29&&mach_vm_read_overwrite(mach_task_self(),u->uc_mcontext->__ss.__x[r]+(uint64_t)off,8,(uintptr_t)&hp,&got)==KERN_SUCCESS&&got==8&&mach_vm_read_overwrite(mach_task_self(),hp,sizeof(hh),(uintptr_t)hh,&got)==KERN_SUCCESS&&got==sizeof(hh)&&hh[5]==hp&&hh[6]<0x40000000ULL){
+  if(r<29&&mach_vm_read_overwrite(mach_task_self(),u->UC_X[r]+(uint64_t)off,8,(uintptr_t)&hp,&got)==KERN_SUCCESS&&got==8&&mach_vm_read_overwrite(mach_task_self(),hp,sizeof(hh),(uintptr_t)hh,&got)==KERN_SUCCESS&&got==sizeof(hh)&&hh[5]==hp&&hh[6]<0x40000000ULL){
    int fd=open(dp,O_WRONLY|O_CREAT|O_TRUNC,0644);if(fd>=0){uint64_t done=0;static char buf[65536];while(done<hh[6]){uint64_t n=hh[6]-done;if(n>sizeof buf)n=sizeof buf;
     if(mach_vm_read_overwrite(mach_task_self(),hp+done,n,(uintptr_t)buf,&got)!=KERN_SUCCESS||got!=n)break;if(write(fd,buf,(size_t)n)!=(ssize_t)n)break;done+=n;}close(fd);signal_hex("heapdump bytes=",done);}}}}
  _exit(128+num);
@@ -628,12 +641,14 @@ int main(int argc,char **argv) {
  /* One game or GPU probe at a time (memory, GPU time): wait for the slot before anything is loaded. */
  if(!strcmp(argv[2],"boot")||!strncmp(argv[2],"probe-gpu",9))runtime_game_slot_acquire(argv[2]);
  if(strcmp(argv[2],"boot"))setenv("TOTK_PROBE_GPU","1",1);   /* standalone probes submit GPU work; the game does not unless TOTK_GPU_ALLOW_SUBMIT=1 */
- else unsetenv("TOTK_PROBE_GPU");need(sysconf(_SC_PAGESIZE)==0x4000,"expected 16KB Apple pages");
+ else unsetenv("TOTK_PROBE_GPU");need(sysconf(_SC_PAGESIZE)==0x4000,"expected 16 KiB host pages");
  struct sigaction a={0};a.sa_sigaction=crash;a.sa_flags=SA_SIGINFO|SA_ONSTACK;sigemptyset(&a.sa_mask);
  sigaction(SIGSEGV,&a,NULL);sigaction(SIGBUS,&a,NULL);sigaction(SIGILL,&a,NULL);sigaction(SIGTRAP,&a,NULL);
  {struct sigaction ab={0};ab.sa_handler=abort_report;ab.sa_flags=SA_ONSTACK;sigemptyset(&ab.sa_mask);sigaction(SIGABRT,&ab,NULL);}
+#ifndef __linux__
  for(unsigned i=0;i<8;i++)need(pthread_key_create(&runtime_keys[i],NULL)==0&&runtime_keys[i]!=0,"allocate Darwin key");
- runtime_hle_stack_init((uint64_t)runtime_keys[4]*8);
+#endif
+ runtime_hle_stack_init(runtime_slot_offset(4));
  need(pthread_key_create(&environment_key,environment_destroy)==0,"thread environment key");
  load_tables();
  for(unsigned i=0;i<NM;i++)map_module(&modules[i],argv[1]);

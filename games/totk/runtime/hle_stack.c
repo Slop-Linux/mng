@@ -5,6 +5,7 @@
    prints the functions called since tracing began, most called first. 2026-10-17 this is how a hang with every thread idle is narrowed to the last
    host call the game made (the game over "retry" that never reloads). */
 #include "runtime.h"
+#include "host_tp.h"
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -103,7 +104,7 @@ void runtime_hle_trace_set(int mode) {
 
 /* Called on a guest thread's own host stack before it enters guest code; top must leave room for the caller's frame. */
 void runtime_hle_stack_set(uintptr_t top) {
-    uintptr_t tp; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tp));
+    uintptr_t tp = runtime_tp();
     if (!runtime_hle_tsd_off) runtime_fail("host-stack slot not initialised");
     *(volatile uintptr_t *)(tp + runtime_hle_tsd_off) = top & ~(uintptr_t)15;
 }

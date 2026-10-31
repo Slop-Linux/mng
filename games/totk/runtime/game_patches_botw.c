@@ -1,6 +1,7 @@
 /* Breath of the Wild game-code patches (botw.md): exclusive loads with acquire, the real-time frame step, and the
    TOTK_JQ_CHECK diagnostics. Key 4 (ultrawide) is 1.9.0 only (end of the file); the output size answers "not available"
    until BotW's own sites are found. */
+#include "host_context.h"
 #include <stdatomic.h>
 #include "world_survey.h"
 #include <stdio.h>
@@ -1110,7 +1111,7 @@ static double jq_ms(uint64_t since) { static mach_timebase_info_data_t tb; if (!
    replaced, and one line per update while a stick or d-pad direction (bits 16..23) is or was held: time, thread, the
    controller, the tick the loop will read, new and previous hold, the previous update's repeat bits, counts 16..23. */
 static int botw_pad_hook(ucontext_t *u) {
-    uint64_t *x = u->uc_mcontext->__ss.__x, c = x[19]; uint32_t hold = (uint32_t)x[11];
+    uint64_t *x = u->UC_X, c = x[19]; uint32_t hold = (uint32_t)x[11];
     x[8] = *(const uint32_t *)(uintptr_t)(c + 0x100);
     uint32_t old = *(const uint32_t *)(uintptr_t)(c + 0x114), rep = *(const uint32_t *)(uintptr_t)(c + 0x10);
     if ((hold | old) & 0xff0000u) {
@@ -1124,7 +1125,7 @@ static int botw_pad_hook(ucontext_t *u) {
                 n[16], n[17], n[18], n[19], n[20], n[21], n[22], n[23], dl[16], pu[16], dl[17], pu[17], dl[18], pu[18], dl[19], pu[19],
                 dl[20], pu[20], dl[21], pu[21], dl[22], pu[22], dl[23], pu[23]);
     }
-    u->uc_mcontext->__ss.__pc += 4; return 1;
+    u->UC_PC += 4; return 1;
 }
 #endif
 #ifdef GAME_BOTW160
@@ -1260,8 +1261,8 @@ static void cdp_chain(char *chain, size_t size, uint64_t lr, uint64_t fp) {
     }
 }
 static int botw_cdp_cast_hook(ucontext_t *u) {
-    uint64_t *x = u->uc_mcontext->__ss.__x;
-    u->uc_mcontext->__ss.__sp -= 0x110; u->uc_mcontext->__ss.__pc += 4;   /* the instruction the brk took */
+    uint64_t *x = u->UC_X;
+    u->UC_SP -= 0x110; u->UC_PC += 4;   /* the instruction the brk took */
     const uint64_t calls = atomic_fetch_add(&g_cdp_casts, 1), self = x[0], input = x[1];
     float from[3] = {0}, rot[4] = {0}, to[4] = {0}, tol[2] = {0}, radius = 0; uint8_t type = 0xff;
     cdp_read(self + 0x18, from, sizeof from); cdp_read(self + 0x30, rot, sizeof rot); cdp_read(input, to, sizeof to); cdp_read(input + 16, tol, sizeof tol);
@@ -1270,7 +1271,7 @@ static int botw_cdp_cast_hook(ucontext_t *u) {
     const float dx = to[0] - from[0], dy = to[1] - from[1], dz = to[2] - from[2], path = sqrtf(dx * dx + dy * dy + dz * dz);
     if (!calls) fprintf(stderr, "[cdpoint-cast] first cast (the trace works): from %g %g %g to %g %g %g, shape type %u radius %g\n", from[0], from[1], from[2], to[0], to[1], to[2], type, radius);
     if (!(path > 50 || radius > 50 || path != path) || atomic_fetch_add(&g_cdp_cast_logged, 1) >= 40) return 1;
-    char chain[600], vt[40]; cdp_chain(chain, sizeof chain, u->uc_mcontext->__ss.__lr, u->uc_mcontext->__ss.__fp); cdp_where(vt, sizeof vt, cdp_u64(self));
+    char chain[600], vt[40]; cdp_chain(chain, sizeof chain, u->UC_LR, u->UC_FP); cdp_where(vt, sizeof vt, cdp_u64(self));
     fprintf(stderr, "[cdpoint-cast] thread %#x cast %llu: this %#llx (vtable %s) from %g %g %g to %g %g %g (w %g) path %g m, rotation %g %g %g %g, tolerances %g %g, shape %#llx type %u radius %g;%s\n",
             runtime_thread_current_handle(), (unsigned long long)calls, (unsigned long long)self, vt, from[0], from[1], from[2], to[0], to[1], to[2], to[3], path,
             rot[0], rot[1], rot[2], rot[3], tol[0], tol[1], (unsigned long long)shape, type, radius, chain);
@@ -1280,9 +1281,9 @@ static int botw_cdp_cast_hook(ucontext_t *u) {
     return 1;
 }
 static int botw_cdp_cam_hook(ucontext_t *u) {
-    const uint64_t cam = u->uc_mcontext->__ss.__x[19];
+    const uint64_t cam = u->UC_X[19];
     __uint128_t one_half = 0; const float h = 0.5f; memcpy(&one_half, &h, 4);
-    u->uc_mcontext->__ns.__v[1] = one_half; u->uc_mcontext->__ss.__pc += 4;   /* the instruction the brk took */
+    UC_V(u)[1] = one_half; u->UC_PC += 4;   /* the instruction the brk took */
     const uint64_t calls = atomic_fetch_add(&g_cdp_cams, 1);
     float f[4] = {0}; if (!cdp_read(cam + 0x964, f, sizeof f)) return 1;   /* fov, +0x968, aspect, near */
     /* From the first frame whose near distance is 100 m or more (a cutscene's long shot): the camera's three 0x38-byte
@@ -1308,21 +1309,21 @@ static int botw_cdp_cam_hook(ucontext_t *u) {
     fprintf(stderr, "[cdpoint-cam] thread %#x call %llu camera %#llx (vtable %s): fov %g, +0x968 %g, aspect %g, near %g\n",
             runtime_thread_current_handle(), (unsigned long long)calls, (unsigned long long)cam, vt, f[0], f[1], f[2], f[3]);
     if (!odd || atomic_fetch_add(&g_cdp_cam_dumps, 1) >= 3) return 1;
-    char chain[600]; cdp_chain(chain, sizeof chain, u->uc_mcontext->__ss.__lr, u->uc_mcontext->__ss.__fp);
+    char chain[600]; cdp_chain(chain, sizeof chain, u->UC_LR, u->UC_FP);
     fprintf(stderr, "[cdpoint-cam] odd camera values;%s\n", chain);
     cdp_hex("cam", cam, 0x200); cdp_strings("cam", cam, 0x200);
     cdp_hex("cam+0x900", cam + 0x900, 0x100);
     return 1;
 }
 static int botw_cdp_heap_hook(ucontext_t *u) {
-    uint64_t *x = u->uc_mcontext->__ss.__x; const uint64_t router = x[0];
-    x[0] = cdp_u64(router + 88); u->uc_mcontext->__ss.__pc += 4;   /* the instruction the brk took */
+    uint64_t *x = u->UC_X; const uint64_t router = x[0];
+    x[0] = cdp_u64(router + 88); u->UC_PC += 4;   /* the instruction the brk took */
     int32_t want = 0; cdp_read(x[19], &want, 4);   /* x19 = &new size, w20 = old size */
     static _Atomic int first_mid;
     const int mid = want >= (8 << 10) && want < (4 << 20) && !atomic_exchange(&first_mid, 1);   /* the structure once, before any trouble */
     if ((want < (4 << 20) && !mid) || atomic_fetch_add(&g_cdp_heap_logged, 1) >= 12) return 1;
     const uint64_t heap = x[0]; char vt[40]; cdp_where(vt, sizeof vt, cdp_u64(heap));
-    char chain[600]; cdp_chain(chain, sizeof chain, u->uc_mcontext->__ss.__lr, u->uc_mcontext->__ss.__fp);
+    char chain[600]; cdp_chain(chain, sizeof chain, u->UC_LR, u->UC_FP);
     fprintf(stderr, "[cdpoint-heap] thread %#x realloc %#llx: %u -> %d bytes; router %#llx heap %#llx (vtable %s);%s\n", runtime_thread_current_handle(),
             (unsigned long long)x[21], (unsigned)x[20], want, (unsigned long long)router, (unsigned long long)heap, vt, chain);
     cdp_hex("router", router, 0x80);
@@ -1343,13 +1344,13 @@ static int botw_cdp_heap_hook(ucontext_t *u) {
     return 1;
 }
 static int botw_cdp_blend_hook(ucontext_t *u) {
-    uint64_t *x = u->uc_mcontext->__ss.__x; const uint64_t mode = x[19];
+    uint64_t *x = u->UC_X; const uint64_t mode = x[19];
     float t = 0; cdp_read(mode + 432, &t, 4);
-    __uint128_t v = 0; memcpy(&v, &t, 4); u->uc_mcontext->__ns.__v[2] = v; u->uc_mcontext->__ss.__pc += 4;   /* the instruction the brk took */
+    __uint128_t v = 0; memcpy(&v, &t, 4); UC_V(u)[2] = v; u->UC_PC += 4;   /* the instruction the brk took */
     if (t >= 0.999f || atomic_fetch_add(&g_cdp_blend_logged, 1) >= 80) return 1;
-    float from = 0, target = 0; memcpy(&from, &u->uc_mcontext->__ns.__v[0], 4);   /* s0: [mode+388]; s1: target - from */
-    memcpy(&target, &u->uc_mcontext->__ns.__v[1], 4); target += from;
-    char vt[40], chain[600]; cdp_where(vt, sizeof vt, cdp_u64(mode)); cdp_chain(chain, sizeof chain, u->uc_mcontext->__ss.__lr, u->uc_mcontext->__ss.__fp);
+    float from = 0, target = 0; memcpy(&from, &UC_V(u)[0], 4);   /* s0: [mode+388]; s1: target - from */
+    memcpy(&target, &UC_V(u)[1], 4); target += from;
+    char vt[40], chain[600]; cdp_where(vt, sizeof vt, cdp_u64(mode)); cdp_chain(chain, sizeof chain, u->UC_LR, u->UC_FP);
     fprintf(stderr, "[cdpoint-blend] thread %#x mode %#llx (vtable %s): t %g, fov from %g to %g -> %g;%s\n", runtime_thread_current_handle(),
             (unsigned long long)mode, vt, t, from, target, from + (target - from) * t, chain);
     float f[144]; if (!cdp_read(mode, f, sizeof f)) return 1;
@@ -1367,16 +1368,16 @@ static void cdp_heap(void) {   /* the allocator _reserveMore uses ([main+0x2c814
     for (int i = 1; i <= 4; i++) { const uint64_t p = cdp_u64(a + 8 * (uint64_t)i); char tag[24]; snprintf(tag, sizeof tag, "heap[%d]", i); cdp_hex(tag, p, 0x80); cdp_strings(tag, p, 0x100); }
 }
 static int botw_cdp_hook(ucontext_t *u) {
-    uint64_t *x = u->uc_mcontext->__ss.__x, col = x[20], pt = x[19];
+    uint64_t *x = u->UC_X, col = x[20], pt = x[19];
     x[1] = col + 0x10;   /* the instruction the brk took */
-    u->uc_mcontext->__ss.__pc += 4;
+    u->UC_PC += 4;
     const uint64_t grows = atomic_fetch_add(&g_cdp_grows, 1);
     const uint32_t count = U32(col + 0x18), cap = U32(col + 0x1c) & 0x3fffffffu;
     if (!grows) fprintf(stderr, "[cdpoint] first growth (the trace works): collector %#llx, %u points\n", (unsigned long long)col, cap);
     if (cap < g_cdp_min || atomic_fetch_add(&g_cdp_logged, 1) >= 200) return 1;
     const float *f = (const float *)(uintptr_t)pt;   /* hkContactPoint: position xyzw, separating normal xyzw */
-    char chain[400]; size_t n = 0; uint64_t fp = u->uc_mcontext->__ss.__fp; const uint64_t base = (uintptr_t)g_cdp_main;
-    n += (size_t)snprintf(chain + n, sizeof chain - n, " lr main+%#llx", (unsigned long long)(u->uc_mcontext->__ss.__lr - base));
+    char chain[400]; size_t n = 0; uint64_t fp = u->UC_FP; const uint64_t base = (uintptr_t)g_cdp_main;
+    n += (size_t)snprintf(chain + n, sizeof chain - n, " lr main+%#llx", (unsigned long long)(u->UC_LR - base));
     for (int d = 0; d < 12 && fp && !(fp & 15) && n < sizeof chain - 24; d++) {
         const uint64_t next = U64(fp), ret = U64(fp + 8);
         n += (size_t)snprintf(chain + n, sizeof chain - n, ret >= base && ret < base + 0x4000000 ? " < main+%#llx" : " < %#llx", (unsigned long long)(ret >= base && ret < base + 0x4000000 ? ret - base : ret));
@@ -1393,15 +1394,15 @@ static int botw_cdp_hook(ucontext_t *u) {
 #endif
 int botw_jq_hook(void *context) {   /* SIGTRAP from loader.c crash(): 1 = it was one of ours, handled */
 #ifdef GAME_BOTW160
-    if (g_pad_log_on && ((ucontext_t *)context)->uc_mcontext->__ss.__pc == (uintptr_t)g_pad_main + PAD_LOOP) return botw_pad_hook(context);
-    if (g_cdp_on && ((ucontext_t *)context)->uc_mcontext->__ss.__pc == (uintptr_t)g_cdp_main + CDP_SITE) return botw_cdp_hook(context);
-    if (g_cdp_cast_on && ((ucontext_t *)context)->uc_mcontext->__ss.__pc == (uintptr_t)g_cdp_main + CDP_CAST_SITE) return botw_cdp_cast_hook(context);
-    if (g_cdp_heap_on && ((ucontext_t *)context)->uc_mcontext->__ss.__pc == (uintptr_t)g_cdp_main + CDP_HEAP_SITE) return botw_cdp_heap_hook(context);
-    if (g_cdp_blend_on && ((ucontext_t *)context)->uc_mcontext->__ss.__pc == (uintptr_t)g_cdp_main + CDP_BLEND_SITE) return botw_cdp_blend_hook(context);
-    if (g_cdp_cam_on && ((ucontext_t *)context)->uc_mcontext->__ss.__pc == (uintptr_t)g_cdp_main + CDP_CAM_SITE) return botw_cdp_cam_hook(context);
+    if (g_pad_log_on && ((ucontext_t *)context)->UC_PC == (uintptr_t)g_pad_main + PAD_LOOP) return botw_pad_hook(context);
+    if (g_cdp_on && ((ucontext_t *)context)->UC_PC == (uintptr_t)g_cdp_main + CDP_SITE) return botw_cdp_hook(context);
+    if (g_cdp_cast_on && ((ucontext_t *)context)->UC_PC == (uintptr_t)g_cdp_main + CDP_CAST_SITE) return botw_cdp_cast_hook(context);
+    if (g_cdp_heap_on && ((ucontext_t *)context)->UC_PC == (uintptr_t)g_cdp_main + CDP_HEAP_SITE) return botw_cdp_heap_hook(context);
+    if (g_cdp_blend_on && ((ucontext_t *)context)->UC_PC == (uintptr_t)g_cdp_main + CDP_BLEND_SITE) return botw_cdp_blend_hook(context);
+    if (g_cdp_cam_on && ((ucontext_t *)context)->UC_PC == (uintptr_t)g_cdp_main + CDP_CAM_SITE) return botw_cdp_cam_hook(context);
 #endif
     if (!g_jq_on) return 0;
-    ucontext_t *u = context; uint64_t pc = u->uc_mcontext->__ss.__pc, *x = u->uc_mcontext->__ss.__x;
+    ucontext_t *u = context; uint64_t pc = u->UC_PC, *x = u->UC_X;
     int site = -1; for (int i = 0; i < JQ_SITES; i++) if (pc == (uintptr_t)g_jq_main + g_jq_site[i].off) site = i;
     if (site < 0) return 0;
     uint64_t th = 0; pthread_threadid_np(NULL, &th); uint32_t h = runtime_thread_current_handle();
@@ -1465,7 +1466,7 @@ int botw_jq_hook(void *context) {   /* SIGTRAP from loader.c crash(): 1 = it was
         }
         break; }
     }
-    u->uc_mcontext->__ss.__pc = next_pc; return 1;
+    u->UC_PC = next_pc; return 1;
 }
 #undef U32
 #undef U64

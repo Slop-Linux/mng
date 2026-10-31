@@ -22,6 +22,8 @@
 // Semantics follow the public Horizon kernel behavior (KConditionVariable / KAddressArbiter / KSynchronization of Atmosphère mesosphère).
 // All waits hang on one global lock G, with one condition variable per thread; correctness first, performance to be measured later.
 #include "thread_compat.h"
+#include "host_tp.h"
+#include "host_context.h"
 #include "dm_wait_stats.h"
 #include "ipc.h"
 #include <errno.h>
@@ -449,7 +451,6 @@ static thr_t *me_or_null(void);
 static void core_take(thr_t *t);
 static int g_totk_ap = -1;
 static uint64_t g_ap_kicks, g_ap_taken, g_ap_refused, g_ap_deferred;   // signals sent / cores given up in the handler / owner outside game code / owner with preemption disabled (SVC 0x36 later)
-extern pthread_key_t runtime_keys[8];   // loader.c: [2] holds the game's thread-local region (its tpidrro)
 static void totk_preempt_signal(int sig, siginfo_t *si, void *context);
 static int totk_ap_on(void) {   // holding G
     if (g_totk_ap < 0) {
@@ -487,8 +488,8 @@ static int totk_should_yield(const thr_t *t) {   // holding G: does a better wai
 static uint64_t g_ap_skip_host, g_ap_skip_disabled, g_ap_skip_recent;
 static void totk_note_self(thr_t *t) {   // the calling thread, once its slots are set (guest_thread_init): for totk_kick
     if (t->hle_slot || !runtime_hle_tsd_off) return;
-    void *tlr = pthread_getspecific(runtime_keys[2]); if (!tlr) return;
-    uintptr_t tp; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tp));
+    void *tlr = runtime_slot_get(2); if (!tlr) return;
+    uintptr_t tp = runtime_tp();
     t->tlr16 = tlr; __atomic_store_n(&t->hle_slot, (volatile uintptr_t *)(tp + runtime_hle_tsd_off), __ATOMIC_RELEASE);
 }
 static int totk_kick(thr_t *t) {   // holding G, t waiting: mark (and signal) the owners t beats; returns how many
@@ -512,8 +513,8 @@ static void totk_preempt_signal(int sig, siginfo_t *si, void *context) {
     (void)sig; (void)si;
     thr_t *t = me_or_null();
     if (!t || !__atomic_load_n(&t->preempt, __ATOMIC_ACQUIRE) || t->cur_core < 0) return;
-    uint64_t pc = (uint64_t)((ucontext_t *)context)->uc_mcontext->__ss.__pc;
-    uintptr_t tp; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tp));
+    uint64_t pc = (uint64_t)((ucontext_t *)context)->UC_PC;
+    uintptr_t tp = runtime_tp();
     if (!runtime_hle_tsd_off || !*(volatile uintptr_t *)(tp + runtime_hle_tsd_off) || !runtime_guest_code_pc(pc)) {
         __atomic_fetch_add(&g_ap_refused, 1, __ATOMIC_RELAXED); return; }   // in a host function: its next SVC gives the core up
     /* Horizon's preemption disable (ThreadLocalRegion +0x100 disable_count, +0x102 interrupt_flag): the SDK's spin locks
@@ -522,7 +523,7 @@ static void totk_preempt_signal(int sig, siginfo_t *si, void *context) {
        sets interrupt_flag and the switch happens at that SVC. Preempting it anyway made the game stop at its first
        "Continue" (2026-10-24): the lock holder lost its core to a better thread that then spun with wfe on the lock it
        held, on the same core. The TLR is the game's tpidrro, which the loader keeps in runtime_keys[2]. */
-    { volatile uint16_t *tlr = *(uint16_t *volatile *)(tp + (uintptr_t)runtime_keys[2] * 8);
+    { volatile uint16_t *tlr = *(uint16_t *volatile *)(tp + (uintptr_t)runtime_slot_offset(2));
       if (tlr && tlr[0x100 / 2]) { tlr[0x102 / 2] = 1; __atomic_fetch_add(&g_ap_deferred, 1, __ATOMIC_RELAXED); return; } }
     int saved = errno;
     pthread_mutex_lock(&G);
@@ -574,8 +575,8 @@ static void preempt_signal(int sig, siginfo_t *si, void *context) {
     (void)sig; (void)si;
     thr_t *t = me_or_null();
     if (!t || !__atomic_load_n(&t->preempt, __ATOMIC_ACQUIRE) || t->cur_core < 0) return;
-    uint64_t pc = (uint64_t)((ucontext_t *)context)->uc_mcontext->__ss.__pc;
-    uintptr_t tp; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tp));
+    uint64_t pc = (uint64_t)((ucontext_t *)context)->UC_PC;
+    uintptr_t tp = runtime_tp();
     if (!runtime_hle_tsd_off || !*(volatile uintptr_t *)(tp + runtime_hle_tsd_off) || !runtime_guest_code_pc(pc)) return;
     int saved = errno;
     pthread_mutex_lock(&G);
