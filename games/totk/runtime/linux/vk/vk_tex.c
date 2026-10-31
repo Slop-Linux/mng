@@ -148,7 +148,7 @@ static vtex *tex_make(const tex_t *t) {
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b};
     vkCmdPipelineBarrier2(cb, &di);
     v->gmem = t->mem; v->gsize = t->L.size;
-    v->uploadable = t->mem && !vf->depth && !vf->stencil && v->samples == 1 && vf->bpb != 0;
+    { int bw, bh; v->uploadable = t->mem && !vf->depth && !vf->stencil && v->samples == 1 && nvn_fmt_bpb(t->d.format, &bw, &bh) != 0; }
     return v;
 }
 vtex *vk_tex_get(const tex_t *t) {
