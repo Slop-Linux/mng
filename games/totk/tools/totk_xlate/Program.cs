@@ -27,6 +27,7 @@ using Ryujinx.Common.Memory;
 using Ryujinx.Graphics.Shader;
 using Ryujinx.Graphics.Shader.Translation;
 using System;
+using System.Text;
 using System.Collections.Generic;
 using System.Linq;
 using System.IO;
@@ -61,10 +62,13 @@ static class SwshXlate
         public uint ConstantBuffer1Read(int offset) { if (offset >= 0 && offset + 4 <= _c1.Length) return BitConverter.ToUInt32(_c1, offset); Notes.Add($"c1 读越界 +{offset:X}（c1 长 {_c1.Length}）"); return 0; }
         // 全部资源放进第 0 组，各占不同绑定号（spirv-cross 出成一个参数缓冲）；常量段号 index 的缓冲由翻译器给 binding = index+1 的惯例不依赖
         // All resources go into set 0, each with a distinct binding number (spirv-cross emits them as one argument buffer); the translator's convention of giving the buffer of constant segment number index binding = index+1 is not relied on
-        public SetBindingPair CreateConstantBufferBinding(int index) => new(0, _binding++);
-        public SetBindingPair CreateImageBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(0, b); }
-        public SetBindingPair CreateStorageBufferBinding(int index) => new(0, _binding++);
-        public SetBindingPair CreateTextureBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(0, b); }
+        // Vulkan target (Service.cs --target vulkan): the job's "set" puts a stage's resources in its own descriptor set
+        // (vertex / compute 0, fragment 1); Ryujinx's support buffer stays at set 0 binding 0
+        int Set => _job["set"] is JsonNode n ? (int)n : 0;
+        public SetBindingPair CreateConstantBufferBinding(int index) => new(Set, _binding++);
+        public SetBindingPair CreateImageBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(Set, b); }
+        public SetBindingPair CreateStorageBufferBinding(int index) => new(Set, _binding++);
+        public SetBindingPair CreateTextureBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(Set, b); }
         public ReadOnlySpan<ulong> GetCode(ulong address, int minimumSize) => MemoryMarshal.Cast<byte, ulong>(new ReadOnlySpan<byte>(_code)[(int)address..]);
         public int QuerySamplerArrayLengthFromPool() => 32;
         public int QueryTextureArrayLengthFromBuffer(int slot) => 32;
@@ -137,6 +141,10 @@ static class SwshXlate
         // a retry for shaders that actually emit FP64 in the first pass.
         public bool QueryHostSupportsShaderFloat64() => _job["softfloat64"] is not JsonValue v || !(v.TryGetValue<bool>(out bool b) && b);
         public bool QueryHostSupportsTextureShadowLod() => true;
+        // Vulkan target: storage buffers are bound at their base address rounded down to the device's 256-byte offset
+        // alignment, and the shader adds the remainder (Ryujinx GlobalToStorage)
+        public int QueryHostStorageBufferOffsetAlignment() => _job["set"] is JsonNode ? 256 : 16;
+        public bool QueryHasUnalignedStorageBuffer() => _job["set"] is JsonNode;
         // 作业 reduced = true：放宽精度——翻译器只给强制精确的运算打 NoContraction（缺省全部打：保持 Maxwell 分开舍入的逐位结果，代价是 MSL 里大量禁优化的 spvFMul 等）
         // Job reduced = true: relaxed precision - the translator marks NoContraction only on operations that must be exact (the default marks all: keeps the bit-exact results of Maxwell's separate rounding, at the cost of many optimization-disabled spvFMul etc. in the MSL)
         public bool QueryHostReducedPrecision() => _job["reduced"] is JsonNode n && (bool)n;
@@ -194,6 +202,16 @@ static class SwshXlate
                 foreach (var (list, name) in new[] { (p.Info.Textures, "textures"), (p.Info.Images, "images") })
                     foreach (var t in list) res[name].AsArray().Add((JsonNode)new JsonObject { ["binding"] = t.Binding, ["type"] = (int)t.Type, ["format"] = t.Format.ToString(), ["cbuf_slot"] = t.CbufSlot, ["handle"] = t.HandleIndex, ["array"] = t.ArrayLength, ["separate"] = t.Separate, ["flags"] = (int)t.Flags });
                 File.WriteAllText(Path.Combine(outDir, key + ".res.json"), res.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+                if (job["set"] is JsonNode)   // Vulkan target: the same list as lines for the C runtime (runtime/linux/vk_shader.c)
+                {
+                    var t = new StringBuilder();
+                    foreach (var b in p.Info.CBuffers) t.Append($"cbuf {b.Set} {b.Binding} {b.Slot}\n");
+                    foreach (var b in p.Info.SBuffers) t.Append($"sbuf {b.Set} {b.Binding} {b.Slot} {b.SbCbSlot} {b.SbCbOffset} {(int)b.Flags}\n");
+                    foreach (var b in p.Info.Textures) t.Append($"tex {b.Set} {b.Binding} {(int)b.Type} {b.CbufSlot} {b.HandleIndex} {b.ArrayLength} {(b.Separate ? 1 : 0)} {(int)b.Flags} {(int)b.Format}\n");
+                    foreach (var b in p.Info.Images) t.Append($"img {b.Set} {b.Binding} {(int)b.Type} {b.CbufSlot} {b.HandleIndex} {b.ArrayLength} {(b.Separate ? 1 : 0)} {(int)b.Flags} {(int)b.Format}\n");
+                    t.Append($"info {(p.Info.UsesFragCoord ? 1 : 0)} {p.Info.FragmentOutputMap}\n");
+                    File.WriteAllText(Path.Combine(outDir, key + ".vk.txt"), t.ToString());
+                }
                 return null;
             }
             catch (Exception e) { if (Environment.GetEnvironmentVariable("DMSH_STACK") != null) Console.Error.WriteLine(e.StackTrace); return $"{e.GetType().Name}: {e.Message.Split('\n')[0]}"; }

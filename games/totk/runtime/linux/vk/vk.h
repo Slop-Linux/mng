@@ -1,0 +1,106 @@
+/* Linux Vulkan backend of the NVN layer (the nvn_mtl.h interface). Files: vk_dev.c (device, window, memory, submissions,
+   present), vk_tex.c (formats, textures, samplers), vk_shader.c (translation service, shader variants), vk_replay.c (the
+   command stream). */
+#pragma once
+#include "../../../third_party/d2r_gfx/gfx/nvn/nvn_obj.h"
+#include "../../../third_party/d2r_gfx/gfx/nvn/nvn_mtl.h"
+#include "../../../third_party/d2r_gfx/host/dm.h"
+#include <vulkan/vulkan.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define VKDIE(...) do { fprintf(stderr, "[vk] FATAL: " __VA_ARGS__); fputc('\n', stderr); abort(); } while (0)
+#define VKCHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) VKDIE("%s = %d (%s:%d)", #x, r_, __FILE__, __LINE__); } while (0)
+#define VKLOG(...) do { fprintf(stderr, "[vk] " __VA_ARGS__); fputc('\n', stderr); } while (0)
+
+/* ---------- vk_dev.c ---------- */
+typedef struct {
+    VkInstance inst; VkPhysicalDevice phys; VkDevice dev; VkQueue queue; uint32_t qfam;
+    VkPhysicalDeviceProperties props; VkPhysicalDeviceMemoryProperties mem;
+    VkSemaphore timeline; VkCommandPool cmdpool;
+    VkDescriptorSetLayout empty_layout;
+    uint64_t host_align;
+    PFN_vkCmdSetVertexInputEXT CmdSetVertexInputEXT;
+    PFN_vkCreateShadersEXT CreateShadersEXT; PFN_vkDestroyShaderEXT DestroyShaderEXT; PFN_vkCmdBindShadersEXT CmdBindShadersEXT;
+    PFN_vkCmdSetColorBlendEnableEXT CmdSetColorBlendEnableEXT; PFN_vkCmdSetColorBlendEquationEXT CmdSetColorBlendEquationEXT;
+    PFN_vkCmdSetColorWriteMaskEXT CmdSetColorWriteMaskEXT; PFN_vkCmdSetPolygonModeEXT CmdSetPolygonModeEXT;
+    PFN_vkCmdSetRasterizationSamplesEXT CmdSetRasterizationSamplesEXT; PFN_vkCmdSetSampleMaskEXT CmdSetSampleMaskEXT;
+    PFN_vkCmdSetAlphaToCoverageEnableEXT CmdSetAlphaToCoverageEnableEXT; PFN_vkCmdSetDepthClampEnableEXT CmdSetDepthClampEnableEXT;
+    PFN_vkCmdSetLogicOpEnableEXT CmdSetLogicOpEnableEXT; PFN_vkCmdSetLogicOpEXT CmdSetLogicOpEXT;
+    PFN_vkCmdSetTessellationDomainOriginEXT CmdSetTessellationDomainOriginEXT;
+    PFN_vkCmdSetConservativeRasterizationModeEXT CmdSetConservativeRasterizationModeEXT;
+    PFN_vkCmdSetLineRasterizationModeEXT CmdSetLineRasterizationModeEXT;
+    PFN_vkCmdSetDepthClipEnableEXT CmdSetDepthClipEnableEXT;
+    PFN_vkCmdSetProvokingVertexModeEXT CmdSetProvokingVertexModeEXT;
+    PFN_vkCmdPushDescriptorSetKHR CmdPushDescriptorSetKHR;
+    PFN_vkGetMemoryHostPointerPropertiesEXT GetMemoryHostPointerPropertiesEXT;
+} vk_ctx;
+extern vk_ctx V;
+void vk_init(void);
+uint32_t vk_memtype(uint32_t bits, VkMemoryPropertyFlags want);
+
+/* image memory: suballocated from 64 MiB device-local blocks (maxMemoryAllocationCount is 4096) */
+typedef struct { VkDeviceMemory mem; VkDeviceSize off, size; int block; } vk_alloc;
+int vk_alloc_mem(VkMemoryRequirements req, vk_alloc *out);
+void vk_free_mem(vk_alloc *a);
+
+/* guest memory pools: imported host memory (VK_EXT_external_memory_host), one VkBuffer each */
+typedef struct { uintptr_t lo, hi; VkBuffer buf; VkDeviceMemory mem; uintptr_t base; } vk_pool;
+int vk_pool_find(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off);
+
+/* per-submission ring of host-visible memory (driver banks, uniform copies, upload staging) */
+typedef struct { VkBuffer buf; uint8_t *cpu; VkDeviceSize off; } vk_span;
+vk_span vk_ring(VkDeviceSize size, VkDeviceSize align);
+
+/* the submission being recorded: prologue (uploads), main command buffer */
+typedef struct sub sub_t;
+VkCommandBuffer vk_cb(void);          /* main command buffer of the open submission */
+VkCommandBuffer vk_upload_cb(void);   /* prologue: executed before the main one */
+uint64_t vk_next_fence(void);         /* the fence value the open submission will signal */
+uint64_t vk_done(void);               /* completed fence value */
+void vk_sub_post(int kind, volatile uint32_t *val, uint32_t mode, uint32_t v, uint64_t addr);
+void vk_defer_free(void (*fn)(void *), void *p);   /* run when the open submission completes */
+
+/* window and present */
+void vk_window_open(void);
+void vk_present_image(VkImage img, uint32_t w, uint32_t h, VkFormat fmt);
+
+/* ---------- vk_tex.c ---------- */
+typedef struct {
+    VkFormat vk; uint8_t depth, stencil, compressed, bw, bh, bpb, integer, expand3, swz_bgr;
+} vk_fmt;
+const vk_fmt *vk_format(int nvn_format);
+typedef struct vtex vtex;   /* a VkImage made for one texture object (by serial) */
+vtex *vk_tex_get(const tex_t *t);                      /* made on first use */
+void vk_tex_upload_if_stale(vtex *v, const tex_t *t);  /* from guest memory when the CPU wrote it since */
+void vk_tex_gpu_wrote(vtex *v);                         /* rendered / copied into: the image holds the newest content */
+VkImage vk_tex_image(vtex *v);
+VkImageView vk_tex_view(vtex *v, const tex_t *t, const view_t *view, int has_view, VkImageViewType type, int attach);
+void vk_tex_dims(vtex *v, uint32_t *w, uint32_t *h, VkFormat *f);
+int vk_tex_aspect(vtex *v);   /* VkImageAspectFlags of the whole format */
+VkSampler vk_sampler(const samp_par *p);
+void vk_tex_registry_set(int id, const tex_t *t, const view_t *v);
+int vk_tex_registry_get(int id, tex_t *t, view_t *v, int *has_view);
+void vk_samp_registry_set(int id, const samp_par *p);
+int vk_samp_registry_get(int id, samp_par *p);
+void vk_tex_release_serial(uint64_t serial);
+void vk_tex_readback(vtex *v, const tex_t *t);   /* write the image back into guest memory (CPU reads) */
+
+/* ---------- vk_shader.c ---------- */
+enum { RB_CBUF, RB_SBUF, RB_TEX, RB_IMG };
+typedef struct { uint8_t kind, set, type_buffer; uint16_t binding; int32_t slot, cb_slot, cb_off, flags, stype, handle, cbuf_slot, array, separate, format; } vk_rbind;
+typedef struct vshader {
+    char key[96]; int stage;   /* 0 vertex, 1 fragment, 5 compute */
+    uint32_t *spv; size_t nwords;
+    vk_rbind *b; int nb;
+    uint32_t in_mask;          /* vertex: input locations used */
+    uint32_t local[3];
+    uint8_t *c1; size_t c1_len;
+    VkBuffer c1buf; VkDeviceMemory c1mem;
+    VkDescriptorSetLayout layout;
+} vshader;
+vshader *vk_shader_get(const uint8_t *control, const uint8_t *code, int stage, const char *answers);

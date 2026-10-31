@@ -57,6 +57,7 @@ static partial class ShaderService
     static readonly Regex Fp64 = new(@"\bdouble\b|unsupported_GLSLstd450(?:Pack|Unpack)Double2x32");
 
     static string spirvCross, outDir, chain;
+    static bool vulkan;   // --target vulkan: SPIR-V and Ryujinx's resource list are the result; no SPIRV-Cross, no MSL
     static int debugMode;
 
     // ---- small helpers with Python's meaning ----
@@ -463,6 +464,15 @@ static partial class ShaderService
         if (capture && stage != "vs") throw new RuntimeError("geometry_capture on a non-vertex stage");
         if (stage == "cs" && !Truthy(Get(rq, "local"))) throw new RuntimeError("compute shader without thread group size");
         JsonObject job = MakeJob(rq, variant, stage);
+        if (vulkan)
+        {
+            // <variant>.spv and <variant>.res.json (bindings with their Maxwell constant-buffer slots, storage-buffer address
+            // words and texture handles); FP64 is lowered, the device has no shaderFloat64
+            job["set"] = stage == "ps" ? 1 : 0;
+            job["softfloat64"] = true;
+            Translate(job);
+            return;
+        }
         Translate(job);
         JsonObject res = ReadRes(variant);
         string spv = Path.Combine(outDir, variant + ".spv"), msl = Path.Combine(outDir, variant + "_b.metal");
@@ -653,11 +663,12 @@ static partial class ShaderService
                 case "--spirv-cross": spirvCross = v; i++; break;
                 case "--out": outDir = v; i++; break;
                 case "--chain": chain = v; i++; break;
+                case "--target": vulkan = v == "vulkan"; i++; break;
                 case "--debug-mode": debugMode = (int)ParseInt(v); i++; break;
                 default: Console.Error.WriteLine($"totk_xlate --service: unknown argument {args[i]}"); return 2;
             }
         }
-        if (spirvCross == null || outDir == null || chain == null)
+        if ((spirvCross == null && !vulkan) || outDir == null || chain == null)
         {
             Console.Error.WriteLine("usage: totk_xlate --service --spirv-cross <path> --out <dir> --chain <name> [--debug-mode 0|1]");
             return 2;

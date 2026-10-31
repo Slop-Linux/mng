@@ -1,4 +1,4 @@
-/* Linux null graphics backend: the nvn_mtl.h interface without a GPU. A submission's CPU-visible effects (event writes,
+/* Linux null graphics backend (make -f Makefile.linux GFX=null), and the Metal backend's diagnostic stubs for both builds: the nvn_mtl.h interface without a GPU. A submission's CPU-visible effects (event writes,
    counter records, buffer copies, inline uniform updates) are applied in command order when it is committed, so the game's
    waits on syncs, events and queries complete; draws, dispatches and texture work are recorded and dropped. Counted with
    TOTK_NULL_STATS=1 (per op, logged every 600 presents). */
@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef VK_BACKEND   /* the null device; with the Vulkan backend (runtime/linux/vk) only the stubs below */
 typedef struct { const void *mem; uint64_t size; } pool_ent;
 static pool_ent g_pools[4096]; static int g_npool; static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER;
 typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr, src, n; const uint8_t *data; } post_op;
@@ -130,6 +131,7 @@ void mtl_ub_present(double iv_ms) { (void)iv_ms; }
 void mtl_note_world(void) {}
 int mtl_pipeline_archive_tool(int argc, char **argv) { (void)argc; (void)argv; return 1; }
 
+#endif
 /* MetalFX keys and diagnostics of the Metal backend: off */
 int mfx_enabled(void) { return 0; }
 int mfx_latch(void) { return 0; }
@@ -169,7 +171,9 @@ void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = *reuploa
 void mtl_pool_res_stats(uint64_t v[4]) { memset(v, 0, 4 * sizeof *v); }
 void mtl_ren_stats(uint64_t v[6]) { memset(v, 0, 6 * sizeof *v); }
 void mtl_scan_stats(uint64_t *shader_ns, uint64_t *pso_ns) { *shader_ns = *pso_ns = 0; }
+#ifndef VK_BACKEND
 void mtl_stats(uint64_t *passes, uint64_t *draws) { *passes = 0; *draws = g_ops[OP_DRAW] + g_ops[OP_DRAW_IDX]; }
+#endif
 uint64_t mtl_udc_saved_bytes(void) { return 0; }
 uint64_t mtl_upload_bytes(void) { return 0; }
 uint64_t mtl_upload_gpu_ns_take(void) { return 0; }
