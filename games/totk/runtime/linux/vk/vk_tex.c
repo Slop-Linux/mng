@@ -1,4 +1,5 @@
-/* Formats, textures and samplers. A texture object (by serial) gets one VkImage; its content comes from guest memory
+/* Formats, textures and samplers. A texture (by its guest memory and layout: the game re-creates texture objects over the
+   same memory, as nvn_mtl.m's packaged textures are found by memory) gets one VkImage; its content comes from guest memory
    (block-linear deswizzled on the CPU, nvn_deswizzle.c) on first use and again whenever the CPU wrote that memory since
    (nvn_dirty.c write tracking), and from the GPU when it is rendered or copied into. All images stay in GENERAL layout. */
 #include "vk.h"
@@ -97,6 +98,7 @@ struct vtex {
     const uint8_t *gmem; uint64_t gsize; uint64_t stamp; int uploaded, gpu_owned, uploadable;
     nvn_texdesc d;
     vview *views; int nviews;
+    uint64_t key;   /* hash of memory, format, target, size, levels, samples, linearity */
     struct vtex *next;
 };
 #define TEX_HASH 4096
@@ -151,11 +153,22 @@ static vtex *tex_make(const tex_t *t) {
     { int bw, bh; v->uploadable = t->mem && !vf->depth && !vf->stencil && v->samples == 1 && nvn_fmt_bpb(t->d.format, &bw, &bh) != 0; }
     return v;
 }
+static uint64_t tex_key(const tex_t *t) {
+    uint64_t k[6] = {t->mem ? (uint64_t)(uintptr_t)t->mem : t->serial | (1ull << 63), (uint64_t)t->d.format | (uint64_t)t->d.target << 16 | (uint64_t)(t->d.flags & 0x54) << 32,
+                     (uint64_t)t->d.width | (uint64_t)t->d.height << 32, (uint64_t)t->d.depth | (uint64_t)t->d.levels << 32, (uint64_t)t->d.samples | (uint64_t)t->d.stride << 32,
+                     (uint64_t)(t->d.pkg_block_h & 0xff)};
+    uint64_t h = 1469598103934665603ull; const uint8_t *b = (const uint8_t *)k; for (size_t i = 0; i < sizeof k; i++) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+static vtex *g_last; static uint64_t g_last_key;
 vtex *vk_tex_get(const tex_t *t) {
     if (!t || !t->serial) return NULL;
+    uint64_t key = tex_key(t);
     pthread_mutex_lock(&g_tex_mu);
-    vtex *v = g_tex[t->serial % TEX_HASH]; while (v && v->serial != t->serial) v = v->next;
-    if (!v && (v = tex_make(t))) { v->next = g_tex[t->serial % TEX_HASH]; g_tex[t->serial % TEX_HASH] = v; }
+    if (g_last && g_last_key == key) { vtex *v = g_last; pthread_mutex_unlock(&g_tex_mu); return v; }
+    vtex *v = g_tex[key % TEX_HASH]; while (v && v->key != key) v = v->next;
+    if (!v && (v = tex_make(t))) { v->key = key; v->next = g_tex[key % TEX_HASH]; g_tex[key % TEX_HASH] = v; }
+    g_last = v; g_last_key = key;
     pthread_mutex_unlock(&g_tex_mu);
     return v;
 }
@@ -164,14 +177,25 @@ static void tex_destroy(void *p) {
     for (int i = 0; i < v->nviews; i++) vkDestroyImageView(V.dev, v->views[i].view, NULL);
     free(v->views); vkDestroyImage(V.dev, v->img, NULL); vk_free_mem(&v->mem); free(v);
 }
-void vk_tex_release_serial(uint64_t serial) {
+/* images live as long as their memory: a pool going away takes the images made over it */
+void vk_tex_release_range(uintptr_t lo, uintptr_t hi) {
     pthread_mutex_lock(&g_tex_mu);
-    vtex **pp = &g_tex[serial % TEX_HASH]; while (*pp && (*pp)->serial != serial) pp = &(*pp)->next;
-    vtex *v = *pp; if (v) *pp = v->next;
+    for (int b = 0; b < TEX_HASH; b++) for (vtex **pp = &g_tex[b]; *pp;) {
+        vtex *v = *pp;
+        if ((uintptr_t)v->gmem >= lo && (uintptr_t)v->gmem < hi) { *pp = v->next; if (g_last == v) g_last = NULL; vk_defer_free(tex_destroy, v); } else pp = &v->next;
+    }
+    pthread_mutex_unlock(&g_tex_mu);
+}
+void vk_tex_release_serial(uint64_t serial) { (void)serial; }
+void mtl_tex_release(tex_t *t) {   /* a texture without memory is made per object: it goes with it */
+    if (!t || t->mem) return;
+    uint64_t key = tex_key(t);
+    pthread_mutex_lock(&g_tex_mu);
+    vtex **pp = &g_tex[key % TEX_HASH]; while (*pp && (*pp)->key != key) pp = &(*pp)->next;
+    vtex *v = *pp; if (v) { *pp = v->next; if (g_last == v) g_last = NULL; }
     pthread_mutex_unlock(&g_tex_mu);
     if (v) vk_defer_free(tex_destroy, v);
 }
-void mtl_tex_release(tex_t *t) { if (t && t->serial) vk_tex_release_serial(t->serial); }
 void mtl_dead_forget(const uint64_t *serials, size_t n) { (void)serials; (void)n; }
 
 static void upload(vtex *v) {

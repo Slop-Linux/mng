@@ -177,6 +177,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
 void mtl_pool_del(const void *mem) {
     pthread_mutex_lock(&g_pool_mu);
     for (int i = 0; i < g_npool; i++) if (g_pools[i].lo == (uintptr_t)mem) {
+        void vk_tex_release_range(uintptr_t lo, uintptr_t hi); vk_tex_release_range(g_pools[i].lo, g_pools[i].hi);
         vk_pool *o = malloc(sizeof *o); *o = g_pools[i]; g_pools[i] = g_pools[--g_npool];
         pthread_mutex_unlock(&g_pool_mu); vk_defer_free(pool_destroy, o); return;
     }
