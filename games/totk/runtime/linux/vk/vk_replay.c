@@ -98,7 +98,7 @@ static int pass_begin(void) {
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {w, h}}, .layerCount = 1, .colorAttachmentCount = (uint32_t)n, .pColorAttachments = ca,
         .pDepthAttachment = da.sType ? &da : NULL, .pStencilAttachment = sa.sType ? &sa : NULL};
     vkCmdBeginRendering(vk_cb(), &ri);
-    g_pass_open = 1; g_passes++; g_frame_passes++;
+    g_pass_open = 1; g_passes++; g_frame_passes++; g_fb_run = 0;
     return 1;
 }
 
@@ -250,6 +250,7 @@ static VkImageViewType view_type(int stype) {
 }
 static samp_par g_default_samp = {.minf = 1, .magf = 1, .ws = 7, .wt = 7, .wr = 7, .lod_max = 1000, .aniso = 1};
 static int g_feedback;   /* a draw samples an attachment of the open pass */
+static int g_fb_run;     /* the pass was split for the previous draw, which also sampled its targets: a run shares that one split */
 #define MAXW 160
 static VkDescriptorSet stage_set(vshader *s, int stage, int set, VkDescriptorSetLayout layout) {
     VkWriteDescriptorSet w[MAXW]; VkDescriptorBufferInfo bi[MAXW]; VkDescriptorImageInfo ii[MAXW]; int nw = 0, nb = 0, ni = 0;
@@ -542,10 +543,14 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
     pair_t *p = pair_get(vs, fs);
     if (!p->sh[0] || (fs && !p->sh[1])) { g_skips[3]++; return; }
     VkDescriptorSet sets[2]; sets[0] = stage_set(vs, 0, 0, vs->layout); sets[1] = fs ? stage_set(fs, 1, 1, fs->layout) : dset_alloc(V.empty_layout);
-    if (g_feedback) {   /* the draw samples a target of this pass: what the pass rendered so far goes to memory first */
-        static uint64_t n; if (!n++) VKLOG("a draw samples a render target of its own pass: the pass is split there");
+    /* the draw samples a target of this pass: what the pass rendered so far goes to memory first. Consecutive such draws (decals
+       blending into the G-buffer) share one split, as nvn_mtl.m's store before sample (att_unstored_read); they read the
+       pass as it was at the first of them */
+    if (g_feedback && !g_fb_run) {
+        static uint64_t n; if (!n++) VKLOG("a draw samples a render target of its own pass: the pass is split there (once per run of such draws)");
         end_pass(7); if (!pass_begin()) return;
     }
+    g_fb_run = g_feedback;
     VkCommandBuffer cb = vk_cb();
     VkShaderStageFlagBits stages[5] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, VK_SHADER_STAGE_GEOMETRY_BIT};
     VkShaderEXT sh[5] = {p->sh[0], fs ? p->sh[1] : VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
