@@ -64,6 +64,12 @@ uint64_t vk_next_fence(void);         /* the fence value the open submission wil
 uint64_t vk_done(void);               /* completed fence value */
 void vk_sub_post(int kind, volatile uint32_t *val, uint32_t mode, uint32_t v, uint64_t addr);
 void vk_defer_free(void (*fn)(void *), void *p);   /* run when the open submission completes */
+/* occlusion queries: slots of one query pool taken in recording order; a submission's slots are read and reset when it
+   completes, a report (vk_sub_post_samples) sums the slots counted since the last reset */
+typedef struct { int n, skipped; uint32_t slot[]; } vk_qlist;
+VkQueryPool vk_query_pool(void);
+uint32_t vk_query_alloc(void);
+void vk_sub_post_samples(uint64_t addr, vk_qlist *l);
 
 /* window and present */
 void vk_window_open(void);
@@ -89,6 +95,7 @@ void vk_samp_registry_set(int id, const samp_par *p);
 int vk_samp_registry_get(int id, samp_par *p);
 void vk_tex_release_serial(uint64_t serial);
 void vk_tex_readback(vtex *v, const tex_t *t);   /* write the image back into guest memory (CPU reads) */
+VkBufferView vk_tex_bufview(const tex_t *t, int format);   /* a buffer texture's view over its pool memory */
 
 /* ---------- vk_shader.c ---------- */
 enum { RB_CBUF, RB_SBUF, RB_TEX, RB_IMG };

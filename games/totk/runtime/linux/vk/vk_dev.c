@@ -206,10 +206,11 @@ void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
 /* ---------- submissions ---------- */
 #define RING_CHUNK (16ull << 20)
 typedef struct { VkBuffer buf; VkDeviceMemory mem; uint8_t *cpu; VkDeviceSize size, used; } chunk_t;
-typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; } post_t;
+typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; vk_qlist *q; } post_t;
 typedef struct { void (*fn)(void *); void *p; } dfree_t;
 struct sub {
     uint64_t fence; VkCommandBuffer up, main; int up_used;
+    uint32_t q_first, q_n;   /* occlusion query slots taken while it was recorded */
     chunk_t *chunks; int nchunks;
     post_t *posts; int nposts, capposts;
     dfree_t *frees; int nfrees, capfrees;
@@ -222,7 +223,8 @@ static _Atomic uint64_t g_fence_next = 1, g_applied, g_submitted;
 static pthread_t g_done_thread;
 /* GPU time: a timestamp at the start and the end of every submission's main command buffer */
 #define TS_RING 512
-static VkQueryPool g_ts; static _Atomic uint64_t g_gpu_ns;
+static VkQueryPool g_ts; static _Atomic uint64_t g_gpu_ns, g_submit_ns;   /* g_submit_ns: wall time inside vkQueueSubmit2 of the submissions */
+uint64_t vk_submit_ns(void) { return atomic_load(&g_submit_ns); }
 uint64_t vk_gpu_ns(void) { return atomic_load(&g_gpu_ns); }
 
 static void chunk_new(chunk_t *c, VkDeviceSize size) {
@@ -266,7 +268,7 @@ void vk_sub_open(void) {
     if (!s) { s = calloc(1, sizeof *s); s->up = cb_new(); s->main = cb_new(); }
     else { vkResetCommandBuffer(s->up, 0); vkResetCommandBuffer(s->main, 0); }
     pthread_mutex_unlock(&g_cmdpool_mu);
-    s->fence = atomic_fetch_add(&g_fence_next, 1); s->nchunks = 0; s->nposts = 0; s->nfrees = 0; s->up_used = 0; s->next = NULL;
+    s->fence = atomic_fetch_add(&g_fence_next, 1); s->nchunks = 0; s->nposts = 0; s->nfrees = 0; s->up_used = 0; s->next = NULL; s->q_n = 0;
     cb_begin(s->up); cb_begin(s->main);
     if (!g_ts) { VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 * TS_RING}; VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &g_ts)); vkResetQueryPool(V.dev, g_ts, 0, 2 * TS_RING); }
     vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g_ts, (uint32_t)(s->fence % TS_RING) * 2);
@@ -279,7 +281,28 @@ uint64_t vk_done(void) { return atomic_load(&g_applied); }
 void vk_sub_post(int kind, volatile uint32_t *val, uint32_t mode, uint32_t v, uint64_t addr) {
     sub_t *s = g_open; vk_sub_open(); s = g_open;
     if (s->nposts == s->capposts) { s->capposts = s->capposts ? s->capposts * 2 : 64; s->posts = realloc(s->posts, s->capposts * sizeof *s->posts); }
-    s->posts[s->nposts++] = (post_t){kind, val, mode, v, addr};
+    s->posts[s->nposts++] = (post_t){kind, val, mode, v, addr, NULL};
+}
+#define QN 32768
+static VkQueryPool g_qpool; static uint32_t g_qnext; static uint64_t g_qres[QN];
+VkQueryPool vk_query_pool(void) {
+    if (!g_qpool) { VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_OCCLUSION, .queryCount = QN};
+                    VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &g_qpool)); vkResetQueryPool(V.dev, g_qpool, 0, QN); }
+    return g_qpool;
+}
+uint32_t vk_query_alloc(void) {
+    vk_sub_open(); vk_query_pool();
+    if (!g_open->q_n) g_open->q_first = g_qnext;
+    g_open->q_n++; uint32_t s = g_qnext; g_qnext = (g_qnext + 1) % QN; return s;
+}
+void vk_sub_post_samples(uint64_t addr, vk_qlist *l) { vk_sub_post(3, NULL, 0, 0, addr); g_open->posts[g_open->nposts - 1].q = l; }
+/* completion: a submission's slots into g_qres, then reset for reuse */
+static void query_land(sub_t *s) {
+    for (uint32_t done = 0; done < s->q_n;) {
+        uint32_t first = (s->q_first + done) % QN, n = s->q_n - done; if (first + n > QN) n = QN - first;
+        if (vkGetQueryPoolResults(V.dev, g_qpool, first, n, n * 8, &g_qres[first], 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) memset(&g_qres[first], 0, n * 8);
+        vkResetQueryPool(V.dev, g_qpool, first, n); done += n;
+    }
 }
 void vk_defer_free(void (*fn)(void *), void *p) {
     vk_sub_open(); sub_t *s = g_open;
@@ -297,10 +320,19 @@ static void *done_thread(void *arg) {
         VkResult r = vkWaitSemaphores(V.dev, &wi, 10ull * 1000000000);
         if (r == VK_TIMEOUT) { VKLOG("【红】submission %llu not finished after 10 s", (unsigned long long)s->fence); continue; }
         if (r != VK_SUCCESS) VKDIE("wait for submission %llu: %d (device lost?)", (unsigned long long)s->fence, r);
+        query_land(s);
         for (int i = 0; i < s->nposts; i++) {
             post_t *o = &s->posts[i];
             if (o->kind == 1) { if (o->mode == NVN_EVENT_SIGNAL_MODE_ADD) *o->val += o->v; else *o->val = o->v; }
-            else { uint64_t rec[2] = {o->kind == 3 ? 1u << 20 : 0, gpu_ticks()}; memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec); }   /* counters: samples passed reports visible (no queries yet) */
+            else {   /* NVNcounterData {counter, timestamp}: samples passed = the slots since the reset; other counters 0 (nvn_mtl.m) */
+                uint64_t sum = 0;
+                if (o->q) { for (int k = 0; k < o->q->n; k++) sum += g_qres[o->q->slot[k]];
+                            if (!sum && o->q->skipped) sum = 1;   /* a counted draw was not drawn: visible, as nvn_mtl.m */
+                            static int vis = -1; if (vis < 0) vis = getenv("TOTK_VK_OCCL_VISIBLE") != NULL;
+                            if (vis) sum = 1u << 20;
+                            free(o->q); }
+                uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec);
+            }
         }
         { uint64_t t[2]; uint32_t q = (uint32_t)(s->fence % TS_RING) * 2;
           if (vkGetQueryPoolResults(V.dev, g_ts, q, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0]) atomic_fetch_add(&g_gpu_ns, (uint64_t)((t[1] - t[0]) * V.props.limits.timestampPeriod));
@@ -335,7 +367,8 @@ static void submit_now(sub_t *s) {
     VkSemaphoreSubmitInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = V.timeline, .value = s->fence, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = s->up_used ? 2 : 1, .pCommandBufferInfos = s->up_used ? cbs : cbs + 1,
         .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
-    pthread_mutex_lock(&g_queue_mu); VKCHECK(vkQueueSubmit2(V.queue, 1, &si, VK_NULL_HANDLE)); pthread_mutex_unlock(&g_queue_mu);
+    pthread_mutex_lock(&g_queue_mu); uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    VKCHECK(vkQueueSubmit2(V.queue, 1, &si, VK_NULL_HANDLE)); atomic_fetch_add(&g_submit_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0); pthread_mutex_unlock(&g_queue_mu);
     pthread_mutex_lock(&g_sub_mu);
     if (!g_done_thread) pthread_create(&g_done_thread, NULL, done_thread, NULL);
     if (g_inflight_tail) g_inflight_tail->next = s; else g_inflight_head = s;

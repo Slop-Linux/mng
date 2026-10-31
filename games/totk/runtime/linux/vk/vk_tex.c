@@ -187,7 +187,9 @@ static void tex_destroy(void *p) {
     free(v->views); vkDestroyImage(V.dev, v->img, NULL); vk_free_mem(&v->mem); free(v);
 }
 /* images live as long as their memory: a pool going away takes the images made over it */
+static void bview_release_range(uintptr_t lo, uintptr_t hi);
 void vk_tex_release_range(uintptr_t lo, uintptr_t hi) {
+    bview_release_range(lo, hi);
     pthread_mutex_lock(&g_tex_mu);
     for (int b = 0; b < TEX_HASH; b++) for (vtex **pp = &g_tex[b]; *pp;) {
         vtex *v = *pp;
@@ -207,6 +209,50 @@ void mtl_tex_release(tex_t *t) {   /* a texture without memory is made per objec
 }
 void mtl_dead_forget(const uint64_t *serials, size_t n) { (void)serials; (void)n; }
 
+/* GPU deswizzle (deswizzle.comp): a level / layer of a block-linear texture read from its pool buffer by a compute dispatch
+   into the ring, then copied into the image. Used when the bytes per block are a power of two (rows of 16-byte segments)
+   and the level starts 16-byte aligned in the pool; the rest is deswizzled on the CPU. TOTK_VK_CPU_DESWIZZLE=1: CPU only */
+#include "deswizzle_spv.h"
+typedef struct { uint32_t src_off, row_bytes, rows, slices, th, td, pitch, segs; } dsw_pc;
+static VkPipeline g_dsw; static VkPipelineLayout g_dsw_pl; static uint64_t g_gpu_uploads;
+static int dsw_init(void) {
+    static int state; if (state) return state > 0;
+    const char *e = getenv("TOTK_VK_CPU_DESWIZZLE"); if (e && atoi(e)) { state = -1; return 0; }
+    VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}, {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+    VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, .bindingCount = 2, .pBindings = b};
+    VkDescriptorSetLayout dl; VKCHECK(vkCreateDescriptorSetLayout(V.dev, &li, NULL, &dl));
+    VkPushConstantRange pc = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(dsw_pc)};
+    VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &dl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pc};
+    VKCHECK(vkCreatePipelineLayout(V.dev, &pli, NULL, &g_dsw_pl));
+    VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof deswizzle_spv, .pCode = deswizzle_spv};
+    VkShaderModule m; VKCHECK(vkCreateShaderModule(V.dev, &mi, NULL, &m));
+    VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"}, .layout = g_dsw_pl};
+    state = vkCreateComputePipelines(V.dev, VK_NULL_HANDLE, 1, &ci, NULL, &g_dsw) == VK_SUCCESS ? 1 : -1;
+    vkDestroyShaderModule(V.dev, m, NULL);
+    if (state < 0) VKLOG("【红】deswizzle pipeline failed: CPU deswizzle");
+    return state > 0;
+}
+/* records the dispatch of one level / layer into s (pitch: row bytes rounded to 16); 0 when the CPU has to do it */
+static int dsw_record(VkCommandBuffer cb, vtex *v, uint32_t l, uint32_t ly, vk_span *s, uint32_t *pitch, uint32_t *rows_out, uint32_t *slices_out) {
+    if (!dsw_init() || nvn_tex_is_linear(&v->d)) return 0;
+    uint32_t row_bytes, rows, slices, bpb; uint64_t base; unsigned th, td;
+    if (nvn_deswizzle_geom(&v->d, l, ly, &row_bytes, &rows, &slices, &base, &th, &td, &bpb) || (bpb & (bpb - 1))) return 0;
+    VkBuffer pb; VkDeviceSize po;
+    if (!vk_pool_find((uint64_t)(uintptr_t)v->gmem, v->gsize, &pb, &po) || ((po + base) & 15)) return 0;
+    uint32_t p = (row_bytes + 15) & ~15u, segs = p / 16; uint64_t n = (uint64_t)segs * rows * slices;
+    if ((n + 63) / 64 > V.props.limits.maxComputeWorkGroupCount[0] || (po & 255) + v->gsize >= (1ull << 32)) return 0;
+    VkDeviceSize bo = po & ~(VkDeviceSize)(V.props.limits.minStorageBufferOffsetAlignment - 1);
+    *s = vk_ring((VkDeviceSize)p * rows * slices, 256);
+    VkDescriptorBufferInfo bi[2] = {{pb, bo, ((po - bo) + v->gsize + 15) & ~15ull}, {s->buf, s->off, (VkDeviceSize)p * rows * slices}};
+    VkWriteDescriptorSet w[2] = {{.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[0]},
+                                 {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[1]}};
+    dsw_pc pc = {(uint32_t)(po - bo + base), row_bytes, rows, slices, th, td, p, segs};
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dsw);
+    V.CmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dsw_pl, 0, 2, w);
+    vkCmdPushConstants(cb, g_dsw_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    vkCmdDispatch(cb, (uint32_t)((n + 63) / 64), 1, 1);
+    *pitch = p; *rows_out = rows; *slices_out = slices; return 1;
+}
 static void upload(vtex *v) {
     int bw = 1, bh = 1, bpb = nvn_fmt_bpb(v->d.format, &bw, &bh);
     if (!bpb) return;
@@ -214,17 +260,29 @@ static void upload(vtex *v) {
     VkCommandBuffer cb = vk_upload_cb();
     int one_d = v->type == VK_IMAGE_TYPE_1D, linear = nvn_tex_is_linear(&v->d);
     uint32_t nlev = linear ? 1 : v->levels, nlay = linear ? 1 : v->layers;
+    VkBufferImageCopy *cp = malloc(sizeof *cp * nlev * nlay); VkBuffer *cbuf = malloc(sizeof *cbuf * nlev * nlay); int ncp = 0, gpu = 0;
     for (uint32_t l = 0; l < nlev; l++) {
         uint32_t w = mipd(v->w, l), h = one_d ? 1 : mipd(v->h, l), dd = v->type == VK_IMAGE_TYPE_3D ? mipd(v->depth, l) : 1;
         size_t row = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh, bytes = row * rows * dd;
         for (uint32_t ly = 0; ly < nlay; ly++) {
-            vk_span s = vk_ring(bytes, 16);
-            if (nvn_deswizzle(&v->d, l, ly, v->gmem, s.cpu, row)) { static int said; if (!said++) VKLOG("【红】texture %#x %ux%u target %d: no deswizzle path", v->d.format, v->w, v->h, v->d.target); return; }
-            VkBufferImageCopy r = {.bufferOffset = s.off, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, ly, 1}, .imageExtent = {w, h, dd}};
-            vkCmdCopyBufferToImage(cb, s.buf, v->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
-            g_upload_bytes += bytes;
+            vk_span s; uint32_t pitch = (uint32_t)row, r_, z_;
+            if (dsw_record(cb, v, l, ly, &s, &pitch, &r_, &z_)) gpu = 1;
+            else {
+                s = vk_ring(bytes, 16);
+                if (nvn_deswizzle(&v->d, l, ly, v->gmem, s.cpu, row)) { static int said; if (!said++) VKLOG("【红】texture %#x %ux%u target %d: no deswizzle path", v->d.format, v->w, v->h, v->d.target); free(cp); free(cbuf); return; }
+            }
+            cp[ncp] = (VkBufferImageCopy){.bufferOffset = s.off, .bufferRowLength = pitch / bpb * bw, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, ly, 1}, .imageExtent = {w, h, dd}};
+            cbuf[ncp++] = s.buf; g_upload_bytes += bytes;
         }
     }
+    if (gpu) {   /* the dispatches' writes before the copies read them */
+        VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT};
+        VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+        vkCmdPipelineBarrier2(cb, &di); g_gpu_uploads++;
+    }
+    for (int i = 0; i < ncp; i++) vkCmdCopyBufferToImage(cb, cbuf[i], v->img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp[i]);
+    free(cp); free(cbuf);
     if (v->uploaded && getenv("TOTK_VK_UPLOAD_LOG")) VKLOG("re-upload serial %llu fmt %#x %ux%ux%u levels %u layers %u at %p (%llu bytes)", (unsigned long long)v->serial, v->d.format, v->w, v->h, v->depth, v->levels, v->layers, (const void *)v->gmem, (unsigned long long)v->gsize);
     v->stamp = stamp; v->uploaded = 1; v->gpu_owned = 0; g_uploads++;
     nvn_dirty_protect(v->gmem, v->gsize);
@@ -437,4 +495,101 @@ VkSampler vk_sampler(const samp_par *p) {
     pthread_mutex_unlock(&g_samp_mu);
     return e->s;
 }
-void vk_tex_stats(uint64_t *uploads, uint64_t *bytes) { *uploads = g_uploads; *bytes = g_upload_bytes; }
+void vk_tex_stats(uint64_t *uploads, uint64_t *bytes, uint64_t *gpu) { *uploads = g_uploads; *bytes = g_upload_bytes; *gpu = g_gpu_uploads; }
+
+/* ---------- buffer textures (NVN_TEXTURE_TARGET_BUFFER): a texel buffer view over the pool memory, read by the GPU at execution
+   as on NVN (nvn_mtl.m's texture buffer over the pool buffer) ---------- */
+typedef struct bview { uintptr_t mem; VkDeviceSize n; VkFormat fmt; VkBufferView v; struct bview *next; } bview;
+static bview *g_bview[256]; static pthread_mutex_t g_bview_mu = PTHREAD_MUTEX_INITIALIZER;
+VkBufferView vk_tex_bufview(const tex_t *t, int format) {
+    if (t->d.target != NVN_TEXTURE_TARGET_BUFFER || !t->mem) return VK_NULL_HANDLE;
+    const vk_fmt *f = vk_format(format); int bw, bh, bpb = nvn_fmt_bpb(format, &bw, &bh);
+    if (!f || !bpb) { static int said; if (!said++) VKLOG("【红】buffer texture format %#x has no Vulkan format", format); return VK_NULL_HANDLE; }
+    VkDeviceSize n = t->d.width ? t->d.width : 1;
+    if (n > V.props.limits.maxTexelBufferElements) { static int said; if (!said++) VKLOG("【红】buffer texture of %llu texels: the first %u are bound", (unsigned long long)n, V.props.limits.maxTexelBufferElements); n = V.props.limits.maxTexelBufferElements; }
+    uintptr_t mem = (uintptr_t)t->mem; unsigned h = (unsigned)((mem >> 4) ^ n ^ (unsigned)f->vk) & 255;
+    pthread_mutex_lock(&g_bview_mu);
+    for (bview *e = g_bview[h]; e; e = e->next) if (e->mem == mem && e->n == n && e->fmt == f->vk) { pthread_mutex_unlock(&g_bview_mu); return e->v; }
+    VkBuffer b; VkDeviceSize o; VkBufferView v = VK_NULL_HANDLE;
+    if (!vk_pool_find(mem, n * bpb, &b, &o)) { static int said; if (!said++) VKLOG("【红】buffer texture at %#lx is not in a memory pool", (unsigned long)mem); }
+    else if (o % V.props.limits.minTexelBufferOffsetAlignment) { static int said; if (!said++) VKLOG("【红】buffer texture at pool offset %#llx: not %llu-byte aligned", (unsigned long long)o, (unsigned long long)V.props.limits.minTexelBufferOffsetAlignment); }
+    else {
+        VkBufferViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = b, .format = f->vk, .offset = o, .range = n * bpb};
+        if (vkCreateBufferView(V.dev, &ci, NULL, &v) != VK_SUCCESS) v = VK_NULL_HANDLE;
+        bview *e = malloc(sizeof *e); *e = (bview){mem, n, f->vk, v, g_bview[h]}; g_bview[h] = e;
+    }
+    pthread_mutex_unlock(&g_bview_mu); return v;
+}
+static void bview_destroy(void *p) { bview *e = p; if (e->v) vkDestroyBufferView(V.dev, e->v, NULL); free(e); }
+static void bview_release_range(uintptr_t lo, uintptr_t hi) {
+    pthread_mutex_lock(&g_bview_mu);
+    for (int b = 0; b < 256; b++) for (bview **pp = &g_bview[b]; *pp;) { bview *e = *pp; if (e->mem >= lo && e->mem < hi) { *pp = e->next; vk_defer_free(bview_destroy, e); } else pp = &e->next; }
+    pthread_mutex_unlock(&g_bview_mu);
+}
+
+/* ---------- CPU texel access (nvnTextureReadTexels / WriteTexels, as nvn_mtl.m): a texture the GPU rendered or copied into
+   holds its content in the image; any other texture in its pool memory ---------- */
+static vtex *tex_find(const tex_t *t) {
+    if (!t || !t->serial) return NULL;
+    uint64_t key = tex_key(t);
+    pthread_mutex_lock(&g_tex_mu); vtex *v = g_tex[key % TEX_HASH]; while (v && v->key != key) v = v->next; pthread_mutex_unlock(&g_tex_mu);
+    return v;
+}
+/* the region of one level through a host buffer: to_image 0 reads the image into lin, 1 writes lin into it */
+static void texels_image(vtex *v, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *lin, size_t wb, size_t hb, int nz, int to_image) {
+    int is3d = v->type == VK_IMAGE_TYPE_3D; VkDeviceSize n = (VkDeviceSize)wb * hb * nz; VkBuffer b; VkDeviceMemory m; uint8_t *cpu;
+    mtl_finish(); host_buffer(n, &b, &m, &cpu);
+    if (to_image) memcpy(cpu, lin, n);
+    VkCommandBuffer cb = vk_oneshot_begin();
+    VkImageAspectFlags asp = (VkImageAspectFlags)vk_tex_aspect(v); if (asp & VK_IMAGE_ASPECT_DEPTH_BIT) asp = VK_IMAGE_ASPECT_DEPTH_BIT;
+    for (int z = 0; z < nz; z++) {
+        VkBufferImageCopy c = {.bufferOffset = (VkDeviceSize)z * wb * hb, .imageSubresource = {asp, level, is3d ? 0 : layer0 + r->zoffset + z, 1},
+            .imageOffset = {r->xoffset, r->yoffset, is3d ? r->zoffset + z : 0}, .imageExtent = {(uint32_t)r->width, (uint32_t)(r->height ? r->height : 1), 1}};
+        if (to_image) vkCmdCopyBufferToImage(cb, b, v->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c); else vkCmdCopyImageToBuffer(cb, v->img, VK_IMAGE_LAYOUT_GENERAL, b, 1, &c);
+    }
+    vk_oneshot_end(cb);
+    if (!to_image) memcpy(lin, cpu, n);
+    vkUnmapMemory(V.dev, m); vkDestroyBuffer(V.dev, b, NULL); vkFreeMemory(V.dev, m, NULL);
+}
+/* the region of one level in pool memory: write 0 reads it into dst rows, 1 writes src rows into it (swizzled back) */
+static void texels_memory(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *rows, size_t row, size_t img, int write) {
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh), is3d = t->d.target == NVN_TEXTURE_TARGET_3D, nz = r->depth ? r->depth : 1;
+    size_t wb = (size_t)((r->width + bw - 1) / bw) * bpb, hb = (r->height + bh - 1) / bh, x0 = (size_t)(r->xoffset / bw) * bpb, y0 = r->yoffset / bh;
+    uint32_t lw = mipd(t->d.width, level), lh = mipd(t->d.height, level), lz = is3d ? mipd(t->d.depth, level) : 1;
+    size_t lp = (size_t)((lw + bw - 1) / bw) * bpb, lr = (lh + bh - 1) / bh; uint8_t *lin = malloc(lp * lr * lz);
+    for (int z = 0; z < nz; z++) {
+        unsigned layer = is3d ? 0 : layer0 + r->zoffset + z;
+        if ((!is3d || !z) && nvn_deswizzle(&t->d, level, layer, t->mem, lin, lp)) { static int said; if (!said++) VKLOG("【红】texels: no layout path for format %#x", t->d.format); break; }
+        uint8_t *at = lin + (is3d ? (size_t)(r->zoffset + z) * lp * lr : 0);
+        for (size_t y = 0; y < hb; y++) { if (write) memcpy(at + (y0 + y) * lp + x0, rows + z * img + y * row, wb); else memcpy(rows + z * img + y * row, at + (y0 + y) * lp + x0, wb); }
+        if (write && (!is3d || z == nz - 1)) nvn_swizzle(&t->d, level, layer, lin, lp, t->mem);
+    }
+    free(lin);
+}
+void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh); if (!bpb || !r->width || !r->height) return;
+    size_t wb = (size_t)((r->width + bw - 1) / bw) * bpb, hb = (r->height + bh - 1) / bh; int nz = r->depth ? r->depth : 1;
+    vtex *v = tex_find(t);
+    if (v && v->gpu_owned) {
+        uint8_t *lin = malloc(wb * hb * nz); texels_image(v, level, layer0, r, lin, wb, hb, nz, 0);
+        for (int z = 0; z < nz; z++) for (size_t y = 0; y < hb; y++) memcpy(dst + z * img + y * row, lin + (z * hb + y) * wb, wb);
+        free(lin); return;
+    }
+    if (t->mem) texels_memory(t, level, layer0, r, dst, row, img, 0);
+    else for (int z = 0; z < nz; z++) for (size_t y = 0; y < hb; y++) memset(dst + z * img + y * row, 0, wb);
+}
+void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img) {
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh); if (!bpb || !r->width || !r->height) return;
+    size_t wb = (size_t)((r->width + bw - 1) / bw) * bpb, hb = (r->height + bh - 1) / bh; int nz = r->depth ? r->depth : 1;
+    vtex *v = tex_find(t); int gpu = v && v->gpu_owned;
+    if (t->mem) {   /* the pool bytes: a CPU write (re-uploaded on use), or in step with the image the GPU owns */
+        void *tok = gpu ? nvn_dirty_gpu_write_begin(t->mem, t->L.size) : NULL;
+        if (!gpu) dm_guest_write_prepare(t->mem, t->L.size);
+        texels_memory(t, level, layer0, r, (uint8_t *)src, row, img, 1);
+        if (gpu) nvn_dirty_gpu_write_end(tok);
+    }
+    if (!gpu) return;
+    uint8_t *lin = malloc(wb * hb * nz);
+    for (int z = 0; z < nz; z++) for (size_t y = 0; y < hb; y++) memcpy(lin + (z * hb + y) * wb, src + z * img + y * row, wb);
+    texels_image(v, level, layer0, r, lin, wb, hb, nz, 1); free(lin);
+}

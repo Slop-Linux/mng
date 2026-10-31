@@ -9,7 +9,7 @@
       devShells.${system}.default = pkgs.mkShell {
         packages = with pkgs; [
           python314 clang lld llvm git rsync gnumake pkg-config
-          libopus libvpx sdl3 vulkan-headers vulkan-loader spirv-tools
+          libopus libvpx sdl3 vulkan-headers vulkan-loader spirv-tools glslang
           dotnetCorePackages.sdk_10_0 zlib openssl
         ];
         DOTNET_CLI_TELEMETRY_OPTOUT = "1";

@@ -1,0 +1,16 @@
+// Tegra X1 block-linear -> linear, one 16-byte GOB segment per invocation (nvn_deswizzle.c nvn_bl_offset).
+// vk_tex.c upload: x = segment of the block row, y = block row, z = slice; src at the level / layer start, dst rows at pitch.
+#version 450
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) readonly buffer Src { uvec4 src[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Dst { uvec4 dst[]; };
+layout(push_constant) uniform P { uint src_off, row_bytes, rows, slices, th, td, pitch, segs; } p;
+uint gob_off(uint x, uint y) { return (x % 64u / 32u) * 256u + (y % 8u / 2u) * 64u + (x % 32u / 16u) * 32u + (y % 2u) * 16u + x % 16u; }
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.segs * p.rows * p.slices) return;
+    uint x = (i % p.segs) * 16u, y = (i / p.segs) % p.rows, z = i / (p.segs * p.rows);
+    uint bh = 1u << p.th, bd = 1u << p.td, gobs_x = (p.row_bytes + 63u) / 64u, blocks_y = (p.rows + 8u * bh - 1u) / (8u * bh), block = 512u * bh * bd;
+    uint o = (z / bd) * gobs_x * blocks_y * block + (y / (8u * bh)) * gobs_x * block + (x / 64u) * block + ((z % bd) * bh + (y % (8u * bh)) / 8u) * 512u + gob_off(x, y);
+    dst[((z * p.rows + y) * p.pitch + x) / 16u] = src[(p.src_off + o) / 16u];
+}
