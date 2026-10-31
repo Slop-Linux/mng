@@ -36,6 +36,7 @@ static uint64_t g_passes, g_draws, g_dispatches, g_copies, g_skips[8], g_frame_p
 typedef struct { vtex *v; VkImageView view; int level, layer; } att_t;
 static int g_pass_open; static att_t g_patt[8], g_pdepth; static int g_pslot[8]; static uint32_t g_pw, g_ph; static int g_pcount;
 static int g_dyn_set;   /* every dynamic state set once in this command buffer */
+static int g_fb_run;    /* the pass was split for the previous draw, which also sampled its targets: a run of such draws shares that one split */
 static int depth_has_stencil(void) { return g_pdepth.v && (vk_tex_aspect(g_pdepth.v) & VK_IMAGE_ASPECT_STENCIL_BIT); }
 /* why passes end: 0 submit, 1 targets, 2 buffer copy, 3 texture copy, 4 dispatch, 5 barrier, 6 texture clear, 7 feedback, 8 uniform update flush */
 static uint64_t g_end_why[9];
