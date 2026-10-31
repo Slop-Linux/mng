@@ -9,7 +9,7 @@ GAME_DEFS_botw160 := -DGAME_BOTW=1 -DGAME_BOTW160=1
 DEFS := $(GAME_DEFS_$(VERSION))
 OPT ?= -O2
 PKGS := opus vpx sdl3 vulkan openssl
-CFLAGS := -std=gnu11 $(OPT) -g -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-missing-field-initializers -Wno-sign-compare \
+CFLAGS = -std=gnu11 $(OPT) -g -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-missing-field-initializers -Wno-sign-compare \
   -fno-strict-aliasing -D_GNU_SOURCE $(DEFS) $(BACKEND) -Iruntime/linux/include -include darwin_compat.h -Ithird_party/d2r_gfx/gfx/nvn/include -Ibuild \
   $(shell pkg-config --cflags $(PKGS)) -I$(shell pkg-config --variable=includedir opus)/opus
 LIBS := $(shell pkg-config --libs $(PKGS)) -lpthread -lm -ldl
