@@ -317,6 +317,7 @@ void vk_replay_end_pass(void);   /* vk_replay.c */
 uint64_t vk_sub_submit(void) {
     if (!g_open) vk_sub_open();
     vk_replay_end_pass();
+    { void vk_tex_stage_rendered(VkCommandBuffer cb, uint64_t fence); vk_tex_stage_rendered(g_open->main, g_open->fence); }
     sub_t *s = g_open; g_open = NULL;
     if (s->up_used) {   /* uploads first, visible to everything after */
         VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
@@ -324,7 +325,6 @@ uint64_t vk_sub_submit(void) {
         VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
         vkCmdPipelineBarrier2(s->up, &di);
     }
-    { void vk_tex_stage_rendered(VkCommandBuffer cb, uint64_t fence); vk_tex_stage_rendered(s->main, s->fence); }
     vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_ts, (uint32_t)(s->fence % TS_RING) * 2 + 1);
     VKCHECK(vkEndCommandBuffer(s->up)); VKCHECK(vkEndCommandBuffer(s->main));
     VkCommandBufferSubmitInfo cbs[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->up}, {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main}};
