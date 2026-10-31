@@ -19,7 +19,7 @@ static pthread_mutex_t vsync_lock = PTHREAD_MUTEX_INITIALIZER;
 static void *vsync_events[16]; static unsigned vsync_count;
 static _Atomic uint64_t presented;
 
-void *front_metal_layer(void) { return &native_window; }
+void *front_metal_layer(void) { return &native_window; }   /* the NVN native window: a token (the Vulkan backend presents to its own surface) */
 void front_frame_presented(void) { if (atomic_fetch_add(&presented, 1) == 0) fprintf(stderr, "[totk-boot] %.3f first presented frame\n", (runtime_now_ns() - boot_ns) / 1e9); }
 uint64_t front_game_res(int docked) { (void)docked; return (720ULL << 32) | 1280; }
 int runtime_front_focus(void) { return 1; }
@@ -77,11 +77,49 @@ void *runtime_front_override(const char *name) {
     for (unsigned i = 0; i < sizeof entries / sizeof *entries; i++) if (!strcmp(name, entries[i].name)) return entries[i].fn;
     return NULL;
 }
+#ifdef VK_BACKEND
+/* The window (SDL3, Wayland): made on the main thread, which then runs its event loop; the game runs on a thread of its
+   own. Keys go to the keyboard layout as Mac virtual key codes (keyboard_map.h). */
+#include <SDL3/SDL.h>
+extern SDL_Window *vk_sdl_window;   /* vk/vk_dev.c */
+static int mac_key(SDL_Scancode s) {
+    static const uint8_t letters[26] = {0, 11, 8, 2, 14, 3, 5, 4, 34, 38, 40, 37, 46, 45, 31, 35, 12, 15, 1, 17, 32, 9, 13, 7, 16, 6};
+    static const uint8_t digits[10] = {18, 19, 20, 21, 23, 22, 26, 28, 25, 29};
+    if (s >= SDL_SCANCODE_A && s <= SDL_SCANCODE_Z) return letters[s - SDL_SCANCODE_A];
+    if (s >= SDL_SCANCODE_1 && s <= SDL_SCANCODE_0) return digits[s - SDL_SCANCODE_1];
+    switch (s) {
+        case SDL_SCANCODE_RETURN: return 36; case SDL_SCANCODE_ESCAPE: return 53; case SDL_SCANCODE_SPACE: return 49; case SDL_SCANCODE_TAB: return 48;
+        case SDL_SCANCODE_BACKSPACE: return 51; case SDL_SCANCODE_LSHIFT: return 56; case SDL_SCANCODE_RSHIFT: return 60; case SDL_SCANCODE_LCTRL: return 59;
+        case SDL_SCANCODE_RCTRL: return 62; case SDL_SCANCODE_LALT: return 58; case SDL_SCANCODE_RALT: return 61; case SDL_SCANCODE_LEFT: return 123;
+        case SDL_SCANCODE_RIGHT: return 124; case SDL_SCANCODE_DOWN: return 125; case SDL_SCANCODE_UP: return 126; case SDL_SCANCODE_MINUS: return 27;
+        case SDL_SCANCODE_EQUALS: return 24; case SDL_SCANCODE_COMMA: return 43; case SDL_SCANCODE_PERIOD: return 47; case SDL_SCANCODE_SLASH: return 44;
+        case SDL_SCANCODE_SEMICOLON: return 41; case SDL_SCANCODE_APOSTROPHE: return 39; case SDL_SCANCODE_LEFTBRACKET: return 33; case SDL_SCANCODE_RIGHTBRACKET: return 30;
+        default: return -1;
+    }
+}
+static void *game_thread(void *cb) { ((void (*)(void))cb)(); return NULL; }
+#endif
 void runtime_front_run(void (*callback)(void)) {
     boot_ns = runtime_now_ns();
     const char *commit = getenv("TOTK_SOURCE_COMMIT");
     fprintf(stderr, "[totk] built from commit %s\n", commit && *commit ? commit : "(not recorded)");
     runtime_gamepad_start();
+#ifdef VK_BACKEND
+    if (!getenv("TOTK_HEADLESS")) {
+        if (!SDL_Init(SDL_INIT_VIDEO)) runtime_fail("SDL video");
+        int w = 1920, h = 1080; const char *e = getenv("TOTK_WINDOW_SIZE"); if (e) sscanf(e, "%dx%d", &w, &h);
+        vk_sdl_window = SDL_CreateWindow("Breath of the Wild — Linux", w, h, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+        if (!vk_sdl_window) { fprintf(stderr, "[totk] SDL window: %s\n", SDL_GetError()); runtime_fail("window"); }
+        pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 64u << 20);
+        pthread_t th; if (pthread_create(&th, &a, game_thread, (void *)callback)) runtime_fail("game thread");
+        for (;;) {
+            SDL_Event ev;
+            if (!SDL_WaitEventTimeout(&ev, 100)) continue;
+            if (ev.type == SDL_EVENT_QUIT) { fprintf(stderr, "[totk] window closed\n"); _exit(0); }
+            if ((ev.type == SDL_EVENT_KEY_DOWN || ev.type == SDL_EVENT_KEY_UP) && !ev.key.repeat) { int k = mac_key(ev.key.scancode); if (k >= 0) runtime_input_key((unsigned)k, ev.type == SDL_EVENT_KEY_DOWN); }
+        }
+    }
+#endif
     callback();
 }
 void runtime_gpu_path_probe(const char *which) { fprintf(stderr, "[totk] %s: GPU path probes are Metal-only\n", which); exit(2); }
