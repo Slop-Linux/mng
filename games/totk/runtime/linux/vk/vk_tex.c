@@ -63,8 +63,11 @@ static int fmt_noalpha(int f) { return f == 0x37 || f == 0x41 || f == 0x45 || f 
 typedef struct { tex_t t; view_t v; int has_v, ok; } treg;
 static treg *g_treg; static int g_ntreg; static samp_par *g_sreg; static uint8_t *g_sok; static int g_nsreg;
 static pthread_mutex_t g_reg_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t g_reg_gen;
+uint64_t vk_tex_registry_gen(void) { return atomic_load_explicit(&g_reg_gen, memory_order_relaxed); }
 void vk_tex_registry_set(int id, const tex_t *t, const view_t *v) {
     if (id < 0 || id >= (1 << 20)) return;
+    atomic_fetch_add_explicit(&g_reg_gen, 1, memory_order_relaxed);
     pthread_mutex_lock(&g_reg_mu);
     if (id >= g_ntreg) { int n = g_ntreg ? g_ntreg : 1024; while (n <= id) n *= 2; g_treg = realloc(g_treg, n * sizeof *g_treg); memset(g_treg + g_ntreg, 0, (n - g_ntreg) * sizeof *g_treg); g_ntreg = n; }
     if (t) { g_treg[id].t = *t; g_treg[id].ok = 1; g_treg[id].has_v = v != NULL; if (v) g_treg[id].v = *v; } else g_treg[id].ok = 0;
@@ -78,6 +81,7 @@ int vk_tex_registry_get(int id, tex_t *t, view_t *v, int *has_view) {
 }
 void vk_samp_registry_set(int id, const samp_par *p) {
     if (id < 0 || id >= 4096) return;
+    atomic_fetch_add_explicit(&g_reg_gen, 1, memory_order_relaxed);
     pthread_mutex_lock(&g_reg_mu);
     if (id >= g_nsreg) { int n = 4096; g_sreg = realloc(g_sreg, n * sizeof *g_sreg); g_sok = realloc(g_sok, n); memset(g_sok + g_nsreg, 0, n - g_nsreg); g_nsreg = n; }
     if (p) { g_sreg[id] = *p; g_sok[id] = 1; } else g_sok[id] = 0;
@@ -99,6 +103,9 @@ struct vtex {
     nvn_texdesc d;
     vview *views; int nviews;
     int gpu_dirty;  /* rendered since the last write-back */
+    /* staged write-back (nvn_mtl.m's botw_wb_stage_encode): a texture the CPU has read back is copied into stage at the end of
+       every submission that renders it; a write-back then waits for that submission only and swizzles from stage */
+    uint64_t render_fence, stage_fence; int wb_count, in_list; VkBuffer stage; VkDeviceMemory stage_mem; uint8_t *stage_cpu; VkDeviceSize stage_size;
     uint64_t key;   /* hash of memory, format, target, size, levels, samples, linearity */
     struct vtex *next;
 };
@@ -175,6 +182,7 @@ vtex *vk_tex_get(const tex_t *t) {
 }
 static void tex_destroy(void *p) {
     vtex *v = p;
+    if (v->stage) { vkDestroyBuffer(V.dev, v->stage, NULL); vkFreeMemory(V.dev, v->stage_mem, NULL); }
     for (int i = 0; i < v->nviews; i++) vkDestroyImageView(V.dev, v->views[i].view, NULL);
     free(v->views); vkDestroyImage(V.dev, v->img, NULL); vk_free_mem(&v->mem); free(v);
 }
@@ -228,42 +236,70 @@ void vk_tex_upload_if_stale(vtex *v, const tex_t *t) {
     /* a rendered texture keeps its image: a CPU write near it on the same pages is not a new content (as nvn_mtl.m's owned textures) */
     if (!v->gpu_owned && nvn_dirty_since(v->gmem, v->gsize, v->stamp)) upload(v);
 }
-void vk_tex_gpu_wrote(vtex *v) { if (v) { v->gpu_owned = 1; v->gpu_dirty = 1; if (!v->uploaded) { v->uploaded = 1; v->stamp = nvn_dirty_now(); if (v->uploadable) nvn_dirty_protect(v->gmem, v->gsize); } } }
+static vtex **g_rendered; static int g_nrendered, g_caprendered;
+void vk_tex_gpu_wrote(vtex *v) { if (v) { v->gpu_owned = 1; v->gpu_dirty = 1; v->render_fence = vk_next_fence();
+      if (v->wb_count && !v->in_list) { if (g_nrendered == g_caprendered) { g_caprendered = g_caprendered ? 2 * g_caprendered : 64; g_rendered = realloc(g_rendered, g_caprendered * sizeof *g_rendered); }
+          g_rendered[g_nrendered++] = v; v->in_list = 1; } if (!v->uploaded) { v->uploaded = 1; v->stamp = nvn_dirty_now(); if (v->uploadable) nvn_dirty_protect(v->gmem, v->gsize); } } }
 /* write-back: an image rendered since the last one is copied out and swizzled into its guest memory (the GPU's write on the
    console), not counted as a CPU write */
 VkCommandBuffer vk_oneshot_begin(void); void vk_oneshot_end(VkCommandBuffer cb);
-static uint64_t g_wb, g_wb_bytes;
-static void writeback(vtex *v) {
-    int bw = 1, bh = 1, bpb = nvn_fmt_bpb(v->d.format, &bw, &bh);
-    if (!bpb || !v->gmem) return;
-    int one_d = v->type == VK_IMAGE_TYPE_1D, linear = nvn_tex_is_linear(&v->d);
-    uint32_t nlev = linear ? 1 : v->levels, nlay = linear ? 1 : v->layers;
-    VkDeviceSize total = 0;
+static uint64_t g_wb, g_wb_bytes, g_wb_staged;
+static VkDeviceSize wb_size(vtex *v, int bw, int bh, int bpb) {
+    int one_d = v->type == VK_IMAGE_TYPE_1D, linear = nvn_tex_is_linear(&v->d); uint32_t nlev = linear ? 1 : v->levels, nlay = linear ? 1 : v->layers; VkDeviceSize total = 0;
     for (uint32_t l = 0; l < nlev; l++) { uint32_t w = mipd(v->w, l), h = one_d ? 1 : mipd(v->h, l), dd = v->type == VK_IMAGE_TYPE_3D ? mipd(v->depth, l) : 1;
         total += (VkDeviceSize)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * dd * nlay; }
-    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = total, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-    VkBuffer b; VKCHECK(vkCreateBuffer(V.dev, &bi, NULL, &b)); VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, b, &req);
-    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = vk_memtype(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)};
-    if (ai.memoryTypeIndex == UINT32_MAX) ai.memoryTypeIndex = vk_memtype(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
-    VkDeviceMemory m; VKCHECK(vkAllocateMemory(V.dev, &ai, NULL, &m)); VKCHECK(vkBindBufferMemory(V.dev, b, m, 0));
-    VkCommandBuffer cb = vk_oneshot_begin(); VkDeviceSize o = 0;
+    return total;
+}
+static void wb_copies(vtex *v, VkCommandBuffer cb, VkBuffer b, int bw, int bh, int bpb) {
+    int one_d = v->type == VK_IMAGE_TYPE_1D, linear = nvn_tex_is_linear(&v->d); uint32_t nlev = linear ? 1 : v->levels, nlay = linear ? 1 : v->layers; VkDeviceSize o = 0;
     for (uint32_t l = 0; l < nlev; l++) {
         uint32_t w = mipd(v->w, l), h = one_d ? 1 : mipd(v->h, l), dd = v->type == VK_IMAGE_TYPE_3D ? mipd(v->depth, l) : 1;
         VkDeviceSize bytes = (VkDeviceSize)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * dd;
-        for (uint32_t ly = 0; ly < nlay; ly++) {
-            VkBufferImageCopy r = {.bufferOffset = o, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, ly, 1}, .imageExtent = {w, h, dd}};
-            vkCmdCopyImageToBuffer(cb, v->img, VK_IMAGE_LAYOUT_GENERAL, b, 1, &r); o += bytes;
-        }
+        for (uint32_t ly = 0; ly < nlay; ly++) { VkBufferImageCopy r = {.bufferOffset = o, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, ly, 1}, .imageExtent = {w, h, dd}}; vkCmdCopyImageToBuffer(cb, v->img, VK_IMAGE_LAYOUT_GENERAL, b, 1, &r); o += bytes; }
     }
-    vk_oneshot_end(cb);
-    uint8_t *src; VKCHECK(vkMapMemory(V.dev, m, 0, VK_WHOLE_SIZE, 0, (void **)&src));
-    void *tok = nvn_dirty_gpu_write_begin((void *)v->gmem, v->gsize); o = 0;
+}
+static void wb_swizzle(vtex *v, const uint8_t *src, int bw, int bh, int bpb) {
+    int one_d = v->type == VK_IMAGE_TYPE_1D, linear = nvn_tex_is_linear(&v->d); uint32_t nlev = linear ? 1 : v->levels, nlay = linear ? 1 : v->layers; VkDeviceSize o = 0;
+    void *tok = nvn_dirty_gpu_write_begin((void *)v->gmem, v->gsize);
     for (uint32_t l = 0; l < nlev; l++) {
         uint32_t w = mipd(v->w, l), h = one_d ? 1 : mipd(v->h, l), dd = v->type == VK_IMAGE_TYPE_3D ? mipd(v->depth, l) : 1;
         size_t row = (size_t)((w + bw - 1) / bw) * bpb; VkDeviceSize bytes = row * ((h + bh - 1) / bh) * dd;
         for (uint32_t ly = 0; ly < nlay; ly++) { nvn_swizzle(&v->d, l, ly, src + o, row, (void *)v->gmem); o += bytes; }
     }
     nvn_dirty_gpu_write_end(tok);
+}
+static void host_buffer(VkDeviceSize size, VkBuffer *b, VkDeviceMemory *m, uint8_t **cpu) {
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VKCHECK(vkCreateBuffer(V.dev, &bi, NULL, b)); VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, *b, &req);
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = vk_memtype(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)};
+    if (ai.memoryTypeIndex == UINT32_MAX) ai.memoryTypeIndex = vk_memtype(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    VKCHECK(vkAllocateMemory(V.dev, &ai, NULL, m)); VKCHECK(vkBindBufferMemory(V.dev, *b, *m, 0)); VKCHECK(vkMapMemory(V.dev, *m, 0, VK_WHOLE_SIZE, 0, (void **)cpu));
+}
+/* end of a submission (vk_dev.c, after its last pass): the rendered textures the CPU reads go to their stages */
+void vk_tex_stage_rendered(VkCommandBuffer cb, uint64_t fence) {
+    for (int i = 0; i < g_nrendered; i++) {
+        vtex *v = g_rendered[i]; v->in_list = 0;
+        int bw = 1, bh = 1, bpb = nvn_fmt_bpb(v->d.format, &bw, &bh); VkDeviceSize n = wb_size(v, bw, bh, bpb);
+        if (!bpb || n > (4u << 20)) continue;
+        if (!v->stage || v->stage_size < n) { if (v->stage) { vkDestroyBuffer(V.dev, v->stage, NULL); vkFreeMemory(V.dev, v->stage_mem, NULL); } host_buffer(n, &v->stage, &v->stage_mem, &v->stage_cpu); v->stage_size = n; }
+        wb_copies(v, cb, v->stage, bw, bh, bpb); v->stage_fence = fence;
+    }
+    g_nrendered = 0;
+}
+static void writeback(vtex *v) {
+    int sbw = 1, sbh = 1, sbpb = nvn_fmt_bpb(v->d.format, &sbw, &sbh);
+    v->wb_count++;
+    if (sbpb && v->gmem && v->stage && v->stage_fence && v->stage_fence == v->render_fence) {
+        mtl_wait(v->stage_fence, UINT64_MAX); wb_swizzle(v, v->stage_cpu, sbw, sbh, sbpb);
+        v->gpu_dirty = 0; g_wb++; g_wb_staged++; g_wb_bytes += v->stage_size; return;
+    }
+    mtl_finish();
+    int bw = 1, bh = 1, bpb = nvn_fmt_bpb(v->d.format, &bw, &bh);
+    if (!bpb || !v->gmem) return;
+    VkDeviceSize total = wb_size(v, bw, bh, bpb); VkBuffer b; VkDeviceMemory m; uint8_t *src;
+    host_buffer(total, &b, &m, &src);
+    VkCommandBuffer cb = vk_oneshot_begin(); wb_copies(v, cb, b, bw, bh, bpb); vk_oneshot_end(cb);
+    wb_swizzle(v, src, bw, bh, bpb);
     vkUnmapMemory(V.dev, m); vkDestroyBuffer(V.dev, b, NULL); vkFreeMemory(V.dev, m, NULL);
     v->gpu_dirty = 0; g_wb++; g_wb_bytes += total;
 }
@@ -275,11 +311,10 @@ void vk_tex_writeback_range(uintptr_t lo, uintptr_t hi) {
         if (v->gpu_dirty && v->uploadable && (uintptr_t)v->gmem < hi && (uintptr_t)v->gmem + v->gsize > lo) list[n++] = v;
     pthread_mutex_unlock(&g_tex_mu);
     if (!n) return;
-    mtl_finish();
     for (int i = 0; i < n; i++) writeback(list[i]);
-    static uint64_t said; if (g_wb / 1000 != said) { said = g_wb / 1000; VKLOG("write-backs: %llu (%.1f MB)", (unsigned long long)g_wb, g_wb_bytes / 1e6); }
+    static uint64_t said; if (g_wb / 1000 != said) { said = g_wb / 1000; VKLOG("write-backs: %llu, %llu from stages (%.1f MB)", (unsigned long long)g_wb, (unsigned long long)g_wb_staged, g_wb_bytes / 1e6); }
 }
-void vk_tex_readback(vtex *v, const tex_t *t) { (void)t; if (v && v->gpu_dirty) { mtl_finish(); writeback(v); } }
+void vk_tex_readback(vtex *v, const tex_t *t) { (void)t; if (v && v->gpu_dirty) writeback(v); }
 
 static VkComponentSwizzle swz1(int s, VkComponentSwizzle self) {
     switch (s) { case NVN_TEXTURE_SWIZZLE_ZERO: return VK_COMPONENT_SWIZZLE_ZERO; case NVN_TEXTURE_SWIZZLE_ONE: return VK_COMPONENT_SWIZZLE_ONE;

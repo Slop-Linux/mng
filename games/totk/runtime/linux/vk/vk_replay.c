@@ -20,6 +20,10 @@ typedef struct {
     int depth_clamp, render_disabled, raster_discard; int64_t copy_stride;
 } state_t;
 static state_t S;
+/* generations: what a draw derives from the state is rebuilt only when its inputs changed (per stage bindings, fixed-function
+   state, vertex input); g_sub_gen invalidates everything that lives in one submission (descriptor sets, ring copies) */
+static uint64_t g_gen_bind[6], g_gen_state, g_gen_vtx, g_sub_gen = 1;
+uint64_t vk_tex_registry_gen(void);
 static void state_reset(void) {
     memset(&S, 0, sizeof S);
     for (int i = 0; i < 8; i++) S.blend[i] = (blend_st){i, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_EQUATION_ADD, NVN_BLEND_EQUATION_ADD};
@@ -99,7 +103,7 @@ static int pass_begin(void) {
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {w, h}}, .layerCount = 1, .colorAttachmentCount = (uint32_t)n, .pColorAttachments = ca,
         .pDepthAttachment = da.sType ? &da : NULL, .pStencilAttachment = sa.sType ? &sa : NULL};
     vkCmdBeginRendering(vk_cb(), &ri);
-    g_pass_open = 1; g_passes++; g_frame_passes++; g_fb_run = 0;
+    g_pass_open = 1; g_passes++; g_frame_passes++; g_fb_run = 0; g_gen_state++;
     return 1;
 }
 
@@ -251,7 +255,6 @@ static VkImageViewType view_type(int stype) {
 }
 static samp_par g_default_samp = {.minf = 1, .magf = 1, .ws = 7, .wt = 7, .wr = 7, .lod_max = 1000, .aniso = 1};
 static int g_feedback;   /* a draw samples an attachment of the open pass */
-static int g_fb_run;     /* the pass was split for the previous draw, which also sampled its targets: a run shares that one split */
 #define MAXW 160
 static VkDescriptorSet stage_set(vshader *s, int stage, int set, VkDescriptorSetLayout layout) {
     VkWriteDescriptorSet w[MAXW]; VkDescriptorBufferInfo bi[MAXW]; VkDescriptorImageInfo ii[MAXW]; int nw = 0, nb = 0, ni = 0;
@@ -382,12 +385,17 @@ static uint64_t state_sig(int st) {
     return h;
 }
 static vshader *stage_shader_slow(int want);
+static struct { const prog_t *p; uint64_t serial, gen, reg, rt; vshader *s; } g_last_sh[6];
+static uint64_t g_gen_rt;
 static vshader *stage_shader(int want) {
     const prog_t *p = S.prog; if (!p) return NULL;
+    uint64_t reg = vk_tex_registry_gen();
+    if (g_last_sh[want].p == p && g_last_sh[want].serial == p->serial && g_last_sh[want].gen == g_gen_bind[want] + (want == 0 ? g_gen_vtx : 0) && g_last_sh[want].reg == reg && g_last_sh[want].rt == g_gen_rt) return g_last_sh[want].s;
     uint64_t sig = state_sig(want); unsigned h = (unsigned)(((uintptr_t)p >> 4) ^ p->serial ^ (sig >> 7) ^ (uint64_t)want) & 4095;
-    for (memo_t *m = g_memo[h]; m; m = m->next) if (m->p == p && m->serial == p->serial && m->stage == want && m->sig == sig) return m->s;
-    vshader *s = stage_shader_slow(want);
-    memo_t *m = malloc(sizeof *m); *m = (memo_t){p, p->serial, want, sig, s, g_memo[h]}; g_memo[h] = m;
+    vshader *s = NULL;
+    for (memo_t *m = g_memo[h]; m && !s; m = m->next) if (m->p == p && m->serial == p->serial && m->stage == want && m->sig == sig) s = m->s;
+    if (!s) { s = stage_shader_slow(want); memo_t *m = malloc(sizeof *m); *m = (memo_t){p, p->serial, want, sig, s, g_memo[h]}; g_memo[h] = m; }
+    g_last_sh[want].p = p; g_last_sh[want].serial = p->serial; g_last_sh[want].gen = g_gen_bind[want] + (want == 0 ? g_gen_vtx : 0); g_last_sh[want].reg = reg; g_last_sh[want].rt = g_gen_rt; g_last_sh[want].s = s;
     return s;
 }
 static vshader *stage_shader_slow(int want) {
@@ -543,7 +551,16 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
     g_feedback = 0;
     pair_t *p = pair_get(vs, fs);
     if (!p->sh[0] || (fs && !p->sh[1])) { g_skips[3]++; return; }
-    VkDescriptorSet sets[2]; sets[0] = stage_set(vs, 0, 0, vs->layout); sets[1] = fs ? stage_set(fs, 1, 1, fs->layout) : dset_alloc(V.empty_layout);
+    /* a stage's set is reused while its shader, its bindings, the registry and the submission are the same */
+    static struct { vshader *s; uint64_t gen, reg, sub, pass; VkDescriptorSet set; int fb; } last[2];
+    uint64_t reg = vk_tex_registry_gen(); VkDescriptorSet sets[2];
+    for (int k = 0; k < 2; k++) {
+        vshader *s = k ? fs : vs;
+        if (last[k].s == s && last[k].gen == g_gen_bind[k] && last[k].reg == reg && last[k].sub == g_sub_gen && last[k].pass == g_passes && s) { sets[k] = last[k].set; g_feedback |= last[k].fb; continue; }
+        int f0 = g_feedback; g_feedback = 0;
+        sets[k] = s ? stage_set(s, k, k, s->layout) : dset_alloc(V.empty_layout);
+        last[k] = (typeof(last[k])){s, g_gen_bind[k], reg, g_sub_gen, g_passes, sets[k], g_feedback}; g_feedback |= f0;
+    }
     /* the draw samples a target of this pass: what the pass rendered so far goes to memory first. Consecutive such draws (decals
        blending into the G-buffer) share one split, as nvn_mtl.m's store before sample (att_unstored_read); they read the
        pass as it was at the first of them */
@@ -559,8 +576,9 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
     if (!(has_tess() & 1) && (has_tess() & 2)) { stages[2] = VK_SHADER_STAGE_GEOMETRY_BIT; }
     V.CmdBindShadersEXT(cb, (uint32_t)ns, stages, sh);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pl, 0, 2, sets, 0, NULL);
-    set_dynamic(cb);
-    vertex_input(cb, vs);
+    static uint64_t dyn_gen, dyn_sub, vtx_gen, vtx_sub; static vshader *vtx_vs;
+    if (dyn_gen != g_gen_state || dyn_sub != g_sub_gen) { set_dynamic(cb); dyn_gen = g_gen_state; dyn_sub = g_sub_gen; }
+    if (vtx_gen != g_gen_vtx || vtx_sub != g_sub_gen || vtx_vs != vs) { vertex_input(cb, vs); vtx_gen = g_gen_vtx; vtx_sub = g_sub_gen; vtx_vs = vs; }
     int prim = d ? d->prim : di->prim, inst = d ? (d->instances ? d->instances : 1) : (di->instances ? di->instances : 1);
     if (prim == NVN_DRAW_PRIMITIVE_QUADS || prim == NVN_DRAW_PRIMITIVE_QUAD_STRIP) {
         VkBuffer qb; VkDeviceSize qo; int n;
@@ -713,29 +731,29 @@ void mtl_exec(const uint8_t *p) {
             case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8); vk_sub_post(t == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 3 : 2, NULL, 0, 0, ad); break; }
             case OP_RESET_COUNTER: break;
             case OP_COPY_B2B: { uint64_t s, d, n; memcpy(&s, a, 8); memcpy(&d, (const uint8_t *)a + 8, 8); memcpy(&n, (const uint8_t *)a + 16, 8); copy_b2b(s, d, n); break; }
-            case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8); upd_add(d, (const uint8_t *)a + 16, n); break; }
-            case OP_SET_RT: { const p_set_rt *r = a; if (S.has_rt && same_rt(r, &S.rt)) { S.rt = *r; break; } end_pass(1); S.rt = *r; S.has_rt = 1; break; }
+            case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8); upd_add(d, (const uint8_t *)a + 16, n); for (int k = 0; k < 6; k++) g_gen_bind[k]++; break; }
+            case OP_SET_RT: { const p_set_rt *r = a; if (S.has_rt && same_rt(r, &S.rt)) { S.rt = *r; break; } end_pass(1); S.rt = *r; S.has_rt = 1; g_gen_rt++; break; }
             case OP_CLEAR_COLOR: clear_color(a); break;
             case OP_CLEAR_DS: clear_ds(a); break;
-            case OP_VIEWPORTS: { const p_viewports *v = a; for (int i = 0; i < v->n && v->first + i < 16; i++) memcpy(S.vp[v->first + i], v->v[i], 24); if (v->first + v->n > S.nvp) S.nvp = v->first + v->n > 16 ? 16 : v->first + v->n; break; }
-            case OP_SCISSOR: S.sc = *(const p_scissor *)a; S.has_sc = 1; break;
-            case OP_DEPTH_RANGE: { const p_depth_range *d = a; S.dr[0] = d->n; S.dr[1] = d->f; break; }
+            case OP_VIEWPORTS: g_gen_state++; { const p_viewports *v = a; for (int i = 0; i < v->n && v->first + i < 16; i++) memcpy(S.vp[v->first + i], v->v[i], 24); if (v->first + v->n > S.nvp) S.nvp = v->first + v->n > 16 ? 16 : v->first + v->n; break; }
+            case OP_SCISSOR: g_gen_state++; S.sc = *(const p_scissor *)a; S.has_sc = 1; break;
+            case OP_DEPTH_RANGE: g_gen_state++; { const p_depth_range *d = a; S.dr[0] = d->n; S.dr[1] = d->f; break; }
             case OP_BIND_PROGRAM: S.prog = ((const p_bind_program *)a)->prog; break;
-            case OP_BIND_STATE: { const p_bind_state *b = a;
+            case OP_BIND_STATE: g_gen_state++; { const p_bind_state *b = a;
                 switch (b->kind) { case 0: { blend_st bs; memcpy(&bs, b->bytes, sizeof bs); if (bs.target < 8) S.blend[bs.target] = bs; break; }
                                    case 1: memcpy(&S.color, b->bytes, sizeof S.color); break; case 2: memcpy(&S.chmask, b->bytes, sizeof S.chmask); break;
                                    case 3: memcpy(&S.ms, b->bytes, sizeof S.ms); break; case 4: memcpy(&S.poly, b->bytes, sizeof S.poly); break; case 5: memcpy(&S.ds, b->bytes, sizeof S.ds); break; }
                 break; }
-            case OP_BIND_VATTR: { const p_bind_vattr *b = a; for (int i = 0; i < b->n && b->first + i < 16; i++) S.attr[b->first + i] = b->st[i]; S.nattr = b->first + b->n > 16 ? 16 : b->first + b->n; break; }
-            case OP_BIND_VSTREAM: { const p_bind_vstream *b = a; for (int i = 0; i < b->n && b->first + i < 16; i++) S.stream[b->first + i] = b->st[i]; S.nstream = b->first + b->n; break; }
-            case OP_BIND_VBUF: { const p_bind_vbuf *b = a; for (int i = 0; i < b->n && b->first + i < 16; i++) S.vbuf[b->first + i] = b->r[i]; break; }
-            case OP_BIND_UBO: { const p_bind_buf *b = a; if (b->stage < 6 && b->index >= 0 && b->index < 16) S.ubo[b->stage][b->index] = *b; break; }
-            case OP_BIND_SSBO: { const p_bind_buf *b = a; if (b->stage < 6 && b->index >= 0 && b->index < 16) S.ssbo[b->stage][b->index] = *b; break; }
-            case OP_BIND_TEX: { const p_bind_handles *b = a; if (b->stage < 6 && b->first >= 0 && b->first + b->n <= 128) memcpy(&S.tex[b->stage][b->first], b->h, 8 * b->n); break; }
-            case OP_BIND_SAMP: { const p_bind_handles *b = a; if (b->stage < 6 && b->first >= 0 && b->first + b->n <= 128) memcpy(&S.samp[b->stage][b->first], b->h, 8 * b->n); break; }
-            case OP_BIND_IMG: { const p_bind_handles *b = a; if (b->stage < 6 && b->first >= 0 && b->first + b->n <= 32) memcpy(&S.img[b->stage][b->first], b->h, 8 * b->n); break; }
-            case OP_STENCIL: { const p_stencil *b = a; for (int f = 0; f < 2; f++) if (b->face & (1 << f)) { if (b->which == 0) S.st_vmask[f] = b->value_mask; else if (b->which == 1) S.st_wmask[f] = b->mask; else S.st_ref[f] = b->ref; } break; }
-            case OP_POLY_OFFSET: S.po = *(const p_poly_offset *)a; break;
+            case OP_BIND_VATTR: g_gen_vtx++; { const p_bind_vattr *b = a; for (int i = 0; i < b->n && b->first + i < 16; i++) S.attr[b->first + i] = b->st[i]; S.nattr = b->first + b->n > 16 ? 16 : b->first + b->n; break; }
+            case OP_BIND_VSTREAM: g_gen_vtx++; { const p_bind_vstream *b = a; for (int i = 0; i < b->n && b->first + i < 16; i++) S.stream[b->first + i] = b->st[i]; S.nstream = b->first + b->n; break; }
+            case OP_BIND_VBUF: g_gen_vtx++; { const p_bind_vbuf *b = a; for (int i = 0; i < b->n && b->first + i < 16; i++) S.vbuf[b->first + i] = b->r[i]; break; }
+            case OP_BIND_UBO: { const p_bind_buf *b = a; if (b->stage < 6 && b->index >= 0 && b->index < 16) S.ubo[b->stage][b->index] = *b; g_gen_bind[b->stage]++; break; }
+            case OP_BIND_SSBO: { const p_bind_buf *b = a; if (b->stage < 6 && b->index >= 0 && b->index < 16) S.ssbo[b->stage][b->index] = *b; g_gen_bind[b->stage]++; break; }
+            case OP_BIND_TEX: { const p_bind_handles *b = a; if (b->stage < 6 && b->first >= 0 && b->first + b->n <= 128) memcpy(&S.tex[b->stage][b->first], b->h, 8 * b->n); g_gen_bind[b->stage]++; break; }
+            case OP_BIND_SAMP: { const p_bind_handles *b = a; if (b->stage < 6 && b->first >= 0 && b->first + b->n <= 128) memcpy(&S.samp[b->stage][b->first], b->h, 8 * b->n); g_gen_bind[b->stage]++; break; }
+            case OP_BIND_IMG: { const p_bind_handles *b = a; if (b->stage < 6 && b->first >= 0 && b->first + b->n <= 32) memcpy(&S.img[b->stage][b->first], b->h, 8 * b->n); g_gen_bind[b->stage]++; break; }
+            case OP_STENCIL: g_gen_state++; { const p_stencil *b = a; for (int f = 0; f < 2; f++) if (b->face & (1 << f)) { if (b->which == 0) S.st_vmask[f] = b->value_mask; else if (b->which == 1) S.st_wmask[f] = b->mask; else S.st_ref[f] = b->ref; } break; }
+            case OP_POLY_OFFSET: g_gen_state++; S.po = *(const p_poly_offset *)a; break;
             case OP_DRAW: draw(a, NULL); break;
             case OP_DRAW_IDX: draw(NULL, a); break;
             case OP_DISPATCH: dispatch(a); break;
@@ -744,13 +762,13 @@ void mtl_exec(const uint8_t *p) {
             case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: break;
             case OP_COPY_B2T: copy_b2t(a, 0); break;
             case OP_COPY_STRIDE: S.copy_stride = ((const p_copy_stride *)a)->stride; break;
-            case OP_BLEND_COLOR: memcpy(S.blend_color, ((const p_blend_color *)a)->rgba, 16); break;
+            case OP_BLEND_COLOR: g_gen_state++; memcpy(S.blend_color, ((const p_blend_color *)a)->rgba, 16); break;
             case OP_COPY_T2B: copy_b2t(a, 1); break;   /* src: the destination buffer address */
             case OP_COPY_T2T: copy_t2t(a); break;
             case OP_CLEAR_TEX: clear_tex(a); break;
-            case OP_DEPTH_CLAMP: S.depth_clamp = ((const p_flag *)a)->value != 0; break;
+            case OP_DEPTH_CLAMP: g_gen_state++; S.depth_clamp = ((const p_flag *)a)->value != 0; break;
             case OP_RENDER_ENABLE: S.render_disabled = !((const p_flag *)a)->value; break;
-            case OP_RASTER_DISCARD: S.raster_discard = ((const p_flag *)a)->value != 0; break;
+            case OP_RASTER_DISCARD: g_gen_state++; S.raster_discard = ((const p_flag *)a)->value != 0; break;
             case OP_RENDER_COND: break;
             default: break;
         }
@@ -759,7 +777,7 @@ void mtl_exec(const uint8_t *p) {
 }
 void mtl_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }
 void mtl_sub_begin(void) { vk_sub_open(); }
-uint64_t mtl_sub_commit(void) { upd_flush(); g_shadow_epoch++; g_dyn_set = 0; g_dpool = VK_NULL_HANDLE; return vk_sub_submit(); }
+uint64_t mtl_sub_commit(void) { upd_flush(); g_shadow_epoch++; g_sub_gen++; g_dyn_set = 0; g_dpool = VK_NULL_HANDLE; return vk_sub_submit(); }
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) { copy_b2b(src, dst, n); }
 void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { vk_sub_post(1, val, mode, v, 0); }
 void mtl_sub_counter(uint64_t addr, uint32_t type) { vk_sub_post(type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 3 : 2, NULL, 0, 0, addr); }

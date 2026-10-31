@@ -324,6 +324,7 @@ uint64_t vk_sub_submit(void) {
         VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
         vkCmdPipelineBarrier2(s->up, &di);
     }
+    { void vk_tex_stage_rendered(VkCommandBuffer cb, uint64_t fence); vk_tex_stage_rendered(s->main, s->fence); }
     vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_ts, (uint32_t)(s->fence % TS_RING) * 2 + 1);
     VKCHECK(vkEndCommandBuffer(s->up)); VKCHECK(vkEndCommandBuffer(s->main));
     VkCommandBufferSubmitInfo cbs[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->up}, {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main}};
