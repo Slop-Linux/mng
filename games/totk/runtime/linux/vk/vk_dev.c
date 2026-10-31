@@ -192,7 +192,11 @@ int vk_pool_find(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) 
     pthread_mutex_unlock(&g_pool_mu); return 0;
 }
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) { VkBuffer b; VkDeviceSize o; if (!vk_pool_find(addr, len, &b, &o)) return 0; *buf = (void *)b; *off = o; return 1; }
-void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) { (void)p; (void)off; (void)n; }
+/* nvnMemoryPool{Flush,Invalidate}MappedRange: the CPU is about to read the range; rendered images over it go back to memory */
+void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
+    void vk_tex_writeback_range(uintptr_t lo, uintptr_t hi);
+    if (p && p->mem) vk_tex_writeback_range((uintptr_t)p->mem + off, (uintptr_t)p->mem + off + n);
+}
 
 /* ---------- submissions ---------- */
 #define RING_CHUNK (16ull << 20)
@@ -334,6 +338,15 @@ uint64_t vk_sub_submit(void) {
     g_inflight_tail = s; pthread_cond_broadcast(&g_sub_cv);
     pthread_mutex_unlock(&g_sub_mu);
     return s->fence;
+}
+/* a command buffer run at once, outside the submissions (write-backs) */
+VkCommandBuffer vk_oneshot_begin(void) { pthread_mutex_lock(&g_cmdpool_mu); VkCommandBuffer cb = cb_new(); pthread_mutex_unlock(&g_cmdpool_mu); cb_begin(cb); return cb; }
+void vk_oneshot_end(VkCommandBuffer cb) {
+    VKCHECK(vkEndCommandBuffer(cb));
+    VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence f; VKCHECK(vkCreateFence(V.dev, &fi, NULL, &f));
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+    VKCHECK(vkQueueSubmit(V.queue, 1, &si, f)); VKCHECK(vkWaitForFences(V.dev, 1, &f, 1, UINT64_MAX)); vkDestroyFence(V.dev, f, NULL);
+    pthread_mutex_lock(&g_cmdpool_mu); vkFreeCommandBuffers(V.dev, V.cmdpool, 1, &cb); pthread_mutex_unlock(&g_cmdpool_mu);
 }
 uint64_t mtl_last_fence(void) { return atomic_load(&g_submitted); }
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
