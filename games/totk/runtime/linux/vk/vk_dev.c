@@ -226,6 +226,10 @@ static chunk_t *g_free_chunks; static int g_nfree_chunks;
 static pthread_mutex_t g_sub_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_sub_cv = PTHREAD_COND_INITIALIZER;
 static _Atomic uint64_t g_fence_next = 1, g_applied, g_submitted;
 static pthread_t g_done_thread;
+/* game-thread time (ns) waiting for room in the job queue, in mtl_wait, in one-shot command buffers, and replaying (vk_wait_stats) */
+static _Atomic uint64_t g_wt[4];
+void vk_wait_stats(uint64_t w[4]) { for (int i = 0; i < 4; i++) w[i] = atomic_load(&g_wt[i]); }
+void vk_replay_ns(uint64_t ns) { g_wt[3] += ns; }
 /* GPU time: a timestamp at the start and the end of every submission's main command buffer */
 #define TS_RING 512   /* timestamps: (fence % TS_RING, command buffer pair) -> begin / end */
 #define TS_SLOT(s, i) ((uint32_t)(((s)->fence % TS_RING) * 16 + (i)) * 2)
@@ -414,7 +418,7 @@ static void *submit_thread(void *arg) {
 static void job_push(job_t j) {
     pthread_mutex_lock(&g_job_mu);
     if (!g_submit_thread) pthread_create(&g_submit_thread, NULL, submit_thread, NULL);
-    while (g_job_head - g_job_tail >= JOBS) pthread_cond_wait(&g_job_cv, &g_job_mu);
+    if (g_job_head - g_job_tail >= JOBS) { uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC); while (g_job_head - g_job_tail >= JOBS) pthread_cond_wait(&g_job_cv, &g_job_mu); g_wt[0] += clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0; }
     g_jobs[g_job_head % JOBS] = j; g_job_head++; pthread_cond_broadcast(&g_job_cv);
     pthread_mutex_unlock(&g_job_mu);
 }
@@ -441,24 +445,27 @@ uint64_t vk_sub_submit(void) {
 /* a command buffer run at once, outside the submissions (write-backs) */
 VkCommandBuffer vk_oneshot_begin(void) { pthread_mutex_lock(&g_cmdpool_mu); VkCommandBuffer cb = cb_new(); pthread_mutex_unlock(&g_cmdpool_mu); cb_begin(cb); return cb; }
 void vk_oneshot_end(VkCommandBuffer cb) {
+    uint64_t o0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     VKCHECK(vkEndCommandBuffer(cb));
     VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence f; VKCHECK(vkCreateFence(V.dev, &fi, NULL, &f));
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
     jobs_drain();
     pthread_mutex_lock(&g_queue_mu); VKCHECK(vkQueueSubmit(V.queue, 1, &si, f)); pthread_mutex_unlock(&g_queue_mu);
-    VKCHECK(vkWaitForFences(V.dev, 1, &f, 1, UINT64_MAX)); vkDestroyFence(V.dev, f, NULL);
+    VKCHECK(vkWaitForFences(V.dev, 1, &f, 1, UINT64_MAX)); vkDestroyFence(V.dev, f, NULL); g_wt[2] += clock_gettime_nsec_np(CLOCK_MONOTONIC) - o0;
     pthread_mutex_lock(&g_cmdpool_mu); vkFreeCommandBuffers(V.dev, V.cmdpool, 1, &cb); pthread_mutex_unlock(&g_cmdpool_mu);
 }
 uint64_t mtl_last_fence(void) { return atomic_load(&g_submitted); }
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     if (atomic_load(&g_applied) >= fence) return 1;
     if (!timeout_ns) return 0;
+    uint64_t w0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
     uint64_t t = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec + (timeout_ns > (1ull << 62) ? (1ull << 62) : timeout_ns);
     ts.tv_sec = t / 1000000000ull; ts.tv_nsec = t % 1000000000ull;
     pthread_mutex_lock(&g_sub_mu);
     while (atomic_load(&g_applied) < fence) if (pthread_cond_timedwait(&g_sub_cv, &g_sub_mu, &ts)) break;
     pthread_mutex_unlock(&g_sub_mu);
+    g_wt[1] += clock_gettime_nsec_np(CLOCK_MONOTONIC) - w0;
     return atomic_load(&g_applied) >= fence;
 }
 void mtl_finish(void) { uint64_t f = atomic_load(&g_submitted); if (f) mtl_wait(f, UINT64_MAX); }
