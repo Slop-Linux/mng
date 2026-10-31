@@ -33,7 +33,7 @@ static void state_reset(void) {
 static uint64_t g_passes, g_draws, g_dispatches, g_copies, g_skips[8], g_frame_passes, g_frame_draws;
 
 /* ---------- the pass ---------- */
-typedef struct { vtex *v; VkImageView view; } att_t;
+typedef struct { vtex *v; VkImageView view; int level, layer; } att_t;
 static int g_pass_open; static att_t g_patt[8], g_pdepth; static int g_pslot[8]; static uint32_t g_pw, g_ph; static int g_pcount;
 static int g_dyn_set;   /* every dynamic state set once in this command buffer */
 static int depth_has_stencil(void) { return g_pdepth.v && (vk_tex_aspect(g_pdepth.v) & VK_IMAGE_ASPECT_STENCIL_BIT); }
@@ -73,7 +73,7 @@ static int pass_begin(void) {
         int lv = S.rt.has_cview[i] && S.rt.cview[i].set_levels ? S.rt.cview[i].base_level : 0; tw = tw >> lv ? tw >> lv : 1; th = th >> lv ? th >> lv : 1;
         if (tw < w) w = tw; if (th < h) h = th;
         vk_tex_upload_if_stale(v, t); vk_tex_gpu_wrote(v);
-        g_patt[i] = (att_t){v, view}; g_pslot[i] = i;
+        g_patt[i] = (att_t){v, view, lv, S.rt.has_cview[i] && S.rt.cview[i].set_layers ? S.rt.cview[i].min_layer : 0}; g_pslot[i] = i;
         ca[i] = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
             .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
         n = i + 1;
@@ -84,7 +84,7 @@ static int pass_begin(void) {
         VkImageView view = v ? vk_tex_view(v, S.rt.depth, &S.rt.dview, S.rt.has_dview, VK_IMAGE_VIEW_TYPE_2D, 1) : VK_NULL_HANDLE;
         if (view) {
             uint32_t tw, th; VkFormat f; vk_tex_dims(v, &tw, &th, &f); if (tw < w) w = tw; if (th < h) h = th;
-            vk_tex_gpu_wrote(v); g_pdepth = (att_t){v, view};
+            vk_tex_gpu_wrote(v); g_pdepth = (att_t){v, view, S.rt.has_dview && S.rt.dview.set_levels ? S.rt.dview.base_level : 0, S.rt.has_dview && S.rt.dview.set_layers ? S.rt.dview.min_layer : 0};
             da = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
                 .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
             if (vk_tex_aspect(v) & VK_IMAGE_ASPECT_STENCIL_BIT) sa = da;
@@ -300,8 +300,11 @@ static VkDescriptorSet stage_set(vshader *s, int stage, int set, VkDescriptorSet
                         vk_tex_upload_if_stale(v, &t);
                         if (is_img) vk_tex_gpu_wrote(v);
                         view = vk_tex_view(v, &t, &vw, hv, view_type(b->stype), 0);
-                        for (int a = 0; a < 8; a++) if (g_patt[a].v == v) g_feedback = 1;
-                        if (g_pdepth.v == v) g_feedback = 1;
+                        /* the sampled levels / layers include an attachment's own: the pass must land first */
+                        int l0 = hv && vw.set_levels ? vw.base_level : 0, nl = hv && vw.set_levels && vw.nlevels ? vw.nlevels : 64;
+                        int y0 = hv && vw.set_layers ? vw.min_layer : 0, ny = hv && vw.set_layers && vw.nlayers ? vw.nlayers : 4096;
+                        for (int a = 0; a < 9; a++) { const att_t *at = a < 8 ? &g_patt[a] : &g_pdepth;
+                            if (at->v == v && at->level >= l0 && at->level < l0 + nl && at->layer >= y0 && at->layer < y0 + ny) g_feedback = 1; }
                     }
                 }
                 samp_par sp; if (!is_img && sid && vk_samp_registry_get(sid, &sp)) smp = vk_sampler(&sp);
@@ -685,7 +688,7 @@ void mtl_exec(const uint8_t *p) {
             case OP_DRAW_IDX: draw(NULL, a); break;
             case OP_DISPATCH: dispatch(a); break;
             case OP_BARRIER: { int bits; memcpy(&bits, a, 4);
-                if (bits & (NVN_BARRIER_INVALIDATE_TEXTURE_BIT | NVN_BARRIER_ORDER_FRAGMENTS_BIT)) end_pass(5); else if (!g_pass_open) full_barrier(); break; }
+                (void)bits; if (!g_pass_open) full_barrier(); break; }   /* inside a pass nothing, as nvn_mtl.m; every pass ends with a full barrier */
             case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: break;
             case OP_COPY_B2T: copy_b2t(a, 0); break;
             case OP_COPY_STRIDE: S.copy_stride = ((const p_copy_stride *)a)->stride; break;
