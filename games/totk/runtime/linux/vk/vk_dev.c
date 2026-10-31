@@ -51,23 +51,23 @@ void vk_init(void) {
         VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
         VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME, VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     uint32_t ndext = sizeof dext / sizeof *dext - (g_surface ? 0 : 1);
-    VkPhysicalDeviceProvokingVertexFeaturesEXT pv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT, .provokingVertexLast = 1};
-    VkPhysicalDeviceDepthClipEnableFeaturesEXT dce = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT, .pNext = &pv, .depthClipEnable = 1};
-    VkPhysicalDeviceIndexTypeUint8FeaturesEXT iu8 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT, .pNext = &dce, .indexTypeUint8 = 1};
-    VkPhysicalDeviceCustomBorderColorFeaturesEXT cbc = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT, .pNext = &iu8, .customBorderColors = 1};
-    VkPhysicalDeviceRobustness2FeaturesEXT rb2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, .pNext = &cbc, .nullDescriptor = 1};
-    VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vid = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT, .pNext = &rb2, .vertexInputDynamicState = 1};
-    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT ed3 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT, .pNext = &vid,
-        .extendedDynamicState3PolygonMode = 1, .extendedDynamicState3AlphaToCoverageEnable = 1, .extendedDynamicState3LogicOpEnable = 1, .extendedDynamicState3ColorBlendEnable = 1,
-        .extendedDynamicState3ColorBlendEquation = 1, .extendedDynamicState3ColorWriteMask = 1, .extendedDynamicState3DepthClampEnable = 1};
-    VkPhysicalDeviceShaderObjectFeaturesEXT so = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT, .pNext = &ed3, .shaderObject = 1};
-    VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .pNext = &so, .dynamicRendering = 1, .synchronization2 = 1, .maintenance4 = 1};
-    VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f13, .timelineSemaphore = 1, .scalarBlockLayout = 1, .samplerMirrorClampToEdge = 1, .samplerFilterMinmax = 1,
-        .shaderFloat16 = 1, .shaderInt8 = 1, .storageBuffer8BitAccess = 1, .uniformAndStorageBuffer8BitAccess = 1};
-    VkPhysicalDeviceVulkan11Features f11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &f12, .storageBuffer16BitAccess = 1, .uniformAndStorageBuffer16BitAccess = 1};
+    /* every feature the device has in these structures (the queried chain is the enabled one), minus robust buffer / image
+       access (a cost the game does not need; null descriptors stay) */
+    VkPhysicalDeviceProvokingVertexFeaturesEXT pv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT};
+    VkPhysicalDeviceDepthClipEnableFeaturesEXT dce = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT, .pNext = &pv};
+    VkPhysicalDeviceIndexTypeUint8FeaturesEXT iu8 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT, .pNext = &dce};
+    VkPhysicalDeviceCustomBorderColorFeaturesEXT cbc = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT, .pNext = &iu8};
+    VkPhysicalDeviceRobustness2FeaturesEXT rb2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, .pNext = &cbc};
+    VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vid = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT, .pNext = &rb2};
+    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT ed3 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT, .pNext = &vid};
+    VkPhysicalDeviceShaderObjectFeaturesEXT so = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT, .pNext = &ed3};
+    VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .pNext = &so};
+    VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f13};
+    VkPhysicalDeviceVulkan11Features f11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &f12};
     VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f11};
-    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; vkGetPhysicalDeviceFeatures2(V.phys, &have);
-    f2.features = have.features; f2.features.robustBufferAccess = 0;   /* everything the device has (shaderInt16 / Int64, image ops, independent blend ...) */
+    vkGetPhysicalDeviceFeatures2(V.phys, &f2);
+    f2.features.robustBufferAccess = 0; rb2.robustBufferAccess2 = 0; rb2.robustImageAccess2 = 0; f13.robustImageAccess = 0;
+    if (!so.shaderObject || !rb2.nullDescriptor || !vid.vertexInputDynamicState || !f13.dynamicRendering || !f12.timelineSemaphore) VKDIE("the device lacks shader objects, null descriptors, dynamic vertex input, dynamic rendering or timeline semaphores");
     VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f2, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .enabledExtensionCount = ndext, .ppEnabledExtensionNames = dext};
     VKCHECK(vkCreateDevice(V.phys, &dci, NULL, &V.dev));
     vkGetDeviceQueue(V.dev, V.qfam, 0, &V.queue);
