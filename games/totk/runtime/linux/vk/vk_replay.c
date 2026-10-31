@@ -133,21 +133,21 @@ static shadow_t g_shadow[1024]; static uint64_t g_shadow_epoch, g_shadow_ep[1024
 static int ubo_range(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off, VkDeviceSize *range) {
     if (!addr) return 0;
     if (!size || size > 65536) size = 65536;
-    int overlap = 0;
-    for (int i = 0; i < g_nupd && !overlap; i++) overlap = g_upd[i].dst < addr + size && addr < g_upd[i].dst + g_upd[i].n;
+    int overlap = 0;   /* 1 + the last pending update that overlaps the range */
+    for (int i = g_nupd - 1; i >= 0 && !overlap; i--) if (g_upd[i].dst < addr + size && addr < g_upd[i].dst + g_upd[i].n) overlap = i + 1;
     VkBuffer b; VkDeviceSize o;
     if (!overlap && vk_pool_find(addr, size, &b, &o) && !(o & 255)) { *buf = b; *off = o; *range = size; return 1; }
     if (!vk_pool_find(addr, 1, &b, &o)) return 0;
     unsigned slot = (unsigned)((addr >> 8) ^ size) & 1023;
     shadow_t *sh = &g_shadow[slot];
-    if (g_shadow_ep[slot] == g_shadow_epoch && sh->addr == addr && sh->size == size && sh->nupd == g_nupd) { *buf = sh->buf; *off = sh->off; *range = size; return 1; }
+    if (g_shadow_ep[slot] == g_shadow_epoch && sh->addr == addr && sh->size == size && sh->nupd == overlap) { *buf = sh->buf; *off = sh->off; *range = size; return 1; }
     vk_span s = vk_ring(size, 256); memcpy(s.cpu, (const void *)(uintptr_t)addr, size);
-    for (int i = 0; i < g_nupd; i++) {
+    for (int i = 0; i < overlap; i++) {
         uint64_t lo = g_upd[i].dst > addr ? g_upd[i].dst : addr, hi = g_upd[i].dst + g_upd[i].n < addr + size ? g_upd[i].dst + g_upd[i].n : addr + size;
         if (lo < hi) memcpy(s.cpu + (lo - addr), g_upd[i].data + (lo - g_upd[i].dst), hi - lo);
     }
     *buf = s.buf; *off = s.off; *range = size;
-    *sh = (shadow_t){addr, size, g_nupd, s.buf, s.off}; g_shadow_ep[slot] = g_shadow_epoch;
+    *sh = (shadow_t){addr, size, overlap, s.buf, s.off}; g_shadow_ep[slot] = g_shadow_epoch;
     return 1;
 }
 
@@ -232,13 +232,21 @@ static void driver_bank(uint8_t *d, int bank, int stage) {
         for (int r = 0; r < 32; r++) { uint32_t th = (uint32_t)S.tex[stage][r]; memcpy(d + 0x20 + 8 * r, &th, 4); }
     }
 }
+/* a 32-bit word of the c2 bank (driver_bank) read from the bound state */
+static uint32_t c2_word(int stage, int word) {
+    int b = word * 4;
+    if (b >= 0x20 && b < 0x120 && (b - 0x20) % 8 == 0) return (uint32_t)S.tex[stage][(b - 0x20) / 8];
+    if (b >= 0x168 && b < 0x568 && (b - 0x168) % 8 == 0) return (uint32_t)S.tex[stage][(b - 0x168) / 8];
+    if (b >= 0x568 && b < 0x968 && (b - 0x568) % 8 == 0) return (uint32_t)S.samp[stage][(b - 0x568) / 8];
+    return 0;
+}
 /* the NVN handle a texture binding reads: Ryujinx TextureHandle.ReadPackedId over the c2 bank */
-static uint32_t packed_handle(const uint8_t *c2, int handle) {
+static uint32_t packed_handle(int stage, int handle) {
     int tw = handle & 0x3fff, sw = (handle >> 14) & 0x3fff, type = (unsigned)handle >> 28;
-    uint32_t h = 0; if (tw * 4 + 4 <= 0xA00) memcpy(&h, c2 + tw * 4, 4);
+    uint32_t h = c2_word(stage, tw);
     if (type) {
         uint32_t s = 0;
-        if (type != 3) { if (sw * 4 + 4 <= 0xA00) memcpy(&s, c2 + sw * 4, 4); } else s = (uint32_t)sw;
+        if (type != 3) s = c2_word(stage, sw); else s = (uint32_t)sw;
         if (type == 2 || type == 3) s <<= 20;
         h |= s;
     }
@@ -259,7 +267,6 @@ static int g_feedback;   /* a draw samples an attachment of the open pass */
 static VkDescriptorSet stage_set(vshader *s, int stage, int set, VkDescriptorSetLayout layout) {
     VkWriteDescriptorSet w[MAXW]; VkDescriptorBufferInfo bi[MAXW]; VkDescriptorImageInfo ii[MAXW]; int nw = 0, nb = 0, ni = 0;
     VkDescriptorSet ds = dset_alloc(layout);
-    uint8_t c2[0xA00]; int have_c2 = 0;
     if (set == 0) { bi[nb] = (VkDescriptorBufferInfo){g_support, 0, 4096}; w[nw++] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[nb++]}; }
     for (int i = 0; i < s->nb && nw < MAXW - 1; i++) {
         const vk_rbind *b = &s->b[i];
@@ -268,7 +275,7 @@ static VkDescriptorSet stage_set(vshader *s, int stage, int set, VkDescriptorSet
         if (b->kind == RB_CBUF) {
             VkBuffer buf = VK_NULL_HANDLE; VkDeviceSize off = 0, range = VK_WHOLE_SIZE;
             if (b->slot == 1) { buf = s->c1buf; range = VK_WHOLE_SIZE; }
-            else if (b->slot == 0 || b->slot == 2) { vk_span sp = vk_ring(0xA00, 256); driver_bank(sp.cpu, b->slot, stage); if (b->slot == 2) { memcpy(c2, sp.cpu, 0xA00); have_c2 = 1; } buf = sp.buf; off = sp.off; range = 0xA00; }
+            else if (b->slot == 0 || b->slot == 2) { vk_span sp = vk_ring(0xA00, 256); driver_bank(sp.cpu, b->slot, stage); buf = sp.buf; off = sp.off; range = 0xA00; }
             else if (b->slot >= 3 && b->slot <= 18) { const p_bind_buf *u = &S.ubo[stage][b->slot - 3]; if (!ubo_range(u->addr, u->size, &buf, &off, &range)) buf = VK_NULL_HANDLE; }
             bi[nb] = (VkDescriptorBufferInfo){buf, off, buf ? range : VK_WHOLE_SIZE};
             x.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; x.pBufferInfo = &bi[nb++];
@@ -297,14 +304,13 @@ static VkDescriptorSet stage_set(vshader *s, int stage, int set, VkDescriptorSet
                 x.descriptorType = is_img ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
                 static VkBufferView none = VK_NULL_HANDLE; x.pTexelBufferView = &none; w[nw++] = x; continue;
             }
-            if (!have_c2) { driver_bank(c2, 2, stage); have_c2 = 1; }
             x.descriptorType = is_img ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             int count = b->array; if (ni + count > MAXW) count = MAXW - ni;
             x.descriptorCount = (uint32_t)count; x.pImageInfo = &ii[ni];
             for (int k = 0; k < count; k++) {
                 uint32_t h;
                 if (is_img) { int tw = b->handle & 0x3fff, reg = tw * 4 >= 0x120 ? (tw * 4 - 0x120) / 8 : -1; h = reg >= 0 && reg < 32 ? (uint32_t)S.img[stage][reg] : 0; }
-                else h = packed_handle(c2, b->handle + k * 2);
+                else h = packed_handle(stage, b->handle + k * 2);
                 int tid = (int)(h & 0xfffff), sid = (int)(h >> 20) & 0xfff;
                 tex_t t; view_t vw; int hv; VkImageView view = VK_NULL_HANDLE; VkSampler smp = vk_sampler(&g_default_samp);
                 if (tid && vk_tex_registry_get(tid, &t, &vw, &hv)) {
