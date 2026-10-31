@@ -51,3 +51,8 @@ $(OUT)/gfx/%.S.o: third_party/d2r_gfx/gfx/nvn/%.S third_party/d2r_gfx/gfx/nvn/in
 $(OUT)/tex/%.o: third_party/d2r_gfx/gfx/tex/%.c $(HEADERS) Makefile.linux
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
+# the GPU deswizzle (vk_tex.c upload): SPIR-V as a C array
+build/deswizzle_spv.h: runtime/linux/vk/deswizzle.comp
+	@mkdir -p build
+	glslangValidator -V --target-env vulkan1.3 --vn deswizzle_spv $< -o $@
+$(OUT)/linux/vk/vk_tex.o: build/deswizzle_spv.h
