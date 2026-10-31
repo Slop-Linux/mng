@@ -120,10 +120,38 @@ static uint64_t app_pool(void){static uint64_t v;if(!v){const char *e=getenv("TO
 #else
 #define ASLR_SIZE (GUEST_ADDRESS_LIMIT-(uintptr_t)low_space)
 #endif
+#ifdef __linux__
+/* Linux: guest RAM is shared memory, one memfd per reservation, so a virtual memory pool can map its pages a second time
+   (totk_vpool.c: mremap of shared pages); a decommitted page becomes a punched hole. */
+#include <fcntl.h>
+#include <linux/falloc.h>
+typedef struct{uintptr_t base;uint64_t size;int fd;}GuestBacking;
+static GuestBacking backing[8];static unsigned nbacking;
+static uint8_t *reserve_fixed(uint64_t at,uint64_t size){
+ int fd=memfd_create("guest-ram",MFD_CLOEXEC);if(fd<0)return NULL;
+ if(ftruncate(fd,(off_t)size)){close(fd);return NULL;}
+ void *p=mmap((void *)(uintptr_t)at,size,PROT_NONE,MAP_SHARED|MAP_FIXED_NOREPLACE|MAP_NORESERVE,fd,0);
+ if(p==MAP_FAILED||p!=(void *)(uintptr_t)at){if(p!=MAP_FAILED)munmap(p,size);close(fd);return NULL;}
+ if(nbacking==sizeof backing/sizeof *backing)runtime_fail("guest memory backing table");
+ backing[nbacking++]=(GuestBacking){(uintptr_t)at,size,fd};return p;
+}
+static void release_region(uint8_t *p,uint64_t size){
+ for(unsigned i=0;i<nbacking;i++)if(backing[i].base==(uintptr_t)p){close(backing[i].fd);backing[i]=backing[--nbacking];break;}
+ munmap(p,size);
+}
+static void decommit_page(uintptr_t page,uint64_t n){
+ for(unsigned i=0;i<nbacking;i++)if(page>=backing[i].base&&page+n<=backing[i].base+backing[i].size){
+  if(fallocate(backing[i].fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,(off_t)(page-backing[i].base),(off_t)n))runtime_fail("decommit guest page");
+  if(mprotect((void *)page,n,PROT_NONE))runtime_fail("decommit guest page");return;}
+ runtime_fail("decommit outside guest memory");
+}
+#else
+static void release_region(uint8_t *p,uint64_t size){mach_vm_deallocate(mach_task_self(),(mach_vm_address_t)(uintptr_t)p,size);}
 static uint8_t *reserve_fixed(uint64_t at,uint64_t size){
  mach_vm_address_t a=at;   /* FIXED without OVERWRITE: fails instead of replacing an existing mapping */
  return mach_vm_map(mach_task_self(),&a,size,0,VM_FLAGS_FIXED,MEMORY_OBJECT_NULL,0,FALSE,VM_PROT_NONE,VM_PROT_ALL,VM_INHERIT_DEFAULT)==KERN_SUCCESS?(uint8_t *)(uintptr_t)a:NULL;
 }
+#endif
 #define GUEST_ALIGN (2ULL<<20)
 /* Reserve size bytes in a free gap (2 MiB aligned). The end of the map is
    not reported, so the last gap is only tried; FIXED fails there with KERN_NO_SPACE when it reaches past the end. */
@@ -190,7 +218,7 @@ static void memory_init(void) {
   /* macOS 27: the shared cache fills 0x1_8000_0000..0xF_C000_0000 and the system reserves ~24 GiB at a random place in
      0x70_0000_0000..2^39, so neither fixed region fits. As on iOS, put stack+heap and the alias region side by side in one
      free hole, shrinking the alias region (the game uses < 3 GiB of it) until it fits. TOTK_ALIAS_GIB pins one size. */
-  if(alias_space)mach_vm_deallocate(mach_task_self(),(mach_vm_address_t)(uintptr_t)alias_space,ALIAS_SIZE);
+  if(alias_space)release_region(alias_space,ALIAS_SIZE);
   alias_space=NULL;
   uint64_t want=alias_requested(),least=getenv("TOTK_ALIAS_GIB")?want:(8ULL<<30);
   for(uint64_t g=want;!low_space;g-=4ULL<<30){
@@ -210,7 +238,7 @@ static void memory_init(void) {
     uint8_t *separate_low=reserve_in_gap(LOW_SIZE,0);
     if(separate_low){
      if((alias_space=reserve_in_gap_from(g,0,(uintptr_t)separate_low+LOW_SIZE))){low_space=separate_low;alias_len=g;break;}
-     mach_vm_deallocate(mach_task_self(),(mach_vm_address_t)(uintptr_t)separate_low,LOW_SIZE);
+     release_region(separate_low,LOW_SIZE);
     }
     if(g<least+(4ULL<<30))break;
    }
@@ -278,7 +306,11 @@ static uint64_t alias_map(int unmap,uint64_t addr,uint64_t size){
   uint64_t released=0;for(unsigned i=0;i<count;i++)if(alias_pages[first+i]){alias_pages[first+i]=0;alias_stale[first+i]=1;released+=4096;}alias_bytes-=released;
   uint64_t low=addr&~0x3fffULL,high=(addr+size+0x3fff)&~0x3fffULL;
   for(uint64_t page=low;page<high;page+=0x4000){unsigned p=(unsigned)((page-start)/4096);if(!alias_pages[p]&&!alias_pages[p+1]&&!alias_pages[p+2]&&!alias_pages[p+3]){
+#ifdef __linux__
+   decommit_page(page,0x4000);
+#else
    if(mmap((void *)page,0x4000,PROT_NONE,MAP_FIXED|MAP_PRIVATE|MAP_ANON,-1,0)!=(void *)page)runtime_fail("decommit physical alias page");
+#endif
    memset(alias_stale+p,0,4);}}
  }else if(fresh){
   uint64_t low=addr&~0x3fffULL,high=(addr+size+0x3fff)&~0x3fffULL;
