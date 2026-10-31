@@ -104,9 +104,20 @@ static void history(const char *event, const char *extra) {
 
 /* Process start time (seconds) or 0 if the pid is gone or a zombie; with the pid it names one process exactly. */
 static uint64_t pid_start(pid_t pid) {
+#ifdef __linux__
+    /* /proc/<pid>/stat: state (field 3) and start time in clock ticks after boot (field 22) */
+    char path[64], buf[1024]; snprintf(path, sizeof path, "/proc/%d/stat", pid);
+    FILE *f = pid > 0 ? fopen(path, "r") : NULL; if (!f) return 0;
+    size_t n = fread(buf, 1, sizeof buf - 1, f); fclose(f); buf[n] = 0;
+    char *p = strrchr(buf, ')'); if (!p) return 0;
+    char state = 0; unsigned long long start = 0; int field = 2;
+    for (char *t = strtok(p + 1, " "); t; t = strtok(NULL, " ")) { field++; if (field == 3) state = t[0]; if (field == 22) { start = strtoull(t, NULL, 10); break; } }
+    return state == 'Z' ? 0 : start / (unsigned long long)sysconf(_SC_CLK_TCK) + 1;
+#else
     struct proc_bsdinfo bi;
     if (pid <= 0 || proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, sizeof bi) != (int)sizeof bi || bi.pbi_status == SZOMB) return 0;
     return bi.pbi_start_tvsec;
+#endif
 }
 static int pid_same(pid_t pid, uint64_t start) { return start && pid_start(pid) == start; }
 static int pid_is_game(pid_t pid) {
@@ -238,7 +249,11 @@ static void holder_write(void) {
     char exe[PROC_PIDPATHINFO_MAXSIZE] = "", cwd[PATH_MAX] = "", log[PATH_MAX] = "", text[4096];
     proc_pidpath(getpid(), exe, sizeof exe);
     if (!getcwd(cwd, sizeof cwd)) cwd[0] = 0;
+#ifdef __linux__
+    { ssize_t k = readlink("/proc/self/fd/2", log, sizeof log - 1); log[k > 0 ? k : 0] = 0; }
+#else
     if (fcntl(2, F_GETPATH, log) == -1) log[0] = 0;
+#endif
     const char *w = getenv("TOTK_SLOT_WRAPPER_PID"), *ex = getenv("TOTK_SLOT_EXPECT_S"), *si = getenv("TOTK_SLOT_SINCE");
     snprintf(text, sizeof text,
              "owner=%s\npurpose=%s\ntoken=%s\ngame_pid=%d\ngame_start=%llu\nwrapper_pid=%s\nsince=%lld\nexpect_s=%s\nmode=%s\nexe=%s\ncwd=%s\nlog=%s\n",

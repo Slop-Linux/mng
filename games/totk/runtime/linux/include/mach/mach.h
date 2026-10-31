@@ -80,7 +80,7 @@ static inline kern_return_t mach_vm_map(mach_port_t t, mach_vm_address_t *a, mac
 }
 /* Regions from /proc/self/maps: the first mapping that ends above *a (Mach semantics), merged with adjacent ones of the same protection. */
 typedef struct { vm_prot_t protection, max_protection; unsigned inheritance, shared, reserved, behavior; uint64_t offset; unsigned short user_wired_count; } vm_region_basic_info_data_64_t;
-typedef struct { vm_prot_t protection, max_protection; unsigned user_tag, pages_resident, pages_dirtied, share_mode, is_submap; uint64_t offset; } vm_region_submap_info_data_64_t;
+typedef struct { vm_prot_t protection, max_protection; unsigned user_tag, pages_resident, pages_dirtied, pages_swapped_out, share_mode, is_submap; uint64_t offset; } vm_region_submap_info_data_64_t;
 #define VM_REGION_BASIC_INFO_64 9
 #define VM_REGION_BASIC_INFO_COUNT_64 ((mach_msg_type_number_t)(sizeof(vm_region_basic_info_data_64_t) / 4))
 #define VM_REGION_SUBMAP_INFO_COUNT_64 ((mach_msg_type_number_t)(sizeof(vm_region_submap_info_data_64_t) / 4))
@@ -105,6 +105,9 @@ static inline kern_return_t mach_vm_region_recurse(mach_port_t t, mach_vm_addres
     (void)depth; vm_region_basic_info_data_64_t b; kern_return_t kr = mach_vm_region(t, a, n, 0, (vm_region_info_t)&b, cnt, NULL);
     if (kr == KERN_SUCCESS) { vm_region_submap_info_data_64_t *s = (vm_region_submap_info_data_64_t *)info; memset(s, 0, sizeof *s); s->protection = b.protection; s->max_protection = 7; }
     return kr;
+}
+static inline kern_return_t vm_region_recurse_64(mach_port_t t, vm_address_t *a, vm_size_t *n, natural_t *depth, vm_region_recurse_info_t info, mach_msg_type_number_t *cnt) {
+    return mach_vm_region_recurse(t, a, n, depth, info, cnt);   /* page counts are not filled */
 }
 /* Thread inspection: unavailable (diagnostics only). */
 typedef struct { uint64_t __x[29], __fp, __lr, __sp, __pc; uint32_t __cpsr, __pad; } arm_thread_state64_t;

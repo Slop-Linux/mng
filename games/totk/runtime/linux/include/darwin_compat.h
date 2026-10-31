@@ -15,7 +15,8 @@ extern "C" {
 #endif
 /* ELF sections named like the Mach-O "__DATA,<name>" ones: section(DM_SEC("name")) and getsectiondata (mach-o/getsect.h) */
 #define DM_SEC(name) name
-static inline int pthread_threadid_np(pthread_t t, uint64_t *id) { (void)t; *id = (uint64_t)syscall(SYS_gettid); return 0; }
+/* the calling thread's id (callers pass NULL or themselves, or log another thread's: that one is not known here) */
+#define pthread_threadid_np(t, id) (*(id) = (uint64_t)syscall(SYS_gettid), 0)
 static inline int pthread_cond_timedwait_relative_np(pthread_cond_t *c, pthread_mutex_t *m, const struct timespec *rel) {
     struct timespec now; clock_gettime(CLOCK_REALTIME, &now);
     now.tv_sec += rel->tv_sec; now.tv_nsec += rel->tv_nsec; if (now.tv_nsec >= 1000000000) { now.tv_sec++; now.tv_nsec -= 1000000000; }
@@ -34,6 +35,14 @@ static inline size_t pthread_get_stacksize_np(pthread_t t) {
 /* CLOCK_UPTIME_RAW: monotonic, not counting sleep (CLOCK_MONOTONIC_RAW); clock_gettime_nsec_np */
 #define CLOCK_UPTIME_RAW CLOCK_MONOTONIC_RAW
 static inline uint64_t clock_gettime_nsec_np(clockid_t c) { struct timespec t; clock_gettime(c, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
+/* struct stat times (no birth time: the change time) */
+#define st_mtimespec st_mtim
+#define st_ctimespec st_ctim
+#define st_atimespec st_atim
+#define st_birthtimespec st_ctim
+/* mincore: Linux reports residency in bit 0 only */
+#define MINCORE_INCORE 1
+#define MINCORE_PAGED_OUT 0
 #define F_FULLFSYNC (-1)   /* fcntl(fd, F_FULLFSYNC) callers use fsync (fs_host.c) */
 #ifdef __cplusplus
 }
