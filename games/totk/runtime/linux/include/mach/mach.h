@@ -78,6 +78,16 @@ static inline kern_return_t mach_vm_map(mach_port_t t, mach_vm_address_t *a, mac
     if (fixed && p != (void *)(uintptr_t)*a) { munmap(p, n); return KERN_NO_SPACE; }
     *a = (uintptr_t)p; return KERN_SUCCESS;
 }
+/* A second mapping of the same pages: only MAP_SHARED memory can be aliased on Linux (mremap with old size 0). */
+static inline kern_return_t mach_vm_remap(mach_port_t t, mach_vm_address_t *a, mach_vm_size_t n, mach_vm_offset_t mask, int flags, mach_port_t src,
+                                          mach_vm_address_t from, boolean_t copy, vm_prot_t *cur, vm_prot_t *max, vm_inherit_t inh) {
+    (void)t; (void)mask; (void)src; (void)inh;
+    if (copy || (flags & VM_FLAGS_ANYWHERE)) return KERN_FAILURE;
+    void *p = mremap((void *)(uintptr_t)from, 0, n, MREMAP_MAYMOVE | MREMAP_FIXED, (void *)(uintptr_t)*a);
+    if (p == MAP_FAILED) return KERN_NO_SPACE;
+    if (cur) *cur = VM_PROT_READ | VM_PROT_WRITE; if (max) *max = VM_PROT_ALL;
+    return KERN_SUCCESS;
+}
 /* Regions from /proc/self/maps: the first mapping that ends above *a (Mach semantics), merged with adjacent ones of the same protection. */
 typedef struct { vm_prot_t protection, max_protection; unsigned inheritance, shared, reserved, behavior; uint64_t offset; unsigned short user_wired_count; } vm_region_basic_info_data_64_t;
 typedef struct { vm_prot_t protection, max_protection; unsigned user_tag, pages_resident, pages_dirtied, pages_swapped_out, share_mode, is_submap; uint64_t offset; } vm_region_submap_info_data_64_t;

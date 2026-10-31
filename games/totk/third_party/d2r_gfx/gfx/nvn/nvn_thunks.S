@@ -6288,7 +6288,7 @@ SYM(nvn_names):
     .quad Ln520
     .quad Ln521
     .quad Ln522
-    .cstring
+    CSTRING_SECTION
 Ln0: .asciz "nvnDeviceBuilderSetDefaults"
 Ln1: .asciz "nvnDeviceBuilderSetFlags"
 Ln2: .asciz "nvnDeviceBuilderGetFlags"
