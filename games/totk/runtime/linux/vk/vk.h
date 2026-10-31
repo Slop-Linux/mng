@@ -96,6 +96,7 @@ int vk_samp_registry_get(int id, samp_par *p);
 void vk_tex_release_serial(uint64_t serial);
 void vk_tex_readback(vtex *v, const tex_t *t);   /* write the image back into guest memory (CPU reads) */
 VkBufferView vk_tex_bufview(const tex_t *t, int format);   /* a buffer texture's view over its pool memory */
+void vk_tex_mark_read(vtex *v); int vk_tex_store_needed(vtex *v); void vk_tex_frame(void); void vk_tex_prune_stats(uint64_t *stores, uint64_t *reads);   /* store pruning */
 
 /* ---------- vk_shader.c ---------- */
 enum { RB_CBUF, RB_SBUF, RB_TEX, RB_IMG, RB_IA };   /* RB_IA: an input attachment of a decal variant (vk_fbread.c), slot = colour attachment */

@@ -103,6 +103,7 @@ struct vtex {
     nvn_texdesc d;
     vview *views; int nviews;
     int gpu_dirty;  /* rendered since the last write-back */
+    uint64_t made, last_read; int store_always; uint64_t pruned;   /* store pruning (vk_tex_store_needed) */
     /* staged write-back (nvn_mtl.m's botw_wb_stage_encode): a texture the CPU has read back is copied into stage at the end of
        every submission that renders it; a write-back then waits for that submission only and swizzles from stage */
     uint64_t render_fence, stage_fence; int wb_count, in_list, in_tiny; VkBuffer stage; VkDeviceMemory stage_mem; uint8_t *stage_cpu; VkDeviceSize stage_size;
@@ -319,6 +320,7 @@ static VkDeviceSize wb_size(vtex *v, int bw, int bh, int bpb) {
     return total;
 }
 static void wb_copies_at(vtex *v, VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, int bw, int bh, int bpb) {
+    vk_tex_mark_read(v);
     int one_d = v->type == VK_IMAGE_TYPE_1D, linear = nvn_tex_is_linear(&v->d); uint32_t nlev = linear ? 1 : v->levels, nlay = linear ? 1 : v->layers;
     for (uint32_t l = 0; l < nlev; l++) {
         uint32_t w = mipd(v->w, l), h = one_d ? 1 : mipd(v->h, l), dd = v->type == VK_IMAGE_TYPE_3D ? mipd(v->depth, l) : 1;
@@ -538,6 +540,7 @@ static vtex *tex_find(const tex_t *t) {
 /* the region of one level through a host buffer: to_image 0 reads the image into lin, 1 writes lin into it */
 static void texels_image(vtex *v, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *lin, size_t wb, size_t hb, int nz, int to_image) {
     int is3d = v->type == VK_IMAGE_TYPE_3D; VkDeviceSize n = (VkDeviceSize)wb * hb * nz; VkBuffer b; VkDeviceMemory m; uint8_t *cpu;
+    if (!to_image) vk_tex_mark_read(v);
     mtl_finish(); host_buffer(n, &b, &m, &cpu);
     if (to_image) memcpy(cpu, lin, n);
     VkCommandBuffer cb = vk_oneshot_begin();
@@ -593,3 +596,23 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
     for (int z = 0; z < nz; z++) for (size_t y = 0; y < hb; y++) memcpy(lin + (z * hb + y) * wb, src + z * img + y * row, wb);
     texels_image(v, level, layer0, r, lin, wb, hb, nz, 1); free(lin);
 }
+
+/* ---------- store pruning: an image nothing has read (sampled, loaded by a later pass, copied from, read back by the CPU or
+   presented) for PRUNE_FRAMES frames since it was made is rendered with STORE_OP_DONT_CARE. A read of a pruned image keeps it
+   stored from then on (logged: that read saw the last stored content) ---------- */
+#define PRUNE_FRAMES 300
+static uint64_t g_frame; static uint64_t g_pruned_reads, g_pruned_stores;
+void vk_tex_frame(void) { g_frame++; }
+void vk_tex_mark_read(vtex *v) {
+    if (!v) return;
+    if (v->pruned && !v->store_always) { v->store_always = 1; g_pruned_reads++; if (g_pruned_reads <= 16) VKLOG("【红】a pruned image was read (%ux%u format %d): stored from now on", v->w, v->h, v->fmt); }
+    v->last_read = g_frame + 1;
+}
+int vk_tex_store_needed(vtex *v) {
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_VK_PRUNE"); on = !(e && !strcmp(e, "0")); }
+    if (!on || !v || v->store_always || v->last_read) return 1;
+    if (!v->made) v->made = g_frame + 1;
+    if (g_frame + 1 - v->made < PRUNE_FRAMES) return 1;
+    v->pruned++; g_pruned_stores++; return 0;
+}
+void vk_tex_prune_stats(uint64_t *stores, uint64_t *reads) { *stores = g_pruned_stores; *reads = g_pruned_reads; }
