@@ -24,6 +24,7 @@
    only pages mincore reports as touched are read, so a scan does not make mapped but untouched memory resident. */
 #if !TARGET_OS_IPHONE
 #include <math.h>
+#include "host_context.h"
 #include <stdarg.h>
 #include <pthread.h>
 #include <sys/mman.h>
@@ -207,15 +208,15 @@ static void scan_record(ucontext_t *u, uint64_t pc) {
     for (unsigned i = (unsigned)(pc >> 2) % SCAN_SLOTS, k = 0; k < SCAN_SLOTS; k++, i = (i + 1) % SCAN_SLOTS) {
         uint64_t z = 0;
         if (atomic_compare_exchange_strong(&scan_hits[i].pc, &z, pc) || z == pc) {
-            atomic_store(&scan_hits[i].lr, u->uc_mcontext->__ss.__lr); atomic_fetch_add(&scan_hits[i].n, 1);
+            atomic_store(&scan_hits[i].lr, u->UC_LR); atomic_fetch_add(&scan_hits[i].n, 1);
             int f = 0;
             if (atomic_compare_exchange_strong(&scan_hits[i].filled, &f, 1)) {
-                memcpy(scan_hits[i].x, u->uc_mcontext->__ss.__x, 29 * 8); scan_hits[i].x[29] = u->uc_mcontext->__ss.__fp;
-                scan_hits[i].x[30] = u->uc_mcontext->__ss.__lr; scan_hits[i].sp = u->uc_mcontext->__ss.__sp;
-                for (int r = 0; r < 16; r++) { __uint128_t q = u->uc_mcontext->__ns.__v[r]; uint32_t w32 = (uint32_t)q; memcpy(&scan_hits[i].v[r], &w32, 4); }
+                memcpy(scan_hits[i].x, u->UC_X, 29 * 8); scan_hits[i].x[29] = u->UC_FP;
+                scan_hits[i].x[30] = u->UC_LR; scan_hits[i].sp = u->UC_SP;
+                for (int r = 0; r < 16; r++) { __uint128_t q = UC_V(u)[r]; uint32_t w32 = (uint32_t)q; memcpy(&scan_hits[i].v[r], &w32, 4); }
                 /* the callers: the frame-pointer chain, followed only while it stays 8-byte aligned and inside the 1 MiB
                    above sp (this thread's stack), so a bad link ends the walk instead of faulting */
-                uint64_t sp = u->uc_mcontext->__ss.__sp, fp = u->uc_mcontext->__ss.__fp;
+                uint64_t sp = u->UC_SP, fp = u->UC_FP;
                 for (int c = 0; c < SCAN_CHAIN; c++) {
                     scan_hits[i].chain[c] = 0;
                     if (fp & 7 || fp < sp || fp >= sp + (1 << 20)) continue;   /* game frames are 8-byte aligned (fp = sp + 0x48 seen) */
@@ -230,12 +231,12 @@ static void scan_record(ucontext_t *u, uint64_t pc) {
 }
 int runtime_mem_scan_trap(void *context) {   /* loader.c crash(): 1 when this SIGTRAP was the scan watchpoint */
     ucontext_t *u = context; uint64_t w = atomic_load(&scan_watch_addr);
-    unsigned ec = (unsigned)(u->uc_mcontext->__es.__esr >> 26); uint64_t far = u->uc_mcontext->__es.__far;
+    unsigned ec = (unsigned)(UC_ESR(u) >> 26); uint64_t far = u->UC_FAR;
     /* any watchpoint exception while the scan's watch is armed is ours: a wide access (a double, a register pair, a vector)
        reports its own start in FAR, which can lie below the watched word (2026-10-27: the game closed on such a store) */
     (void)far;
     if (ec == 0x30 || ec == 0x31) {
-        uint64_t bp = atomic_load(&scan_bp_addr), pc0 = u->uc_mcontext->__ss.__pc;
+        uint64_t bp = atomic_load(&scan_bp_addr), pc0 = u->UC_PC;
         if (bp && pc0 == bp) {   /* the code breakpoint: record it like a watch hit, step over it with slot 1 */
             scan_record(u, pc0);
             thread_act_t self = mach_thread_self(); arm_debug_state64_t d; mach_msg_type_number_t c = ARM_DEBUG_STATE64_COUNT;
@@ -250,7 +251,7 @@ int runtime_mem_scan_trap(void *context) {   /* loader.c crash(): 1 when this SI
         scan_step(0, w); return 1;
     }
     if (!w || (ec != 0x34 && ec != 0x35)) return 0;
-    uint64_t pc = u->uc_mcontext->__ss.__pc;
+    uint64_t pc = u->UC_PC;
     scan_record(u, pc);
     scan_step(pc + 4, 0);   /* the access runs unwatched, then the breakpoint after it arms the watch again */
     return 1;

@@ -1,14 +1,15 @@
+#include "asm_sym.h"
 /* Gate register preservation adapted from D2R Mobile (MIT), pinned in third_party/d2r/README.md. */
 .text
-    .globl _runtime_gate
+    .globl SYM(runtime_gate)
     .p2align 2
-_runtime_gate:
+SYM(runtime_gate):
     // Switch to this thread's host stack first (see hle_stack.S): the guest stack only holds x16/x17.
     // Frame above the 800-byte register area: [sp+800] guest sp (points at saved x16/x17), [sp+808] host top or 0.
     stp x16, x17, [sp, #-16]!
-    mrs x16, tpidrro_el0
-    adrp x17, _runtime_hle_tsd_off@PAGE
-    ldr x17, [x17, _runtime_hle_tsd_off@PAGEOFF]
+    mrs x16, TP_EL0
+    adrp x17, PAGE(runtime_hle_tsd_off)
+    ldr x17, [x17, PAGEOFF(runtime_hle_tsd_off)]
     add x16, x16, x17
     ldr x17, [x16]
     cbz x17, 1f
@@ -64,12 +65,12 @@ _runtime_gate:
     str x9, [sp, #784]
     mov x0, x30              // 返回点 = 门标识 | Return point = gate identifier
     mov x1, sp               // regs
-    bl _runtime_dispatch
+    bl SYM(runtime_dispatch)
     ldr x9, [sp, #808]          // give the host stack back to this thread
     cbz x9, 3f
-    mrs x10, tpidrro_el0
-    adrp x11, _runtime_hle_tsd_off@PAGE
-    ldr x11, [x11, _runtime_hle_tsd_off@PAGEOFF]
+    mrs x10, TP_EL0
+    adrp x11, PAGE(runtime_hle_tsd_off)
+    ldr x11, [x11, PAGEOFF(runtime_hle_tsd_off)]
     str x9, [x10, x11]
 3:
     ldr x9, [sp, #784]

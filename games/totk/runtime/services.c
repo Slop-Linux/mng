@@ -1,5 +1,6 @@
 /* Horizon services reached by the current TOTK startup. Unknown operations fail. */
 #include "runtime.h"
+#include "host_tp.h"
 #include <TargetConditionals.h>
 #include "ipc.h"
 #include <mach/mach.h>
@@ -303,6 +304,13 @@ static uint64_t desired_language(void) {
     if(k==4&&!script[0]&&isalpha((unsigned char)p[0])&&isalpha((unsigned char)p[3])){for(size_t i=0;i<4;i++)script[i]=(char)(i?tolower((unsigned char)p[i]):toupper((unsigned char)p[i]));}
     p+=k;}
   } else {
+#ifdef __linux__
+   /* LC_ALL / LC_MESSAGES / LANG: language[_REGION][.charset][@modifier] */
+   const char *env=getenv("LC_ALL");if(!env||!*env)env=getenv("LC_MESSAGES");if(!env||!*env)env=getenv("LANG");if(!env)env="";
+   size_t n=strcspn(env,"_.@-");if(n<sizeof(language))memcpy(language,env,n);
+   if(env[n]=='_'||env[n]=='-'){const char *r=env+n+1;size_t k=strcspn(r,".@");if(k==2){region[0]=(char)toupper((unsigned char)r[0]);region[1]=(char)toupper((unsigned char)r[1]);}}
+   if(!strcmp(language,"C")||!strcmp(language,"POSIX"))strcpy(language,"en");
+#else
    CFLocaleRef locale=CFLocaleCopyCurrent();
    CFStringRef value=CFLocaleGetValue(locale,kCFLocaleLanguageCode);
    if(value)CFStringGetCString(value,language,sizeof(language),kCFStringEncodingUTF8);
@@ -310,6 +318,7 @@ static uint64_t desired_language(void) {
    if(value)CFStringGetCString(value,script,sizeof(script),kCFStringEncodingUTF8);
    value=CFLocaleGetValue(locale,kCFLocaleCountryCode);
    if(value)CFStringGetCString(value,region,sizeof(region),kCFStringEncodingUTF8);CFRelease(locale);
+#endif
   }
 #if defined(TOTK_GAME_V143) || defined(GAME_BOTW190)
   const int brazil=1;
@@ -440,7 +449,7 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
  /* SynchronizePreemptionState: the SDK calls it after clearing ThreadLocalRegion disable_count (+0x100) when interrupt_flag
     (+0x102) was set by a preemption that had to wait (threads.c totk_preempt_signal). The switch itself happened at this
     SVC's entry (runtime_core_checkpoint); here the flag is cleared, as Horizon does. */
- case 0x36:{volatile uint16_t *tlr=pthread_getspecific(runtime_keys[2]);if(tlr)tlr[0x102/2]=0;r[0]=0;return 0;}
+ case 0x36:{volatile uint16_t *tlr=runtime_slot_get(2);if(tlr)tlr[0x102/2]=0;r[0]=0;return 0;}
  case 0x26: {uint32_t result=0;if(r[1]&&r[2]>=4)memcpy(&result,(void *)(uintptr_t)r[1],4);fprintf(stderr,"[totk] guest Break reason=%llx result=%x\n",(unsigned long long)r[0],result);runtime_trace_guest(r[29],r[30]);if(r[0]&0x80000000ULL)return 0;runtime_fail("original SDK Break");}
  case 0x27: {size_t n=r[1];if(n>65536)runtime_fail("debug string too long");fwrite((void *)(uintptr_t)r[0],1,n,stderr);r[0]=0;return 0;}
  case 0x0b:{int64_t ns=(int64_t)r[0];if(ns>0){struct timespec t={ns/1000000000,ns%1000000000};nanosleep(&t,NULL);}r[0]=0;return 0;}
