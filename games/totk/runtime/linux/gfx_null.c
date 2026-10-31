@@ -141,13 +141,15 @@ __attribute__((weak)) int dm_detclock_enabled(void) { return 0; }
 __attribute__((weak)) void dm_guest_frame_tick(void) {}
 uint64_t g_draw_skip[16];
 void dm_gfx_anomdump(void) {}
+#ifndef VK_BACKEND   /* screenshots: vk_dev.c */
 void dm_gfx_ashot(const char *path) { (void)path; }
+void dm_gfx_shot_at(long frames, const char *path) { (void)frames; (void)path; }
+void dm_gfx_window_shot(const char *path) { (void)path; }
+#endif
 void dm_gfx_passdump_next(long n) { (void)n; }
 void dm_gfx_querylog_next(long n) { (void)n; }
 void dm_gfx_set_flag(const char *name, int value) { (void)name; (void)value; }
-void dm_gfx_shot_at(long frames, const char *path) { (void)frames; (void)path; }
 void dm_gfx_texdump_next(const char *path) { (void)path; }
-void dm_gfx_window_shot(const char *path) { (void)path; }
 void dm_nvn_probe_prediction(void) {}
 void mtl_res_counts(uint32_t tick, const char *why) { (void)tick; (void)why; }
 

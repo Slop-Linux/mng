@@ -22,7 +22,7 @@ typedef struct {
 static state_t S;
 /* generations: what a draw derives from the state is rebuilt only when its inputs changed (per stage bindings, fixed-function
    state, vertex input); g_sub_gen invalidates everything that lives in one submission (descriptor sets, ring copies) */
-static uint64_t g_gen_bind[6], g_gen_state, g_gen_vtx, g_sub_gen = 1;
+static uint64_t g_gen_bind[6], g_gen_state, g_gen_vtx, g_sub_gen = 1, g_cb_gen = 1;   /* g_cb_gen: the command buffer recorded into (vk_sub_cut) */
 uint64_t vk_tex_registry_gen(void);
 static void state_reset(void) {
     memset(&S, 0, sizeof S);
@@ -45,14 +45,15 @@ static int g_dyn_set;   /* every dynamic state set once in this command buffer *
    tile read for input attachments (its local read splits the render at the barrier) and a split costs a store and load of
    the targets, so a run of sampling draws (decals blending into the G-buffer) shares one split: the run reads the pass as
    it was at its first draw. TOTK_VK_FB_DRAW=1 splits before every such draw (exact; ~250 extra passes a frame in the Shrine) */
-static unsigned g_pass_written;
+static unsigned g_pass_written, g_lr_dirty;   /* g_lr_dirty: written since the last local-read barrier (decal variants) */
 static int depth_has_stencil(void) { return g_pdepth.v && (vk_tex_aspect(g_pdepth.v) & VK_IMAGE_ASPECT_STENCIL_BIT); }
 
 /* ---------- occlusion queries (NVN_COUNTER_TYPE_SAMPLES_PASSED): a counter ResetCounter zeroes, every draw adds to and
    ReportCounter writes on completion. While counting each pass segment has a query slot; a report sums the slots since the
    reset (nvn_mtl.m's visibility slots) ---------- */
 static int g_q_counting, g_q_skipped; static int64_t g_q_cur = -1; static uint32_t *g_q_list; static int g_q_n, g_q_cap;
-static void q_begin(void) { if (g_q_counting && g_q_cur < 0) { g_q_cur = vk_query_alloc(); vkCmdBeginQuery(vk_cb(), vk_query_pool(), (uint32_t)g_q_cur, 0); } }
+static int g_pass_recorded;   /* the open pass has been begun on the command buffer (pass_record) */
+static void q_begin(void) { if (g_q_counting && g_q_cur < 0 && g_pass_recorded) { g_q_cur = vk_query_alloc(); vkCmdBeginQuery(vk_cb(), vk_query_pool(), (uint32_t)g_q_cur, 0); } }
 static void q_end(int keep) {
     if (g_q_cur < 0) return;
     vkCmdEndQuery(vk_cb(), vk_query_pool(), (uint32_t)g_q_cur);
@@ -76,28 +77,70 @@ typedef struct { uint32_t w, h; int ncol, depth, draws, why; unsigned load_clear
 static VkQueryPool g_pt_pool; static int g_pt_on, g_pt_n; static pt_info g_pt[PT_MAX];
 static void pt_mark(int end) { if (g_pt_on && g_pt_n < PT_MAX) vkCmdWriteTimestamp2(vk_cb(), VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g_pt_pool, (uint32_t)(2 * g_pt_n + end)); }
 static void pt_close(int why) { if (g_pt_on && g_pt_n < PT_MAX) { pt_mark(1); g_pt[g_pt_n].why = why; g_pt_n++; } }
-/* texture clears deferred to the end of the pass (clear_tex) */
-#define DCLR 32
-static struct { p_clear_tex c; vtex *v; } g_dclr[DCLR]; static int g_ndclr, g_dclr_hit; static uint64_t g_dclr_deferred;
-static void clear_tex_now(const p_clear_tex *c, vtex *v);
-static void end_pass(int why) {
-    if (!g_pass_open) return;
-    g_end_why[why]++;
-    q_end(1);
-    vkCmdEndRendering(vk_cb()); g_pass_open = 0; g_dclr_hit = 0; pt_close(why);
-    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
-        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
-    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
-    vkCmdPipelineBarrier2(vk_cb(), &di);
-    if (g_ndclr) { for (int i = 0; i < g_ndclr; i++) clear_tex_now(&g_dclr[i].c, g_dclr[i].v); g_ndclr = 0; vkCmdPipelineBarrier2(vk_cb(), &di); }
-}
-void vk_replay_end_pass(void) { end_pass(0); }
 static void full_barrier(void) {
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
         .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
     vkCmdPipelineBarrier2(vk_cb(), &di);
 }
+/* ---------- pending clears: a clear of a whole subresource (a texture clear, or the clears of a pass that drew nothing) is
+   kept until the image is next rendered, where it becomes the attachment's load operation, instead of a clear command or
+   a pass of its own. Any other use of the image first runs it (pclr_flush): a draw or dispatch sampling it (g_pclr_hit),
+   a copy, a partial render, the end of the submission ---------- */
+typedef struct { vtex *v; int level, layer; VkImageAspectFlags aspect; VkClearValue val; } pclr_t;
+#define PCLR 64
+static pclr_t g_pclr[PCLR]; static int g_npclr, g_pclr_hit; static uint64_t g_pclr_loads, g_pclr_run, g_pass_dropped;
+static void pclr_flush(void) {
+    if (!g_npclr) return;
+    for (int i = 0; i < g_npclr; i++) { const pclr_t *e = &g_pclr[i]; VkImageSubresourceRange r = {e->aspect, (uint32_t)e->level, 1, (uint32_t)e->layer, 1};
+        if (e->aspect & VK_IMAGE_ASPECT_COLOR_BIT) vkCmdClearColorImage(vk_cb(), vk_tex_image(e->v), VK_IMAGE_LAYOUT_GENERAL, &e->val.color, 1, &r);
+        else vkCmdClearDepthStencilImage(vk_cb(), vk_tex_image(e->v), VK_IMAGE_LAYOUT_GENERAL, &e->val.depthStencil, 1, &r); }
+    g_pclr_run += g_npclr; g_npclr = 0; g_pclr_hit = 0; full_barrier();
+}
+static void pclr_add(vtex *v, int level, int layer, VkImageAspectFlags aspect, VkClearValue val) {
+    for (int i = 0; i < g_npclr; i++) if (g_pclr[i].v == v && g_pclr[i].level == level && g_pclr[i].layer == layer) {   /* a later clear replaces the aspects it covers */
+        if (!(g_pclr[i].aspect & ~aspect)) { g_pclr[i] = g_pclr[--g_npclr]; i--; continue; }
+        pclr_flush(); break;
+    }
+    if (g_npclr == PCLR) pclr_flush();
+    g_pclr[g_npclr++] = (pclr_t){v, level, layer, aspect, val}; vk_tex_gpu_wrote(v);
+}
+static int pclr_find(vtex *v, int level, int layer) { for (int i = 0; i < g_npclr; i++) if (g_pclr[i].v == v && g_pclr[i].level == level && g_pclr[i].layer == layer) return i; return -1; }
+
+/* the open pass is begun lazily (pass_record): a pass that only clears never reaches the GPU, its clears stay pending */
+static VkRenderingAttachmentInfo g_lca[8], g_lda, g_lsa; static VkRenderingInfo g_lri; static unsigned g_pass_full;
+static void pass_record(void) {
+    if (!g_pass_open || g_pass_recorded) return;
+    if (g_pt_on && g_pt_n < PT_MAX) { unsigned lc = 0; for (int i = 0; i < g_pcount; i++) lc |= (g_lca[i].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) << i; if (g_lda.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) lc |= 1u << 8;
+        VkFormat f0 = 0; for (int i = 0; i < g_pcount && !f0; i++) if (g_patt[i].v) { uint32_t a_, b_; vk_tex_dims(g_patt[i].v, &a_, &b_, &f0); }
+        g_pt[g_pt_n] = (pt_info){g_pw, g_ph, g_pcount, g_pdepth.v != NULL, 0, 0, lc, f0}; pt_mark(0); }
+    vkCmdBeginRendering(vk_cb(), &g_lri);
+    g_pass_recorded = 1; g_passes++; g_frame_passes++; g_gen_state++;
+    q_begin();
+}
+static void end_pass(int why) {
+    if (!g_pass_open) return;
+    if (!g_pass_recorded) {   /* nothing drawn: the cleared attachments that cover their whole level go pending */
+        int drop = 1;
+        for (int i = 0; i < g_pcount; i++) if (g_lca[i].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR && !(g_pass_full >> i & 1)) drop = 0;
+        if ((g_lda.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR || g_lsa.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) && !(g_pass_full >> 8 & 1)) drop = 0;
+        if (drop) {
+            for (int i = 0; i < g_pcount; i++) if (g_lca[i].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) pclr_add(g_patt[i].v, g_patt[i].level, g_patt[i].layer, VK_IMAGE_ASPECT_COLOR_BIT, g_lca[i].clearValue);
+            VkImageAspectFlags a = (g_lda.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) | (g_lsa.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+            if (a) { VkClearValue cv = {.depthStencil = {g_lda.clearValue.depthStencil.depth, g_lsa.clearValue.depthStencil.stencil}}; pclr_add(g_pdepth.v, g_pdepth.level, g_pdepth.layer, a, cv); }
+            g_pass_open = 0; g_pass_dropped++; return;
+        }
+        pass_record();
+    }
+    g_end_why[why]++;
+    q_end(1);
+    vkCmdEndRendering(vk_cb()); g_pass_open = 0; g_pass_recorded = 0; pt_close(why);
+    full_barrier();
+    /* TOTK_VK_CHUNK_DRAWS (500; 0 off): after that many draws the submission so far goes to the GPU (vk_sub_cut) */
+    static long chunk = -1; static uint64_t at; if (chunk < 0) { const char *e = getenv("TOTK_VK_CHUNK_DRAWS"); chunk = e ? atol(e) : 500; }
+    if (why && chunk && g_draws - at >= (uint64_t)chunk) { void vk_sub_cut(void); vk_sub_cut(); at = g_draws; g_cb_gen++; }
+}
+void vk_replay_end_pass(void) { end_pass(0); pclr_flush(); }
 /* the clears that open a pass become its load operations: from the op that opens it, the run of clears and state changes
    before its first draw (scissor tracked; a render condition, a draw or any other op ends the run). The first clear of an
    attachment that covers the whole render area with every channel is taken (g_taken); the clear op then does nothing */
@@ -148,7 +191,7 @@ static int clear_taken(void) { for (int i = 0; i < g_ntaken; i++) if (g_taken[i]
 static int pass_begin(void) {
     if (g_pass_open) return 1;
     if (!S.has_rt) { g_skips[0]++; return 0; }
-    VkRenderingAttachmentInfo ca[8] = {0}, da = {0}, sa = {0}; int n = 0; uint32_t w = UINT32_MAX, h = UINT32_MAX;
+    VkRenderingAttachmentInfo ca[8] = {0}, da = {0}, sa = {0}; int n = 0; uint32_t w = UINT32_MAX, h = UINT32_MAX, aw[9] = {0}, ah[9] = {0};
     memset(g_patt, 0, sizeof g_patt); memset(&g_pdepth, 0, sizeof g_pdepth);
     for (int i = 0; i < S.rt.n && i < 8; i++) {
         g_pslot[i] = -1;
@@ -162,6 +205,7 @@ static int pass_begin(void) {
         uint32_t tw, th; VkFormat f; vk_tex_dims(v, &tw, &th, &f);
         int lv = S.rt.has_cview[i] && S.rt.cview[i].set_levels ? S.rt.cview[i].base_level : 0; tw = tw >> lv ? tw >> lv : 1; th = th >> lv ? th >> lv : 1;
         if (tw < w) w = tw; if (th < h) h = th;
+        if (!(S.rt.has_cview[i] && S.rt.cview[i].set_format && S.rt.cview[i].format != t->d.format)) { aw[i] = tw; ah[i] = th; }   /* pending clears: the image's own format only */
         vk_tex_upload_if_stale(v, t); vk_tex_gpu_wrote(v);
         g_patt[i] = (att_t){v, view, lv, S.rt.has_cview[i] && S.rt.cview[i].set_layers ? S.rt.cview[i].min_layer : 0}; g_pslot[i] = i;
         ca[i] = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
@@ -173,7 +217,9 @@ static int pass_begin(void) {
         vtex *v = vk_tex_get(S.rt.depth);
         VkImageView view = v ? vk_tex_view(v, S.rt.depth, &S.rt.dview, S.rt.has_dview, VK_IMAGE_VIEW_TYPE_2D, 1) : VK_NULL_HANDLE;
         if (view) {
-            uint32_t tw, th; VkFormat f; vk_tex_dims(v, &tw, &th, &f); if (tw < w) w = tw; if (th < h) h = th;
+            uint32_t tw, th; VkFormat f; vk_tex_dims(v, &tw, &th, &f);
+            int dl = S.rt.has_dview && S.rt.dview.set_levels ? S.rt.dview.base_level : 0; aw[8] = tw >> dl ? tw >> dl : 1; ah[8] = th >> dl ? th >> dl : 1;
+            if (aw[8] < w) w = aw[8]; if (ah[8] < h) h = ah[8];
             vk_tex_gpu_wrote(v); g_pdepth = (att_t){v, view, S.rt.has_dview && S.rt.dview.set_levels ? S.rt.dview.base_level : 0, S.rt.has_dview && S.rt.dview.set_layers ? S.rt.dview.min_layer : 0};
             da = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
                 .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
@@ -185,15 +231,26 @@ static int pass_begin(void) {
         w = S.nvp ? (uint32_t)(S.vp[0][0] + S.vp[0][2]) : 1; h = S.nvp ? (uint32_t)(S.vp[0][1] + S.vp[0][3]) : 1; if (!w) w = 1; if (!h) h = 1;
     }
     g_pw = w; g_ph = h; g_pcount = n;
+    /* pending clears of the attachments: their load operations when the pass covers the whole level, else they run first */
+    g_pass_full = 0; g_pass_written = 0; g_lr_dirty = 0;
+    for (int a = 0; a < 9; a++) if (aw[a] == w && ah[a] == h) g_pass_full |= 1u << a;
+    for (int a = 0; a < 9; a++) {
+        const att_t *at = a < 8 ? &g_patt[a] : &g_pdepth; int k = at->v ? pclr_find(at->v, at->level, at->layer) : -1;
+        if (k < 0) continue;
+        const pclr_t *e = &g_pclr[k];
+        int ok = g_pass_full >> a & 1;
+        if (a == 8) ok &= !((e->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && !da.sType) && !((e->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) && !sa.sType);
+        if (!ok) { pclr_flush(); break; }
+        if (a < 8) { ca[a].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; ca[a].clearValue = e->val; }
+        else { if (e->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) { da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; da.clearValue = e->val; }
+               if (e->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) { sa.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; sa.clearValue = e->val; } }
+        g_pass_written |= 1u << a; g_pclr_loads++; g_pclr[k] = g_pclr[--g_npclr];
+    }
     take_clears(ca, n, &da, &sa, w, h);
-    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {w, h}}, .layerCount = 1, .colorAttachmentCount = (uint32_t)n, .pColorAttachments = ca,
-        .pDepthAttachment = da.sType ? &da : NULL, .pStencilAttachment = sa.sType ? &sa : NULL};
-    if (g_pt_on && g_pt_n < PT_MAX) { unsigned lc = 0; for (int i = 0; i < n; i++) lc |= (ca[i].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) << i; if (da.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) lc |= 1u << 8;
-        VkFormat f0 = 0; for (int i = 0; i < n && !f0; i++) if (g_patt[i].v) { uint32_t a_, b_; vk_tex_dims(g_patt[i].v, &a_, &b_, &f0); }
-        g_pt[g_pt_n] = (pt_info){w, h, n, g_pdepth.v != NULL, 0, 0, lc, f0}; pt_mark(0); }
-    vkCmdBeginRendering(vk_cb(), &ri);
-    g_pass_open = 1; g_passes++; g_frame_passes++; g_pass_written = 0; g_dclr_hit = 0; g_gen_state++;
-    q_begin();
+    memcpy(g_lca, ca, sizeof ca); g_lda = da; g_lsa = sa;
+    g_lri = (VkRenderingInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {w, h}}, .layerCount = 1, .colorAttachmentCount = (uint32_t)n, .pColorAttachments = g_lca,
+        .pDepthAttachment = da.sType ? &g_lda : NULL, .pStencilAttachment = sa.sType ? &g_lsa : NULL};
+    g_pass_open = 1; g_pass_recorded = 0; g_pclr_hit = 0;
     return 1;
 }
 
@@ -366,6 +423,8 @@ static VkImageViewType view_type(int stype) {
 }
 static samp_par g_default_samp = {.minf = 1, .magf = 1, .ws = 7, .wt = 7, .wr = 7, .lod_max = 1000, .aniso = 1};
 static unsigned g_feedback;   /* the attachments of the open pass a draw samples (g_pass_written bits) */
+static uint64_t g_fb_draws, g_fb_barriers, g_fb_why[8];   /* draws sampling written attachments: no fragment shader, local read off, depth, vertex stage, binding not plain 2D, none, eligible, SPIR-V not rewritable */
+static int g_fbp_bind[8], g_fbp_att[8], g_nfbp, g_fb_bad;   /* fragment stage: texture bindings reading colour attachments as decals can (vk_fbread.c); g_fb_bad: one that cannot */
 #define MAXW 160
 static VkDescriptorSet stage_set(vshader *s, int stage, int set, VkDescriptorSetLayout layout) {
     VkWriteDescriptorSet w[MAXW]; VkDescriptorBufferInfo bi[MAXW]; VkDescriptorImageInfo ii[MAXW]; VkBufferView tb[MAXW]; int nw = 0, nb = 0, ni = 0, nt = 0;
@@ -379,7 +438,9 @@ static VkDescriptorSet stage_set(vshader *s, int stage, int set, VkDescriptorSet
             VkBuffer buf = VK_NULL_HANDLE; VkDeviceSize off = 0, range = VK_WHOLE_SIZE;
             if (b->slot == 1) { buf = s->c1buf; range = VK_WHOLE_SIZE; }
             else if (b->slot == 0 || b->slot == 2) { vk_span sp = vk_ring(0xA00, 256); driver_bank(sp.cpu, b->slot, stage); buf = sp.buf; off = sp.off; range = 0xA00; }
-            else if (b->slot >= 3 && b->slot <= 18) { const p_bind_buf *u = &S.ubo[stage][b->slot - 3]; if (!ubo_range(u->addr, u->size, &buf, &off, &range)) buf = VK_NULL_HANDLE; }
+            else if (b->slot >= 3 && b->slot <= 18) { const p_bind_buf *u = &S.ubo[stage][b->slot - 3];
+                uint64_t sz = u->size && u->size <= 65536 ? u->size : 65536; if (b->used && b->used < sz) sz = b->used;   /* what the shader reads (cbuf_used) */
+                if (!ubo_range(u->addr, sz, &buf, &off, &range)) buf = VK_NULL_HANDLE; }
             bi[nb] = (VkDescriptorBufferInfo){buf, off, buf ? range : VK_WHOLE_SIZE};
             x.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; x.pBufferInfo = &bi[nb++];
         } else if (b->kind == RB_SBUF) {
@@ -400,6 +461,9 @@ static VkDescriptorSet stage_set(vshader *s, int stage, int set, VkDescriptorSet
             bi[nb] = (VkDescriptorBufferInfo){buf, o, range};
             x.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; x.pBufferInfo = &bi[nb++];
             if (buf && (b->flags & 1)) { /* written by the shader */ }
+        } else if (b->kind == RB_IA) {   /* a decal variant's input attachment: the colour attachment itself */
+            ii[ni] = (VkDescriptorImageInfo){VK_NULL_HANDLE, b->slot >= 0 && b->slot < 8 ? g_patt[b->slot].view : VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL};
+            x.descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT; x.pImageInfo = &ii[ni++];
         } else {
             int is_img = b->kind == RB_IMG;
             if ((b->stype & 0xff) == 2) {   /* texel buffers: a view over the buffer texture's pool memory */
@@ -422,14 +486,18 @@ static VkDescriptorSet stage_set(vshader *s, int stage, int set, VkDescriptorSet
                     vtex *v = vk_tex_get(&t);
                     if (v) {
                         vk_tex_upload_if_stale(v, &t);
-                        for (int i = 0; i < g_ndclr; i++) g_dclr_hit |= g_dclr[i].v == v;
+                        if (g_npclr) for (int i = 0; i < g_npclr; i++) g_pclr_hit |= g_pclr[i].v == v;
                         if (is_img) vk_tex_gpu_wrote(v);
                         view = vk_tex_view(v, &t, &vw, hv, view_type(b->stype), 0);
                         /* the sampled levels / layers include an attachment's own: the pass must land first */
                         int l0 = hv && vw.set_levels ? vw.base_level : 0, nl = hv && vw.set_levels && vw.nlevels ? vw.nlevels : 64;
                         int y0 = hv && vw.set_layers ? vw.min_layer : 0, ny = hv && vw.set_layers && vw.nlayers ? vw.nlayers : 4096;
                         for (int a = 0; a < 9; a++) { const att_t *at = a < 8 ? &g_patt[a] : &g_pdepth;
-                            if (at->v == v && at->level >= l0 && at->level < l0 + nl && at->layer >= y0 && at->layer < y0 + ny) g_feedback |= 1u << a; }
+                            if (at->v == v && at->level >= l0 && at->level < l0 + nl && at->layer >= y0 && at->layer < y0 + ny) { g_feedback |= 1u << a;
+                                /* a decal read (vk_fbread.c): a plain 2D colour texture whose view is the attachment itself */
+                                int ok = stage == 1 && a < 8 && !is_img && count == 1 && view_type(b->stype) == VK_IMAGE_VIEW_TYPE_2D && !at->level && !at->layer && !l0 && !y0 &&
+                                         !(hv && vw.set_format && vw.format != t.d.format) && !(S.rt.has_cview[a] && S.rt.cview[a].set_format && S.rt.cview[a].format != t.d.format);
+                                if (ok && g_nfbp < 8) { g_fbp_bind[g_nfbp] = b->binding; g_fbp_att[g_nfbp++] = a; } else g_fb_bad = 1; } }
                     }
                 }
                 samp_par sp; if (!is_img && sid && vk_samp_registry_get(sid, &sp)) smp = vk_sampler(&sp);
@@ -671,23 +739,43 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
     if (!vs) { g_skips[2]++; g_q_skipped |= g_q_counting; return; }
     if (!pass_begin()) return;
     g_feedback = 0;
-    pair_t *p = pair_get(vs, fs);
-    if (!p->sh[0] || (fs && !p->sh[1])) { g_skips[3]++; g_q_skipped |= g_q_counting; return; }
     /* a stage's set is reused while its shader, its bindings, the registry, the targets and the submission are the same */
-    static struct { vshader *s; uint64_t gen, reg, sub, rt; VkDescriptorSet set; unsigned fb; } last[2];
+    static struct { vshader *s; uint64_t gen, reg, sub, rt; VkDescriptorSet set; unsigned fb; int fbp_bind[8], fbp_att[8], nfbp, fb_bad; } last[2];
     uint64_t reg = vk_tex_registry_gen(); VkDescriptorSet sets[2];
     for (int k = 0; k < 2; k++) {
         vshader *s = k ? fs : vs;
         if (last[k].s == s && last[k].gen == g_gen_bind[k] && last[k].reg == reg && last[k].sub == g_sub_gen && last[k].rt == g_gen_rt && s) { sets[k] = last[k].set; g_feedback |= last[k].fb; continue; }
-        unsigned f0 = g_feedback; g_feedback = 0;
+        unsigned f0 = g_feedback; g_feedback = 0; g_nfbp = 0; g_fb_bad = 0;
         sets[k] = s ? stage_set(s, k, k, s->layout) : dset_alloc(V.empty_layout);
-        last[k] = (typeof(last[k])){s, g_gen_bind[k], reg, g_sub_gen, g_gen_rt, sets[k], g_feedback}; g_feedback |= f0;
+        last[k].s = s; last[k].gen = g_gen_bind[k]; last[k].reg = reg; last[k].sub = g_sub_gen; last[k].rt = g_gen_rt; last[k].set = sets[k]; last[k].fb = g_feedback;
+        memcpy(last[k].fbp_bind, g_fbp_bind, sizeof g_fbp_bind); memcpy(last[k].fbp_att, g_fbp_att, sizeof g_fbp_att); last[k].nfbp = g_nfbp; last[k].fb_bad = g_fb_bad;
+        g_feedback |= f0;
     }
-    /* the draw samples an attachment this pass wrote (g_pass_written) and starts a run of sampling draws: split there */
+    /* the draw samples attachments this pass wrote: a decal reads them at its own pixel through local read (vk_fbread.c, a
+       BY_REGION barrier after the writes), as nvn_mtl.m att_fb_take; when its shader cannot, the pass splits (a run of such
+       draws shares the split). TOTK_VK_FB=split: always split */
+    static int lr = -1; if (lr < 0) { const char *e = getenv("TOTK_VK_FB"); lr = !(e && !strcmp(e, "split")); }
+    unsigned fbw = g_feedback & g_pass_written, fbm = 0; vshader *dfs = NULL;
+    if (fbw) g_fb_why[!fs ? 0 : !lr ? 1 : (fbw & 0x100) ? 2 : (last[0].fb & fbw) ? 3 : last[1].fb_bad ? 4 : !last[1].nfbp ? 5 : 6]++;
+    if (fbw && fs && lr && !last[1].fb_bad && !(fbw & 0x100) && !(last[0].fb & fbw) && last[1].nfbp) {
+        dfs = vk_shader_fbread(fs, last[1].fbp_bind, last[1].fbp_att, last[1].nfbp);
+        if (!dfs) g_fb_why[7]++;
+        if (dfs) { for (int i = 0; i < last[1].nfbp; i++) fbm |= 1u << last[1].fbp_att[i];
+                   unsigned f = g_feedback; sets[1] = stage_set(dfs, 1, 1, dfs->layout); g_feedback = f; fs = dfs; g_fb_draws++; }
+    }
+    pair_t *p = pair_get(vs, fs);
+    if (!p->sh[0] || (fs && !p->sh[1])) { g_skips[3]++; g_q_skipped |= g_q_counting; return; }
     static int each = -1; if (each < 0) { const char *e = getenv("TOTK_VK_FB_DRAW"); each = e && atoi(e); }
     static unsigned prev_fb;
-    if (g_dclr_hit) { end_pass(6); if (!pass_begin()) return; }   /* a deferred texture clear lands before this draw samples the image */
-    if ((g_feedback & g_pass_written) && (each || !prev_fb)) { end_pass(7); if (!pass_begin()) return; }
+    if (g_pclr_hit) { if (g_pass_recorded) { end_pass(6); pclr_flush(); if (!pass_begin()) return; } else pclr_flush(); }   /* a pending clear of an image this draw samples runs first */
+    if (!dfs && fbw && (each || !prev_fb)) { pass_record(); end_pass(7); if (!pass_begin()) return; }
+    pass_record();
+    if (dfs && (g_lr_dirty & fbm)) {
+        VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, .dstAccessMask = VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT};
+        VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+        vkCmdPipelineBarrier2(vk_cb(), &di); g_lr_dirty = 0; g_fb_barriers++;
+    }
     prev_fb = g_feedback;
     VkCommandBuffer cb = vk_cb();
     VkShaderStageFlagBits stages[5] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, VK_SHADER_STAGE_GEOMETRY_BIT};
@@ -697,8 +785,8 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
     V.CmdBindShadersEXT(cb, (uint32_t)ns, stages, sh);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pl, 0, 2, sets, 0, NULL);
     static uint64_t dyn_gen, dyn_sub, vtx_gen, vtx_sub; static vshader *vtx_vs;
-    if (dyn_gen != g_gen_state || dyn_sub != g_sub_gen) { set_dynamic(cb); dyn_gen = g_gen_state; dyn_sub = g_sub_gen; }
-    if (vtx_gen != g_gen_vtx || vtx_sub != g_sub_gen || vtx_vs != vs) { vertex_input(cb, vs); vtx_gen = g_gen_vtx; vtx_sub = g_sub_gen; vtx_vs = vs; }
+    if (dyn_gen != g_gen_state || dyn_sub != g_cb_gen) { set_dynamic(cb); dyn_gen = g_gen_state; dyn_sub = g_cb_gen; }
+    if (vtx_gen != g_gen_vtx || vtx_sub != g_cb_gen || vtx_vs != vs) { vertex_input(cb, vs); vtx_gen = g_gen_vtx; vtx_sub = g_cb_gen; vtx_vs = vs; }
     int prim = d ? d->prim : di->prim, inst = d ? (d->instances ? d->instances : 1) : (di->instances ? di->instances : 1);
     if (prim == NVN_DRAW_PRIMITIVE_QUADS || prim == NVN_DRAW_PRIMITIVE_QUAD_STRIP) {
         VkBuffer qb; VkDeviceSize qo; int n;
@@ -718,13 +806,13 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
     }
     g_draws++; g_frame_draws++; if (g_pt_on && g_pt_n < PT_MAX) g_pt[g_pt_n].draws++;
     if (!S.raster_discard) {
-        for (int i = 0; i < g_pcount; i++) if (g_patt[i].v && (S.chmask.mask >> (4 * i) & 0xf)) g_pass_written |= 1u << i;
-        if (g_pdepth.v && ((S.ds.dt && S.ds.dw) || (S.ds.st && (S.st_wmask[0] || S.st_wmask[1])))) g_pass_written |= 1u << 8;
+        for (int i = 0; i < g_pcount; i++) if (g_patt[i].v && (S.chmask.mask >> (4 * i) & 0xf)) { g_pass_written |= 1u << i; g_lr_dirty |= 1u << i; }
+        if (g_pdepth.v && ((S.ds.dt && S.ds.dw) || (S.ds.st && (S.st_wmask[0] || S.st_wmask[1])))) { g_pass_written |= 1u << 8; g_lr_dirty |= 1u << 8; }
     }
 }
 static void dispatch(const p_dispatch *d) {
     vshader *cs = stage_shader(5); if (!cs) { g_skips[5]++; return; }
-    end_pass(4);
+    end_pass(4); pclr_flush();
     comp_t *c = comp_get(cs); if (!c->sh) return;
     g_grid[0] = (uint32_t)d->x; g_grid[1] = (uint32_t)d->y; g_grid[2] = (uint32_t)d->z;
     VkDescriptorSet set = stage_set(cs, 5, 0, cs->layout);
@@ -755,7 +843,7 @@ static void clear_color(const p_clear_color *c) {
     if (clear_taken()) { g_pass_written |= 1u << idx; return; }   /* the pass's load operation */
     VkClearAttachment a = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .colorAttachment = (uint32_t)idx}; memcpy(a.clearValue.color.float32, c->rgba, 16);
     VkClearRect r = {clear_rect(), 0, 1}; if (!r.rect.extent.width || !r.rect.extent.height) return;
-    vkCmdClearAttachments(vk_cb(), 1, &a, 1, &r); g_pass_written |= 1u << idx;
+    pass_record(); vkCmdClearAttachments(vk_cb(), 1, &a, 1, &r); g_pass_written |= 1u << idx; g_lr_dirty |= 1u << idx;
 }
 static void clear_ds(const p_clear_ds *c) {
     if (S.render_disabled || !pass_begin() || !g_pdepth.v) return;
@@ -766,7 +854,7 @@ static void clear_ds(const p_clear_ds *c) {
     if (!asp) return;
     VkClearAttachment a = {.aspectMask = asp, .clearValue.depthStencil = {c->depth, (uint32_t)c->stencil}};
     VkClearRect r = {clear_rect(), 0, 1}; if (!r.rect.extent.width || !r.rect.extent.height) return;
-    vkCmdClearAttachments(vk_cb(), 1, &a, 1, &r); g_pass_written |= 1u << 8;
+    pass_record(); vkCmdClearAttachments(vk_cb(), 1, &a, 1, &r); g_pass_written |= 1u << 8; g_lr_dirty |= 1u << 8;
 }
 static void copy_b2b(uint64_t src, uint64_t dst, uint64_t n) {
     VkBuffer sb, db; VkDeviceSize so, dof;
@@ -785,7 +873,7 @@ static void copy_b2t(const p_copy_b2t *c, int to_buffer) {
     const tex_t *t = c->tex; vtex *v = vk_tex_get(t);
     VkBuffer b; VkDeviceSize o;
     if (!v || !vk_pool_find(c->src, 1, &b, &o)) { g_skips[6]++; return; }
-    end_pass(3);
+    end_pass(3); pclr_flush();
     int bw = 1, bh = 1, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     uint32_t rowlen = S.copy_stride && bpb ? (uint32_t)(S.copy_stride / bpb) * bw : 0;
     int z0 = c->r.zoffset, depth = c->r.depth ? c->r.depth : 1, is3d = t->d.target == NVN_TEXTURE_TARGET_3D;
@@ -800,7 +888,7 @@ static void copy_b2t(const p_copy_b2t *c, int to_buffer) {
 static void copy_t2t(const p_copy_t2t *c) {
     vtex *s = vk_tex_get(c->src), *d = vk_tex_get(c->dst);
     if (!s || !d) { g_skips[6]++; return; }
-    end_pass(3);
+    end_pass(3); pclr_flush();
     vk_tex_upload_if_stale(s, c->src); vk_tex_upload_if_stale(d, c->dst);
     VkImageAspectFlags as = vk_tex_aspect(s), ad = vk_tex_aspect(d);
     int sl = region_layer(&c->sv, c->has_sv), dl = region_layer(&c->dv, c->has_dv);
@@ -816,24 +904,17 @@ static void copy_t2t(const p_copy_t2t *c) {
     } else vkCmdBlitImage(vk_cb(), vk_tex_image(s), VK_IMAGE_LAYOUT_GENERAL, vk_tex_image(d), VK_IMAGE_LAYOUT_GENERAL, 1, &b, (c->flags & 1) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     vk_tex_gpu_wrote(d); full_barrier(); g_copies++;
 }
-static void clear_tex_now(const p_clear_tex *c, vtex *v) {
-    VkImageSubresourceRange r = {(VkImageAspectFlags)vk_tex_aspect(v), (uint32_t)region_level(&c->view, c->has_view), 1, (uint32_t)region_layer(&c->view, c->has_view), 1};
-    if (r.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) { VkClearColorValue cv; memcpy(&cv, &c->c, 16); vkCmdClearColorImage(vk_cb(), vk_tex_image(v), VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &r); }
-    else { VkClearDepthStencilValue dv = {c->c.f[0], c->c.u[1]}; vkCmdClearDepthStencilImage(vk_cb(), vk_tex_image(v), VK_IMAGE_LAYOUT_GENERAL, &dv, 1, &r); }
-    vk_tex_gpu_wrote(v);
-}
-/* a texture clear inside a pass, of an image the pass does not render to, runs when the pass ends (end_pass) instead of
-   splitting it; a draw of the pass that samples the image afterwards ends the pass first (g_dclr_hit, stage_set) */
+/* a texture clear goes pending (pclr_add); one of an attachment of the open pass ends that pass first. Draws of the open
+   pass with sets built before it rebuild them, so a draw sampling the image finds it pending (g_pclr_hit, stage_set) */
 static void clear_tex(const p_clear_tex *c) {
     vtex *v = vk_tex_get(c->tex); if (!v) return;
     vk_tex_upload_if_stale(v, c->tex);
     int att = 0; for (int a = 0; a < 9; a++) att |= (a < 8 ? g_patt[a].v : g_pdepth.v) == v;
-    if (g_pass_open && !att && g_ndclr < DCLR) {
-        g_dclr[g_ndclr].c = *c; g_dclr[g_ndclr++].v = v; g_dclr_deferred++;
-        for (int k = 0; k < 6; k++) g_gen_bind[k]++;   /* every later draw checks its sampled images against the list */
-        return;
-    }
-    end_pass(6); clear_tex_now(c, v); full_barrier();
+    if (g_pass_open && att) end_pass(6);
+    VkClearValue cv; VkImageAspectFlags asp = (VkImageAspectFlags)vk_tex_aspect(v);
+    if (asp & VK_IMAGE_ASPECT_COLOR_BIT) memcpy(&cv.color, &c->c, 16); else cv.depthStencil = (VkClearDepthStencilValue){c->c.f[0], c->c.u[1]};
+    pclr_add(v, region_level(&c->view, c->has_view), region_layer(&c->view, c->has_view), asp, cv);
+    for (int k = 0; k < 6; k++) g_gen_bind[k]++;
 }
 
 /* ---------- conditional rendering (nvn_mtl.m cond_eval): evaluated in GPU order at replay. A counter report still pending
@@ -944,7 +1025,7 @@ void mtl_exec(const uint8_t *p) {
 }
 void mtl_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }
 void mtl_sub_begin(void) { vk_sub_open(); }
-uint64_t mtl_sub_commit(void) { upd_flush(); g_shadow_epoch++; g_sub_gen++; g_dyn_set = 0; g_dpool = VK_NULL_HANDLE; return vk_sub_submit(); }
+uint64_t mtl_sub_commit(void) { upd_flush(); g_shadow_epoch++; g_sub_gen++; g_cb_gen++; g_dyn_set = 0; g_dpool = VK_NULL_HANDLE; return vk_sub_submit(); }
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) { copy_b2b(src, dst, n); }
 void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { vk_sub_post(1, val, mode, v, 0); }
 void mtl_sub_counter(uint64_t addr, uint32_t type) { cpend_push(addr, type != NVN_COUNTER_TYPE_SAMPLES_PASSED); vk_sub_post(2, NULL, 0, 0, addr); }
@@ -985,12 +1066,12 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
               (unsigned long long)g_presents, (unsigned long long)g_passes, (unsigned long long)g_draws, (unsigned long long)g_frame_passes, (unsigned long long)g_frame_draws,
               (unsigned long long)g_dispatches, (unsigned long long)g_copies, (unsigned long long)up, ub / 1e6, (unsigned long long)ug, (unsigned long long)g_skips[0], (unsigned long long)g_skips[1],
               (unsigned long long)g_skips[2], (unsigned long long)g_skips[3], (unsigned long long)g_skips[4], (unsigned long long)g_skips[5], (unsigned long long)g_skips[6]);
-        { uint64_t vk_gpu_ns(void), vk_submit_ns(void); static uint64_t pg, ps; uint64_t g = vk_gpu_ns(), q = vk_submit_ns();
-          VKLOG("GPU busy %.2f ms per present over the last 600; vkQueueSubmit2 %.2f ms per present (submit thread)", (g - pg) / 1e6 / 600, (q - ps) / 1e6 / 600); pg = g; ps = q; }
+        { uint64_t vk_gpu_ns(void), vk_submit_ns(void), vk_end_ns(void); static uint64_t pg, ps, pe; uint64_t g = vk_gpu_ns(), q = vk_submit_ns(), e = vk_end_ns();
+          VKLOG("GPU busy %.2f ms per present over the last 600; submit thread per present: vkEndCommandBuffer %.2f ms, vkQueueSubmit2 %.2f ms", (g - pg) / 1e6 / 600, (e - pe) / 1e6 / 600, (q - ps) / 1e6 / 600); pg = g; ps = q; pe = e; }
         VKLOG("pass ends: submit %llu, targets %llu, buffer copy %llu, texture copy %llu, dispatch %llu, barrier %llu, texture clear %llu, feedback %llu, update flush %llu",
               (unsigned long long)g_end_why[0], (unsigned long long)g_end_why[1], (unsigned long long)g_end_why[2], (unsigned long long)g_end_why[3], (unsigned long long)g_end_why[4],
               (unsigned long long)g_end_why[5], (unsigned long long)g_end_why[6], (unsigned long long)g_end_why[7], (unsigned long long)g_end_why[8]);
-        VKLOG("render conditions: %llu off, %llu unknown (rendered); clears as load operations %llu; texture clears after their pass %llu", (unsigned long long)g_cond_off, (unsigned long long)g_cond_unknown, (unsigned long long)g_load_clears, (unsigned long long)g_dclr_deferred);
+        VKLOG("render conditions: %llu off, %llu unknown (rendered); clears as load operations %llu, pending clears as load operations %llu, run %llu; passes that only cleared %llu; decal draws through local read %llu, their barriers %llu; self-sampling draws by kind %llu %llu %llu %llu %llu %llu %llu %llu", (unsigned long long)g_cond_off, (unsigned long long)g_cond_unknown, (unsigned long long)g_load_clears, (unsigned long long)g_pclr_loads, (unsigned long long)g_pclr_run, (unsigned long long)g_pass_dropped, (unsigned long long)g_fb_draws, (unsigned long long)g_fb_barriers, (unsigned long long)g_fb_why[0], (unsigned long long)g_fb_why[1], (unsigned long long)g_fb_why[2], (unsigned long long)g_fb_why[3], (unsigned long long)g_fb_why[4], (unsigned long long)g_fb_why[5], (unsigned long long)g_fb_why[6], (unsigned long long)g_fb_why[7]);
     }
     g_frame_passes = g_frame_draws = 0; pt_frame(g_presents);
     return g_presents;
