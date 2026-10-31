@@ -199,7 +199,8 @@ void vk_tex_upload_if_stale(vtex *v, const tex_t *t) {
     (void)t;
     if (!v || !v->uploadable) return;
     if (!v->uploaded) { if (!v->gpu_owned) upload(v); return; }
-    if (nvn_dirty_since(v->gmem, v->gsize, v->stamp)) upload(v);
+    /* a rendered texture keeps its image: a CPU write near it on the same pages is not a new content (as nvn_mtl.m's owned textures) */
+    if (!v->gpu_owned && nvn_dirty_since(v->gmem, v->gsize, v->stamp)) upload(v);
 }
 void vk_tex_gpu_wrote(vtex *v) { if (v) { v->gpu_owned = 1; if (!v->uploaded) { v->uploaded = 1; v->stamp = nvn_dirty_now(); if (v->uploadable) nvn_dirty_protect(v->gmem, v->gsize); } } }
 void vk_tex_readback(vtex *v, const tex_t *t) { (void)v; (void)t; }
