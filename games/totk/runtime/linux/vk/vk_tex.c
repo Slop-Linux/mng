@@ -137,7 +137,7 @@ static vtex *tex_make(const tex_t *t) {
     VkFormatFeatureFlags ff = fp.optimalTilingFeatures;
     VkImageUsageFlags u = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) u |= VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (ff & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (ff & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;   /* decals read it in the tile (vk_fbread.c) */
     if (ff & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     if ((ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && v->samples == 1) u |= VK_IMAGE_USAGE_STORAGE_BIT;
     if (!(u & VK_IMAGE_USAGE_SAMPLED_BIT)) { VKLOG("【红】format %#x (Vulkan %d) cannot be sampled", t->d.format, vf->vk); }
@@ -451,7 +451,7 @@ VkImageView vk_tex_view(vtex *v, const tex_t *t, const view_t *vw, int has_view,
             !memcmp(&o->swz, &k.swz, sizeof k.swz) && o->aspect == k.aspect) return o->view;
     }
     VkImageViewUsageCreateInfo vu = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
-        .usage = attach ? (v->vf->depth || v->vf->stencil ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) : VK_IMAGE_USAGE_SAMPLED_BIT};
+        .usage = attach ? (v->vf->depth || v->vf->stencil ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) : VK_IMAGE_USAGE_SAMPLED_BIT};
     VkImageViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .pNext = &vu, .image = v->img, .viewType = k.type, .format = k.fmt, .components = k.swz,
         .subresourceRange = {k.aspect, k.level0, k.nlevels, k.layer0, k.nlayers}};
     if (vkCreateImageView(V.dev, &ci, NULL, &k.view) != VK_SUCCESS) {

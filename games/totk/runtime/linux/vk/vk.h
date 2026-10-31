@@ -98,8 +98,8 @@ void vk_tex_readback(vtex *v, const tex_t *t);   /* write the image back into gu
 VkBufferView vk_tex_bufview(const tex_t *t, int format);   /* a buffer texture's view over its pool memory */
 
 /* ---------- vk_shader.c ---------- */
-enum { RB_CBUF, RB_SBUF, RB_TEX, RB_IMG };
-typedef struct { uint8_t kind, set, type_buffer; uint16_t binding; int32_t slot, cb_slot, cb_off, flags, stype, handle, cbuf_slot, array, separate, format; } vk_rbind;
+enum { RB_CBUF, RB_SBUF, RB_TEX, RB_IMG, RB_IA };   /* RB_IA: an input attachment of a decal variant (vk_fbread.c), slot = colour attachment */
+typedef struct { uint8_t kind, set, type_buffer; uint16_t binding; int32_t slot, cb_slot, cb_off, flags, stype, handle, cbuf_slot, array, separate, format; uint32_t used; } vk_rbind;   /* used: bytes of a uniform buffer the shader reads (cbuf_used), 0 = all */
 typedef struct vshader {
     char key[96]; int stage;   /* 0 vertex, 1 fragment, 5 compute */
     uint32_t *spv; size_t nwords;
@@ -109,5 +109,11 @@ typedef struct vshader {
     uint8_t *c1; size_t c1_len;
     VkBuffer c1buf; VkDeviceMemory c1mem;
     VkDescriptorSetLayout layout;
+    struct vshader *fb_next; uint32_t fb_key; int fb_none;   /* decal variants of a fragment shader by binding / attachment pairs (vk_shader_fbread) */
 } vshader;
 vshader *vk_shader_get(const uint8_t *control, const uint8_t *code, int stage, const char *answers);
+/* the decal variant of a fragment shader: texture bindings bind[i] read colour attachment att[i] at the fragment's own pixel
+   through input attachments (vk_fbread.c); NULL when the shader uses them otherwise */
+#define VK_FB_BINDING 120
+uint32_t *vk_fbread_spv(const uint32_t *w, size_t n, const int bind[], const int att[], int k, size_t *out_n);
+vshader *vk_shader_fbread(vshader *fs, const int bind[], const int att[], int k);

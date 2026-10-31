@@ -60,6 +60,25 @@ static uint32_t input_locations(const uint32_t *w, size_t n) {
     for (uint32_t i = 0; i < bound; i++) if (input[i] && loc[i] >= 0 && loc[i] < 32) mask |= 1u << loc[i];
     free(loc); free(input); return mask;
 }
+/* the bytes of each uniform buffer (set, binding) the shader reads: Ryujinx declares a cbuf as { vec4 data[4096] } and reads it
+   through OpAccessChain %var %int_0 <element> [...]; the largest constant element + 1 vec4, or 0 (all) when an element index
+   is not a constant */
+static uint32_t cbuf_used(const uint32_t *w, size_t n, int set, int binding) {
+    uint32_t bound = n > 3 ? w[3] : 0; if (!bound || bound > (1u << 22)) return 0;
+    uint32_t *dset = calloc(bound, 4), *dbind = calloc(bound, 4), *cval = calloc(bound, 4); uint8_t *isc = calloc(bound, 1);
+    for (size_t i = 5; i < n;) { uint32_t op = w[i] & 0xffff, len = w[i] >> 16; if (!len) break;
+        if (op == 71 && len >= 4 && w[i + 1] < bound) { if (w[i + 2] == 34) dset[w[i + 1]] = w[i + 3] + 1; if (w[i + 2] == 33) dbind[w[i + 1]] = w[i + 3] + 1; }
+        if (op == 43 && len == 4 && w[i + 2] < bound) { isc[w[i + 2]] = 1; cval[w[i + 2]] = w[i + 3]; }
+        i += len; }
+    uint32_t used = 0; int all = 0;
+    for (size_t i = 5; i < n && !all;) { uint32_t op = w[i] & 0xffff, len = w[i] >> 16; if (!len) break;
+        if ((op == 65 || op == 66) && len >= 6 && w[i + 3] < bound && dset[w[i + 3]] == (uint32_t)set + 1 && dbind[w[i + 3]] == (uint32_t)binding + 1) {   /* OpAccessChain / OpInBoundsAccessChain */
+            uint32_t e = w[i + 5]; if (e >= bound || !isc[e] || cval[e] >= 4096) all = 1; else if ((cval[e] + 1) * 16 > used) used = (cval[e] + 1) * 16; }
+        else if (op != 71 && op != 5) for (uint32_t q = 1; q < len; q++) { uint32_t id = w[i + q]; if (id < bound && dset[id] == (uint32_t)set + 1 && dbind[id] == (uint32_t)binding + 1 && op != 59 && op != 15) all = 1; }   /* any other use */
+        i += len; }
+    free(dset); free(dbind); free(cval); free(isc);
+    return all ? 0 : used ? used : 16;
+}
 static VkDescriptorType desc_type(const vk_rbind *b) {
     switch (b->kind) {
         case RB_CBUF: return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -87,6 +106,7 @@ static vshader *load(const char *variant, int stage, const uint8_t *c1, size_t c
         s->b = realloc(s->b, (s->nb + 1) * sizeof *s->b); s->b[s->nb++] = b;
     }
     fclose(f);
+    for (int i = 0; i < s->nb; i++) if (s->b[i].kind == RB_CBUF) s->b[i].used = cbuf_used(s->spv, s->nwords, s->b[i].set, s->b[i].binding);
     if (stage == 0) s->in_mask = input_locations(s->spv, s->nwords);
     if (local) memcpy(s->local, local, sizeof s->local);
     /* c1: the shader's own constant segment */
@@ -144,4 +164,28 @@ vshader *vk_shader_get(const uint8_t *control, const uint8_t *code, int stage, c
     sh_ent *e = calloc(1, sizeof *e); snprintf(e->key, sizeof e->key, "%s", key); e->s = s; e->next = g_tab[h]; g_tab[h] = e;
     pthread_mutex_unlock(&g_sh_mu);
     return s;
+}
+/* the decal variant (vk_fbread.c): the same bindings plus one input attachment per colour attachment it reads, kept on the
+   shader by its (binding, attachment) pairs */
+vshader *vk_shader_fbread(vshader *fs, const int bind[], const int att[], int k) {
+    uint32_t key = 2166136261u; for (int i = 0; i < k; i++) key = (key ^ (uint32_t)(bind[i] << 4 | att[i])) * 16777619u;
+    pthread_mutex_lock(&g_sh_mu);
+    vshader *v = fs->fb_next; while (v && v->fb_key != key) v = v->fb_next;
+    if (!v) {
+        size_t n; uint32_t *spv = vk_fbread_spv(fs->spv, fs->nwords, bind, att, k, &n);
+        v = calloc(1, sizeof *v); *v = *fs; v->fb_key = key; v->fb_none = !spv; v->fb_next = fs->fb_next; fs->fb_next = v;
+        snprintf(v->key, sizeof v->key, "%.80s+fb%08x", fs->key, key);
+        if (spv) {
+            v->spv = spv; v->nwords = n; v->b = malloc((fs->nb + 8) * sizeof *v->b); memcpy(v->b, fs->b, fs->nb * sizeof *v->b);
+            unsigned have = 0; for (int i = 0; i < k; i++) if (!(have >> att[i] & 1)) { have |= 1u << att[i]; v->b[v->nb++] = (vk_rbind){.kind = RB_IA, .set = 1, .binding = (uint16_t)(VK_FB_BINDING + att[i]), .slot = att[i], .array = 1}; }
+            VkDescriptorSetLayoutBinding lb[136]; int nl = 0;
+            for (int i = 0; i < v->nb && nl < 136; i++) lb[nl++] = (VkDescriptorSetLayoutBinding){v->b[i].binding, v->b[i].kind == RB_IA ? VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT : desc_type(&v->b[i]), (uint32_t)v->b[i].array,
+                v->b[i].kind == RB_IA ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_ALL, NULL};
+            VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = (uint32_t)nl, .pBindings = lb};
+            VKCHECK(vkCreateDescriptorSetLayout(V.dev, &li, NULL, &v->layout));
+            if (getenv("TOTK_VK_FB_DUMP")) { char p[256]; snprintf(p, sizeof p, "/tmp/%s.spv", v->key); FILE *f = fopen(p, "wb"); if (f) { fwrite(spv, 4, n, f); fclose(f); } }
+        }
+    }
+    pthread_mutex_unlock(&g_sh_mu);
+    return v->fb_none ? NULL : v;
 }

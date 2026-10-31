@@ -49,11 +49,12 @@ void vk_init(void) {
     VkDeviceQueueCreateInfo qci = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = V.qfam, .queueCount = 1, .pQueuePriorities = &prio};
     const char *dext[] = {VK_EXT_SHADER_OBJECT_EXTENSION_NAME, VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME,
         VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
-        VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME, VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+        VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME, VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     uint32_t ndext = sizeof dext / sizeof *dext - (g_surface ? 0 : 1);
     /* every feature the device has in these structures (the queried chain is the enabled one), minus robust buffer / image
        access (a cost the game does not need; null descriptors stay) */
-    VkPhysicalDeviceProvokingVertexFeaturesEXT pv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT};
+    VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
+    VkPhysicalDeviceProvokingVertexFeaturesEXT pv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT, .pNext = &lr};
     VkPhysicalDeviceDepthClipEnableFeaturesEXT dce = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT, .pNext = &pv};
     VkPhysicalDeviceIndexTypeUint8FeaturesEXT iu8 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT, .pNext = &dce};
     VkPhysicalDeviceCustomBorderColorFeaturesEXT cbc = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT, .pNext = &iu8};
@@ -209,7 +210,11 @@ typedef struct { VkBuffer buf; VkDeviceMemory mem; uint8_t *cpu; VkDeviceSize si
 typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; vk_qlist *q; } post_t;
 typedef struct { void (*fn)(void *); void *p; } dfree_t;
 struct sub {
-    uint64_t fence; VkCommandBuffer up, main; int up_used;
+    uint64_t fence;
+    /* command buffers (prologue for uploads, main), each pair with its own pool: recorded on the game thread, ended and
+       submitted on the submit thread; a long submission is cut into several (vk_sub_cut) so the GPU starts on the first while
+       the next is recorded and encoded */
+    struct { VkCommandPool pool; VkCommandBuffer up, main; int up_used; } cb[16]; int ncb;
     uint32_t q_first, q_n;   /* occlusion query slots taken while it was recorded */
     chunk_t *chunks; int nchunks;
     post_t *posts; int nposts, capposts;
@@ -222,8 +227,10 @@ static pthread_mutex_t g_sub_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond
 static _Atomic uint64_t g_fence_next = 1, g_applied, g_submitted;
 static pthread_t g_done_thread;
 /* GPU time: a timestamp at the start and the end of every submission's main command buffer */
-#define TS_RING 512
-static VkQueryPool g_ts; static _Atomic uint64_t g_gpu_ns, g_submit_ns;   /* g_submit_ns: wall time inside vkQueueSubmit2 of the submissions */
+#define TS_RING 512   /* timestamps: (fence % TS_RING, command buffer pair) -> begin / end */
+#define TS_SLOT(s, i) ((uint32_t)(((s)->fence % TS_RING) * 16 + (i)) * 2)
+static VkQueryPool g_ts; static _Atomic uint64_t g_gpu_ns, g_submit_ns, g_end_ns;   /* wall time inside vkQueueSubmit2 / vkEndCommandBuffer of the submissions */
+uint64_t vk_end_ns(void) { return atomic_load(&g_end_ns); }
 uint64_t vk_submit_ns(void) { return atomic_load(&g_submit_ns); }
 uint64_t vk_gpu_ns(void) { return atomic_load(&g_gpu_ns); }
 
@@ -259,23 +266,35 @@ static VkCommandBuffer cb_new_in(VkCommandPool pool) {
 static VkCommandBuffer cb_new(void) { return cb_new_in(V.cmdpool); }
 static void cb_begin(VkCommandBuffer cb) { VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; VKCHECK(vkBeginCommandBuffer(cb, &bi)); }
 static pthread_mutex_t g_cmdpool_mu = PTHREAD_MUTEX_INITIALIZER;
+static void cb_pair_begin(sub_t *s, int i) {
+    if (!s->cb[i].pool) {
+        VkCommandPoolCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, .queueFamilyIndex = V.qfam};
+        VKCHECK(vkCreateCommandPool(V.dev, &cpi, NULL, &s->cb[i].pool)); s->cb[i].up = cb_new_in(s->cb[i].pool); s->cb[i].main = cb_new_in(s->cb[i].pool);
+    } else vkResetCommandPool(V.dev, s->cb[i].pool, 0);
+    s->cb[i].up_used = 0; cb_begin(s->cb[i].up); cb_begin(s->cb[i].main);
+    vkCmdWriteTimestamp2(s->cb[i].main, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g_ts, TS_SLOT(s, i));
+}
+static void cb_pair_close(sub_t *s, int i) {   /* uploads first, visible to everything after */
+    vkCmdWriteTimestamp2(s->cb[i].main, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_ts, TS_SLOT(s, i) + 1);
+    if (!s->cb[i].up_used) return;
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(s->cb[i].up, &di);
+}
 void vk_sub_open(void) {
     if (g_open) return;
     vk_init();
     pthread_mutex_lock(&g_sub_mu);
     sub_t *s = g_free_subs; if (s) g_free_subs = s->next; pthread_mutex_unlock(&g_sub_mu);
-    pthread_mutex_lock(&g_cmdpool_mu);
-    if (!s) { s = calloc(1, sizeof *s); s->up = cb_new(); s->main = cb_new(); }
-    else { vkResetCommandBuffer(s->up, 0); vkResetCommandBuffer(s->main, 0); }
-    pthread_mutex_unlock(&g_cmdpool_mu);
-    s->fence = atomic_fetch_add(&g_fence_next, 1); s->nchunks = 0; s->nposts = 0; s->nfrees = 0; s->up_used = 0; s->next = NULL; s->q_n = 0;
-    cb_begin(s->up); cb_begin(s->main);
-    if (!g_ts) { VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 * TS_RING}; VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &g_ts)); vkResetQueryPool(V.dev, g_ts, 0, 2 * TS_RING); }
-    vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g_ts, (uint32_t)(s->fence % TS_RING) * 2);
+    if (!s) s = calloc(1, sizeof *s);
+    s->fence = atomic_fetch_add(&g_fence_next, 1); s->nchunks = 0; s->nposts = 0; s->nfrees = 0; s->next = NULL; s->q_n = 0;
+    if (!g_ts) { VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 32 * TS_RING}; VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &g_ts)); vkResetQueryPool(V.dev, g_ts, 0, 32 * TS_RING); }
+    s->ncb = 1; cb_pair_begin(s, 0);
     g_open = s;
 }
-VkCommandBuffer vk_cb(void) { vk_sub_open(); return g_open->main; }
-VkCommandBuffer vk_upload_cb(void) { vk_sub_open(); g_open->up_used = 1; return g_open->up; }
+VkCommandBuffer vk_cb(void) { vk_sub_open(); return g_open->cb[g_open->ncb - 1].main; }
+VkCommandBuffer vk_upload_cb(void) { vk_sub_open(); g_open->cb[g_open->ncb - 1].up_used = 1; return g_open->cb[g_open->ncb - 1].up; }
 uint64_t vk_next_fence(void) { vk_sub_open(); return g_open->fence; }
 uint64_t vk_done(void) { return atomic_load(&g_applied); }
 void vk_sub_post(int kind, volatile uint32_t *val, uint32_t mode, uint32_t v, uint64_t addr) {
@@ -334,7 +353,7 @@ static void *done_thread(void *arg) {
                 uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec);
             }
         }
-        { uint64_t t[2]; uint32_t q = (uint32_t)(s->fence % TS_RING) * 2;
+        for (int i = 0; i < s->ncb; i++) { uint64_t t[2]; uint32_t q = TS_SLOT(s, i);
           if (vkGetQueryPoolResults(V.dev, g_ts, q, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0]) atomic_fetch_add(&g_gpu_ns, (uint64_t)((t[1] - t[0]) * V.props.limits.timestampPeriod));
           vkResetQueryPool(V.dev, g_ts, q, 2); }
         for (int i = 0; i < s->nfrees; i++) s->frees[i].fn(s->frees[i].p);
@@ -355,20 +374,23 @@ void vk_replay_end_pass(void);   /* vk_replay.c */
 /* the submit thread: the ICD encodes a command buffer for the hardware inside vkQueueSubmit (about 37 % of the game's CPU time
    in the world), so submissions and presents are queued to a thread of their own, in order, and the game thread goes on
    replaying the next frame. Every queue operation runs there or under g_queue_mu after the jobs before it. */
-typedef struct { int kind; sub_t *s; VkImage img; uint32_t w, h; VkFormat fmt; } job_t;
+typedef struct { int kind; sub_t *s; int cb, last; VkImage img; uint32_t w, h; VkFormat fmt; } job_t;
 #define JOBS 64
 static job_t g_jobs[JOBS]; static unsigned g_job_head, g_job_tail; static int g_job_busy;
 static pthread_mutex_t g_job_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_job_cv = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t g_queue_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t g_submit_thread;
 static VkCommandPool g_pool2;   /* command buffers recorded on the submit thread (present, screenshots) */
-static void submit_now(sub_t *s) {
-    VkCommandBufferSubmitInfo cbs[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->up}, {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main}};
+static void submit_now(sub_t *s, int i, int last) {
+    uint64_t e0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);   /* the ICD may encode at the end of the command buffer: here, off the game thread */
+    VKCHECK(vkEndCommandBuffer(s->cb[i].up)); VKCHECK(vkEndCommandBuffer(s->cb[i].main)); atomic_fetch_add(&g_end_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - e0);
+    VkCommandBufferSubmitInfo cbs[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cb[i].up}, {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cb[i].main}};
     VkSemaphoreSubmitInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = V.timeline, .value = s->fence, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
-    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = s->up_used ? 2 : 1, .pCommandBufferInfos = s->up_used ? cbs : cbs + 1,
-        .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = s->cb[i].up_used ? 2 : 1, .pCommandBufferInfos = s->cb[i].up_used ? cbs : cbs + 1,
+        .signalSemaphoreInfoCount = last ? 1 : 0, .pSignalSemaphoreInfos = &sig};
     pthread_mutex_lock(&g_queue_mu); uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     VKCHECK(vkQueueSubmit2(V.queue, 1, &si, VK_NULL_HANDLE)); atomic_fetch_add(&g_submit_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0); pthread_mutex_unlock(&g_queue_mu);
+    if (!last) return;
     pthread_mutex_lock(&g_sub_mu);
     if (!g_done_thread) pthread_create(&g_done_thread, NULL, done_thread, NULL);
     if (g_inflight_tail) g_inflight_tail->next = s; else g_inflight_head = s;
@@ -384,7 +406,7 @@ static void *submit_thread(void *arg) {
         pthread_mutex_lock(&g_job_mu);
         while (g_job_head == g_job_tail) { g_job_busy = 0; pthread_cond_broadcast(&g_job_cv); pthread_cond_wait(&g_job_cv, &g_job_mu); }
         job_t j = g_jobs[g_job_tail % JOBS]; g_job_busy = 1; pthread_mutex_unlock(&g_job_mu);
-        if (j.kind == 1) submit_now(j.s); else present_now(j.img, j.w, j.h, j.fmt);
+        if (j.kind == 1) submit_now(j.s, j.cb, j.last); else present_now(j.img, j.w, j.h, j.fmt);
         pthread_mutex_lock(&g_job_mu); g_job_tail++; pthread_cond_broadcast(&g_job_cv); pthread_mutex_unlock(&g_job_mu);
     }
     return NULL;
@@ -399,21 +421,21 @@ static void job_push(job_t j) {
 static void jobs_drain(void) {   /* every queued submission and present has reached the queue */
     pthread_mutex_lock(&g_job_mu); while (g_job_head != g_job_tail) pthread_cond_wait(&g_job_cv, &g_job_mu); pthread_mutex_unlock(&g_job_mu);
 }
+/* a long submission goes to the GPU in parts: the open command buffers are closed and queued (between passes) and recording
+   goes on in the next pair; the last part signals the submission's fence */
+void vk_sub_cut(void) {
+    sub_t *s = g_open; if (!s || s->ncb == 16) return;
+    cb_pair_close(s, s->ncb - 1); job_push((job_t){.kind = 1, .s = s, .cb = s->ncb - 1, .last = 0});
+    cb_pair_begin(s, s->ncb++);
+}
 uint64_t vk_sub_submit(void) {
     if (!g_open) vk_sub_open();
     vk_replay_end_pass();
-    { void vk_tex_stage_rendered(VkCommandBuffer cb, uint64_t fence); vk_tex_stage_rendered(g_open->main, g_open->fence); }
+    { void vk_tex_stage_rendered(VkCommandBuffer cb, uint64_t fence); vk_tex_stage_rendered(vk_cb(), g_open->fence); }
     sub_t *s = g_open; g_open = NULL;
-    if (s->up_used) {   /* uploads first, visible to everything after */
-        VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
-            .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
-        VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
-        vkCmdPipelineBarrier2(s->up, &di);
-    }
-    vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_ts, (uint32_t)(s->fence % TS_RING) * 2 + 1);
-    VKCHECK(vkEndCommandBuffer(s->up)); VKCHECK(vkEndCommandBuffer(s->main));
+    int i = s->ncb - 1; cb_pair_close(s, i);
     atomic_store(&g_submitted, s->fence);
-    job_push((job_t){.kind = 1, .s = s});
+    job_push((job_t){.kind = 1, .s = s, .cb = i, .last = 1});
     return s->fence;
 }
 /* a command buffer run at once, outside the submissions (write-backs) */
@@ -448,9 +470,11 @@ void vk_window_open(void) {
     uint32_t nf = 32; VkSurfaceFormatKHR fm[32]; VKCHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(V.phys, g_surface, &nf, fm));
     VkSurfaceFormatKHR f = fm[0]; for (uint32_t i = 0; i < nf; i++) if (fm[i].format == VK_FORMAT_B8G8R8A8_UNORM || fm[i].format == VK_FORMAT_R8G8B8A8_UNORM) { f = fm[i]; break; }
     uint32_t npm = 8; VkPresentModeKHR pm[8]; vkGetPhysicalDeviceSurfacePresentModesKHR(V.phys, g_surface, &npm, pm);
-    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR; const char *want = getenv("TOTK_VK_PRESENT");   /* uncapped by default: mailbox, else immediate */
-    for (uint32_t i = 0; i < npm; i++) if (pm[i] == VK_PRESENT_MODE_MAILBOX_KHR && !(want && !strcmp(want, "fifo"))) mode = pm[i];
-    if (mode == VK_PRESENT_MODE_FIFO_KHR && !(want && !strcmp(want, "fifo"))) for (uint32_t i = 0; i < npm; i++) if (pm[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = pm[i];
+    /* TOTK_VK_PRESENT=fifo | mailbox | immediate; by default mailbox, else immediate, else fifo (uncapped) */
+    const char *want = getenv("TOTK_VK_PRESENT"); VkPresentModeKHR order[3] = {VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_FIFO_KHR};
+    if (want && !strcmp(want, "fifo")) order[0] = order[1] = VK_PRESENT_MODE_FIFO_KHR; else if (want && !strcmp(want, "immediate")) order[0] = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+    for (int k = 2; k >= 0; k--) for (uint32_t i = 0; i < npm; i++) if (pm[i] == order[k]) mode = order[k];
     int w = 1920, h = 1080; SDL_GetWindowSizeInPixels(vk_sdl_window, &w, &h);
     g_sw = caps.currentExtent.width != UINT32_MAX ? caps.currentExtent.width : (uint32_t)w; g_sh = caps.currentExtent.height != UINT32_MAX ? caps.currentExtent.height : (uint32_t)h;
     VkSwapchainCreateInfoKHR sc = {.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = g_surface, .minImageCount = caps.minImageCount + 1 > 3 ? caps.minImageCount + 1 : 3,
@@ -476,10 +500,19 @@ static void barrier_img(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkI
     vkCmdPipelineBarrier2(cb, &di);
 }
 /* TOTK_VK_SHOT=<path>:<present number>: the presented picture of that present as a binary PPM (8-bit RGB) */
+/* dm_gfx_shot_at (TOTK_INPUT_FILE "shot <path>"): the present <frames> after the request */
+static pthread_mutex_t g_shot_mu = PTHREAD_MUTEX_INITIALIZER; static char g_shot_path[1024]; static long g_shot_at = -1;
+static uint64_t g_presents;
+void dm_gfx_shot_at(long frames, const char *path) { pthread_mutex_lock(&g_shot_mu); snprintf(g_shot_path, sizeof g_shot_path, "%s", path); g_shot_at = (long)g_presents + frames; pthread_mutex_unlock(&g_shot_mu); }
+void dm_gfx_ashot(const char *path) { dm_gfx_shot_at(1, path); }
+void dm_gfx_window_shot(const char *path) { dm_gfx_shot_at(1, path); }
 static void shot(VkImage img, uint32_t w, uint32_t h, VkFormat fmt, uint64_t n) {
     static const char *spec; static long at = -1; static int init;
     if (!init) { init = 1; spec = getenv("TOTK_VK_SHOT"); if (spec && strrchr(spec, ':')) at = atol(strrchr(spec, ':') + 1); }
-    if (at < 0 || (long)n != at) return;
+    char path[1024];
+    pthread_mutex_lock(&g_shot_mu); int want = g_shot_at >= 0 && (long)n >= g_shot_at; if (want) { snprintf(path, sizeof path, "%s", g_shot_path); g_shot_at = -1; } pthread_mutex_unlock(&g_shot_mu);
+    if (!want && (at < 0 || (long)n != at)) return;
+    if (!want) snprintf(path, sizeof path, "%.*s", (int)(strrchr(spec, ':') - spec), spec);
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (VkDeviceSize)w * h * 8, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VkBuffer b; VKCHECK(vkCreateBuffer(V.dev, &bi, NULL, &b)); VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, b, &req);
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = vk_memtype(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
@@ -492,7 +525,6 @@ static void shot(VkImage img, uint32_t w, uint32_t h, VkFormat fmt, uint64_t n) 
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
     pthread_mutex_lock(&g_queue_mu); VKCHECK(vkQueueSubmit(V.queue, 1, &si, VK_NULL_HANDLE)); VKCHECK(vkQueueWaitIdle(V.queue)); pthread_mutex_unlock(&g_queue_mu);
     uint8_t *p; VKCHECK(vkMapMemory(V.dev, m, 0, VK_WHOLE_SIZE, 0, (void **)&p));
-    char path[4096]; snprintf(path, sizeof path, "%.*s", (int)(strrchr(spec, ':') - spec), spec);
     FILE *f = fopen(path, "wb");
     if (f) {
         fprintf(f, "P6\n%u %u\n255\n", w, h);
@@ -508,7 +540,6 @@ static void shot(VkImage img, uint32_t w, uint32_t h, VkFormat fmt, uint64_t n) 
     vkUnmapMemory(V.dev, m); vkDestroyBuffer(V.dev, b, NULL); vkFreeMemory(V.dev, m, NULL);
     vkFreeCommandBuffers(V.dev, g_pool2, 1, &cb);
 }
-static uint64_t g_presents;
 void vk_present_image(VkImage img, uint32_t w, uint32_t h, VkFormat fmt) { job_push((job_t){.kind = 2, .img = img, .w = w, .h = h, .fmt = fmt}); }
 static void present_now(VkImage img, uint32_t w, uint32_t h, VkFormat fmt) {
     g_presents++;
