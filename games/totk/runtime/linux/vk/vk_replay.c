@@ -37,14 +37,18 @@ typedef struct { vtex *v; VkImageView view; } att_t;
 static int g_pass_open; static att_t g_patt[8], g_pdepth; static int g_pslot[8]; static uint32_t g_pw, g_ph; static int g_pcount;
 static int g_dyn_set;   /* every dynamic state set once in this command buffer */
 static int depth_has_stencil(void) { return g_pdepth.v && (vk_tex_aspect(g_pdepth.v) & VK_IMAGE_ASPECT_STENCIL_BIT); }
-void vk_replay_end_pass(void) {
+/* why passes end: 0 submit, 1 targets, 2 buffer copy, 3 texture copy, 4 dispatch, 5 barrier, 6 texture clear, 7 feedback, 8 uniform update flush */
+static uint64_t g_end_why[9];
+static void end_pass(int why) {
     if (!g_pass_open) return;
+    g_end_why[why]++;
     vkCmdEndRendering(vk_cb()); g_pass_open = 0;
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
         .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
     vkCmdPipelineBarrier2(vk_cb(), &di);
 }
+void vk_replay_end_pass(void) { end_pass(0); }
 static void full_barrier(void) {
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
         .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
@@ -109,7 +113,7 @@ static void upd_add(uint64_t dst, const uint8_t *data, uint64_t n) {
 /* the updates land in memory at the end of the submission (after every draw that used a renamed copy) */
 static void upd_flush(void) {
     if (!g_nupd) return;
-    vk_replay_end_pass();
+    end_pass(8);
     for (int i = 0; i < g_nupd; i++) {
         VkBuffer b; VkDeviceSize o;
         if (!vk_pool_find(g_upd[i].dst, g_upd[i].n, &b, &o)) continue;
@@ -507,7 +511,7 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
     VkDescriptorSet sets[2]; sets[0] = stage_set(vs, 0, 0, vs->layout); sets[1] = fs ? stage_set(fs, 1, 1, fs->layout) : dset_alloc(V.empty_layout);
     if (g_feedback) {   /* the draw samples a target of this pass: what the pass rendered so far goes to memory first */
         static uint64_t n; if (!n++) VKLOG("a draw samples a render target of its own pass: the pass is split there");
-        vk_replay_end_pass(); if (!pass_begin()) return;
+        end_pass(7); if (!pass_begin()) return;
     }
     VkCommandBuffer cb = vk_cb();
     VkShaderStageFlagBits stages[5] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, VK_SHADER_STAGE_GEOMETRY_BIT};
@@ -539,7 +543,7 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
 }
 static void dispatch(const p_dispatch *d) {
     vshader *cs = stage_shader(5); if (!cs) { g_skips[5]++; return; }
-    vk_replay_end_pass();
+    end_pass(4);
     comp_t *c = comp_get(cs); if (!c->sh) return;
     g_grid[0] = (uint32_t)d->x; g_grid[1] = (uint32_t)d->y; g_grid[2] = (uint32_t)d->z;
     VkDescriptorSet set = stage_set(cs, 5, 0, cs->layout);
@@ -582,7 +586,7 @@ static void clear_ds(const p_clear_ds *c) {
 static void copy_b2b(uint64_t src, uint64_t dst, uint64_t n) {
     VkBuffer sb, db; VkDeviceSize so, dof;
     if (!n || !vk_pool_find(src, n, &sb, &so) || !vk_pool_find(dst, n, &db, &dof)) { g_skips[6]++; return; }
-    vk_replay_end_pass();
+    end_pass(2);
     VkCommandBuffer cb = vk_cb();
     if (sb == db && so < dof + n && dof < so + n) {   /* overlapping copy within one buffer: through the ring */
         vk_span t = vk_ring(n, 16); VkBufferCopy a = {so, t.off, n}, b = {t.off, dof, n};
@@ -596,7 +600,7 @@ static void copy_b2t(const p_copy_b2t *c, int to_buffer) {
     const tex_t *t = c->tex; vtex *v = vk_tex_get(t);
     VkBuffer b; VkDeviceSize o;
     if (!v || !vk_pool_find(c->src, 1, &b, &o)) { g_skips[6]++; return; }
-    vk_replay_end_pass();
+    end_pass(3);
     int bw = 1, bh = 1, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     uint32_t rowlen = S.copy_stride && bpb ? (uint32_t)(S.copy_stride / bpb) * bw : 0;
     int z0 = c->r.zoffset, depth = c->r.depth ? c->r.depth : 1, is3d = t->d.target == NVN_TEXTURE_TARGET_3D;
@@ -611,7 +615,7 @@ static void copy_b2t(const p_copy_b2t *c, int to_buffer) {
 static void copy_t2t(const p_copy_t2t *c) {
     vtex *s = vk_tex_get(c->src), *d = vk_tex_get(c->dst);
     if (!s || !d) { g_skips[6]++; return; }
-    vk_replay_end_pass();
+    end_pass(3);
     vk_tex_upload_if_stale(s, c->src); vk_tex_upload_if_stale(d, c->dst);
     VkImageAspectFlags as = vk_tex_aspect(s), ad = vk_tex_aspect(d);
     int sl = region_layer(&c->sv, c->has_sv), dl = region_layer(&c->dv, c->has_dv);
@@ -629,7 +633,7 @@ static void copy_t2t(const p_copy_t2t *c) {
 }
 static void clear_tex(const p_clear_tex *c) {
     vtex *v = vk_tex_get(c->tex); if (!v) return;
-    vk_replay_end_pass(); vk_tex_upload_if_stale(v, c->tex);
+    end_pass(6); vk_tex_upload_if_stale(v, c->tex);
     VkImageSubresourceRange r = {(VkImageAspectFlags)vk_tex_aspect(v), (uint32_t)region_level(&c->view, c->has_view), 1, (uint32_t)region_layer(&c->view, c->has_view), 1};
     if (r.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) { VkClearColorValue cv; memcpy(&cv, &c->c, 16); vkCmdClearColorImage(vk_cb(), vk_tex_image(v), VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &r); }
     else { VkClearDepthStencilValue dv = {c->c.f[0], c->c.u[1]}; vkCmdClearDepthStencilImage(vk_cb(), vk_tex_image(v), VK_IMAGE_LAYOUT_GENERAL, &dv, 1, &r); }
@@ -655,7 +659,7 @@ void mtl_exec(const uint8_t *p) {
             case OP_RESET_COUNTER: break;
             case OP_COPY_B2B: { uint64_t s, d, n; memcpy(&s, a, 8); memcpy(&d, (const uint8_t *)a + 8, 8); memcpy(&n, (const uint8_t *)a + 16, 8); copy_b2b(s, d, n); break; }
             case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8); upd_add(d, (const uint8_t *)a + 16, n); break; }
-            case OP_SET_RT: { const p_set_rt *r = a; if (S.has_rt && same_rt(r, &S.rt)) break; vk_replay_end_pass(); S.rt = *r; S.has_rt = 1; break; }
+            case OP_SET_RT: { const p_set_rt *r = a; if (S.has_rt && same_rt(r, &S.rt)) break; end_pass(1); S.rt = *r; S.has_rt = 1; break; }
             case OP_CLEAR_COLOR: clear_color(a); break;
             case OP_CLEAR_DS: clear_ds(a); break;
             case OP_VIEWPORTS: { const p_viewports *v = a; for (int i = 0; i < v->n && v->first + i < 16; i++) memcpy(S.vp[v->first + i], v->v[i], 24); if (v->first + v->n > S.nvp) S.nvp = v->first + v->n > 16 ? 16 : v->first + v->n; break; }
@@ -681,7 +685,7 @@ void mtl_exec(const uint8_t *p) {
             case OP_DRAW_IDX: draw(NULL, a); break;
             case OP_DISPATCH: dispatch(a); break;
             case OP_BARRIER: { int bits; memcpy(&bits, a, 4);
-                if (bits & (NVN_BARRIER_INVALIDATE_TEXTURE_BIT | NVN_BARRIER_ORDER_FRAGMENTS_BIT)) vk_replay_end_pass(); else if (!g_pass_open) full_barrier(); break; }
+                if (bits & (NVN_BARRIER_INVALIDATE_TEXTURE_BIT | NVN_BARRIER_ORDER_FRAGMENTS_BIT)) end_pass(5); else if (!g_pass_open) full_barrier(); break; }
             case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: break;
             case OP_COPY_B2T: copy_b2t(a, 0); break;
             case OP_COPY_STRIDE: S.copy_stride = ((const p_copy_stride *)a)->stride; break;
@@ -723,6 +727,9 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
               (unsigned long long)g_presents, (unsigned long long)g_passes, (unsigned long long)g_draws, (unsigned long long)g_frame_passes, (unsigned long long)g_frame_draws,
               (unsigned long long)g_dispatches, (unsigned long long)g_copies, (unsigned long long)up, ub / 1e6, (unsigned long long)g_skips[0], (unsigned long long)g_skips[1],
               (unsigned long long)g_skips[2], (unsigned long long)g_skips[3], (unsigned long long)g_skips[4], (unsigned long long)g_skips[5], (unsigned long long)g_skips[6]);
+        VKLOG("pass ends: submit %llu, targets %llu, buffer copy %llu, texture copy %llu, dispatch %llu, barrier %llu, texture clear %llu, feedback %llu, update flush %llu",
+              (unsigned long long)g_end_why[0], (unsigned long long)g_end_why[1], (unsigned long long)g_end_why[2], (unsigned long long)g_end_why[3], (unsigned long long)g_end_why[4],
+              (unsigned long long)g_end_why[5], (unsigned long long)g_end_why[6], (unsigned long long)g_end_why[7], (unsigned long long)g_end_why[8]);
     }
     g_frame_passes = g_frame_draws = 0;
     return g_presents;
