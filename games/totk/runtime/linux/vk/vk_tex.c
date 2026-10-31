@@ -192,6 +192,7 @@ static void upload(vtex *v) {
             g_upload_bytes += bytes;
         }
     }
+    if (v->uploaded && getenv("TOTK_VK_UPLOAD_LOG")) VKLOG("re-upload serial %llu fmt %#x %ux%ux%u levels %u layers %u at %p (%llu bytes)", (unsigned long long)v->serial, v->d.format, v->w, v->h, v->depth, v->levels, v->layers, (const void *)v->gmem, (unsigned long long)v->gsize);
     v->stamp = stamp; v->uploaded = 1; v->gpu_owned = 0; g_uploads++;
     nvn_dirty_protect(v->gmem, v->gsize);
 }
