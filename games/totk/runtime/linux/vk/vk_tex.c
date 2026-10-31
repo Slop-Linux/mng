@@ -240,9 +240,13 @@ static vtex **g_rendered; static int g_nrendered, g_caprendered;
 /* tiny targets (16 KiB or less: the 1x1 foot-placement and water-colour renders) are read by the CPU without an invalidate:
    they land in memory when the submission that rendered them completes (nvn_mtl.m botw_tiny_note, upstream #239) */
 #define TINY (16u << 10)
+/* late landing (nvn_mtl.m botw_late_note, the grass masks): a target the CPU has flushed 8 times or more, up to 1 MiB, lands in
+   memory when its submission completes and a flush no longer waits for it: the CPU reads the last completed rendering, as on
+   the console, where the game does not wait for it either */
+#define LATE(v) ((v)->wb_count >= 8 && (v)->gsize <= (1u << 20))
 static vtex **g_tiny; static int g_ntiny, g_captiny;
 void vk_tex_gpu_wrote(vtex *v) { if (v) { v->gpu_owned = 1; v->gpu_dirty = 1; v->render_fence = vk_next_fence();
-      if (v->uploadable && v->gsize <= TINY && !v->in_tiny) { if (g_ntiny == g_captiny) { g_captiny = g_captiny ? 2 * g_captiny : 64; g_tiny = realloc(g_tiny, g_captiny * sizeof *g_tiny); }
+      if (v->uploadable && (v->gsize <= TINY || LATE(v)) && !v->in_tiny) { if (g_ntiny == g_captiny) { g_captiny = g_captiny ? 2 * g_captiny : 64; g_tiny = realloc(g_tiny, g_captiny * sizeof *g_tiny); }
           g_tiny[g_ntiny++] = v; v->in_tiny = 1; }
       if (v->wb_count && !v->in_list) { if (g_nrendered == g_caprendered) { g_caprendered = g_caprendered ? 2 * g_caprendered : 64; g_rendered = realloc(g_rendered, g_caprendered * sizeof *g_rendered); }
           g_rendered[g_nrendered++] = v; v->in_list = 1; } if (!v->uploaded) { v->uploaded = 1; v->stamp = nvn_dirty_now(); if (v->uploadable) nvn_dirty_protect(v->gmem, v->gsize); } } }
@@ -310,6 +314,7 @@ void vk_tex_stage_rendered(VkCommandBuffer cb, uint64_t fence) {
 static void writeback(vtex *v) {
     int sbw = 1, sbh = 1, sbpb = nvn_fmt_bpb(v->d.format, &sbw, &sbh);
     v->wb_count++;
+    if (LATE(v) && v->gpu_dirty) return;   /* lands when its submission completes (tiny_land) */
     static int log = -1; if (log < 0) log = getenv("TOTK_VK_WB_LOG") != NULL;
     if (log) VKLOG("write-back fmt %#x %ux%ux%u levels %u layers %u (%llu bytes) count %d %s", v->d.format, v->w, v->h, v->depth, v->levels, v->layers, (unsigned long long)v->gsize, v->wb_count,
                    v->stage && v->stage_fence && v->stage_fence == v->render_fence ? "staged" : "sync");
