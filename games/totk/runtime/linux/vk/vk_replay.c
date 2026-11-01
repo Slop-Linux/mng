@@ -141,6 +141,10 @@ static void pass_record(void) {
     static int nodepth = -1; if (nodepth < 0) { const char *e = getenv("TOTK_VK_NODEPTH"); nodepth = !(e && !strcmp(e, "0")); }
     if (nodepth && g_pdepth.v && !g_force_depth && !S.ds.dt && !S.ds.dw && !S.ds.st && g_lda.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR && g_lsa.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
         g_lri.pDepthAttachment = g_lri.pStencilAttachment = NULL; g_pass_nodepth = 1; g_nodepth_passes++; }
+    if (g_dump_first == -4) {   /* TOTK_VK_DUMP_AT=<w>x<h>: an armed dump starts at the first pass with an attachment of that size */
+        static unsigned aw_ = 0, ah_ = 0; if (!aw_) sscanf(getenv("TOTK_VK_DUMP_AT"), "%ux%u", &aw_, &ah_);
+        for (int i = 0; i < g_pcount; i++) if (g_patt[i].v) { uint32_t w_, h_; VkFormat f_; vk_tex_dims(g_patt[i].v, &w_, &h_, &f_); if (w_ == aw_ && h_ == ah_) { g_dump_first = (long)g_presents; VKLOG("dump: armed dump starts at present %llu", (unsigned long long)g_presents); break; } }
+    }
     if (g_dump_first >= 0 && (long)g_presents == g_dump_first) VKLOG("pass: %ux%u att0 load %d clear %.3f %.3f %.3f %.3f, %d colour, depth %d load %d clear %.3f", g_pw, g_ph, g_pcount ? (int)g_lca[0].loadOp : -1, g_lca[0].clearValue.color.float32[0], g_lca[0].clearValue.color.float32[1], g_lca[0].clearValue.color.float32[2], g_lca[0].clearValue.color.float32[3], g_pcount, g_pdepth.v != NULL, (int)g_lda.loadOp, g_lda.clearValue.depthStencil.depth);
     vkCmdBeginRendering(vk_cb(), &g_lri);
     g_pass_recorded = 1; g_passes++; g_frame_passes++; g_gen_state++;
@@ -182,7 +186,7 @@ static void dump_attachments(void) {
         if (e && strchr(e, ':')) { static char d_[200]; snprintf(d_, sizeof d_, "%.*s", (int)(strchr(e, ':') - e), e); dir = d_; g_dump_first = atol(strchr(e, ':') + 1); left = strchr(strchr(e, ':') + 1, ':') ? atol(strchr(strchr(e, ':') + 1, ':') + 1) : 50;
             const char *c = strchr(e, ':') + 1;   /* <dir>:<trigger file>:<count>: dumps start once the file appears (it is removed) */
             if (!(*c >= '0' && *c <= '9')) { snprintf(trig, sizeof trig, "%.*s", (int)(strchr(c, ':') ? strchr(c, ':') - c : (long)strlen(c)), c); g_dump_first = -3; } } }
-    if (g_dump_first == -3 && g_presents != trig_chk) { trig_chk = g_presents; if (!access(trig, F_OK)) { unlink(trig); g_dump_first = (long)g_presents; VKLOG("dump: triggered at present %llu", (unsigned long long)g_presents); } }
+    if (g_dump_first == -3 && g_presents != trig_chk) { trig_chk = g_presents; if (!access(trig, F_OK)) { unlink(trig); g_dump_first = getenv("TOTK_VK_DUMP_AT") ? -4 : (long)g_presents; VKLOG("dump: triggered at present %llu%s", (unsigned long long)g_presents, g_dump_first == -4 ? ", armed for TOTK_VK_DUMP_AT" : ""); } }
     if (g_dump_first < 0 || (long)g_presents < g_dump_first || left <= 0) return;
     static uint64_t n; int dumped = 0;
     for (int i = 0; i < g_pcount && left > 0; i++) { vtex *v = g_patt[i].v; if (!v || g_patt[i].level || g_patt[i].layer) continue;
