@@ -399,10 +399,10 @@ static pthread_mutex_t g_job_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond
 static pthread_mutex_t g_queue_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t g_submit_thread;
 static VkCommandPool g_pool2;   /* command buffers recorded on the submit thread (present, screenshots) */
-/* TOTK_VK_END_THREADS=<n> (default 3; 0 or 1: on the submit thread): the ICD encodes in vkEndCommandBuffer, so the pairs of a
+/* TOTK_VK_END_THREADS=<n> (default 1, on the submit thread: in parallel the ICD mixes occlusion-query results between command buffers, r49d-f): the ICD encodes in vkEndCommandBuffer, so the pairs of a
    submission are ended by n workers in parallel as soon as they are cut; the submit thread still submits them in order,
    each once its end is done */
-static int end_threads(void) { static int n = -1; if (n < 0) { const char *e = getenv("TOTK_VK_END_THREADS"); n = e ? atoi(e) : 3; if (n > 8) n = 8; } return n; }
+static int end_threads(void) { static int n = -1; if (n < 0) { const char *e = getenv("TOTK_VK_END_THREADS"); n = e ? atoi(e) : 1; if (n > 8) n = 8; } return n; }
 typedef struct { sub_t *s; int i; } end_job;
 #define ENDQ 256
 static end_job g_endq[ENDQ]; static uint64_t g_endq_head, g_endq_tail; static pthread_mutex_t g_end_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_end_cv = PTHREAD_COND_INITIALIZER, g_ended_cv = PTHREAD_COND_INITIALIZER;
