@@ -227,6 +227,7 @@ static chunk_t *g_free_chunks; static int g_nfree_chunks;
 static pthread_mutex_t g_sub_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_sub_cv = PTHREAD_COND_INITIALIZER;
 static _Atomic uint64_t g_fence_next = 1, g_applied, g_submitted;
 static uint64_t g_oneshot2;   /* read-backs on the second queue (vk_oneshot_after) */
+static _Atomic uint64_t g_qsub; static pthread_mutex_t g_qsub_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_qsub_cv = PTHREAD_COND_INITIALIZER;   /* the last fence whose signalling submission vk-submit has queued */
 static pthread_t g_done_thread;
 /* game-thread time (ns) waiting for room in the job queue, in mtl_wait, in one-shot command buffers, and replaying (vk_wait_stats) */
 static _Atomic uint64_t g_wt[4];
@@ -441,6 +442,7 @@ static void submit_now(sub_t *s, int i, int last) {
         .signalSemaphoreInfoCount = last ? 1 : 0, .pSignalSemaphoreInfos = &sig};
     pthread_mutex_lock(&g_queue_mu); uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     VKCHECK(vkQueueSubmit2(V.queue, 1, &si, VK_NULL_HANDLE)); atomic_fetch_add(&g_submit_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0); pthread_mutex_unlock(&g_queue_mu);
+    if (last) { pthread_mutex_lock(&g_qsub_mu); atomic_store(&g_qsub, s->fence); pthread_cond_broadcast(&g_qsub_cv); pthread_mutex_unlock(&g_qsub_mu); }   /* the timeline point is in the queue */
     if (!last) return;
     pthread_mutex_lock(&g_sub_mu);
     if (!g_done_thread) pthread_create(&g_done_thread, NULL, done_thread, NULL);
@@ -509,6 +511,9 @@ int vk_oneshot_after(VkCommandBuffer cb, uint64_t after) {
     if (!V.queue2 || !after || after > atomic_load(&g_submitted)) return 0;   /* never rendered (uploads go in order on the main queue) or not committed */
     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     uint64_t o0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    /* the ICD feeds both queues into one in-order kernel queue (driver device.rs QUEUES): a wait for a point not queued yet would
+       block queue 0 behind it, so wait (CPU) until vk-submit has queued the image's submission, not for the rest of the backlog */
+    if (atomic_load(&g_qsub) < after) { pthread_mutex_lock(&g_qsub_mu); while (atomic_load(&g_qsub) < after) pthread_cond_wait(&g_qsub_cv, &g_qsub_mu); pthread_mutex_unlock(&g_qsub_mu); }
     VKCHECK(vkEndCommandBuffer(cb));
     VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence f; VKCHECK(vkCreateFence(V.dev, &fi, NULL, &f));
     VkSemaphoreSubmitInfo w = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = V.timeline, .value = after, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
