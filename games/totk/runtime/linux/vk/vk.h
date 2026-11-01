@@ -66,7 +66,7 @@ void vk_sub_post(int kind, volatile uint32_t *val, uint32_t mode, uint32_t v, ui
 void vk_defer_free(void (*fn)(void *), void *p);   /* run when the open submission completes */
 /* occlusion queries: slots of one query pool taken in recording order; a submission's slots are read and reset when it
    completes, a report (vk_sub_post_samples) sums the slots counted since the last reset */
-typedef struct { int n, skipped; uint32_t slot[]; } vk_qlist;
+typedef struct { int n, skipped, draws; uint32_t slot[]; } vk_qlist;   /* draws: counted since the reset (TOTK_VK_QUERY_LOG) */
 VkQueryPool vk_query_pool(void);
 uint32_t vk_query_alloc(void);
 void vk_sub_post_samples(uint64_t addr, vk_qlist *l);

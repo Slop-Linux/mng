@@ -51,7 +51,7 @@ static int depth_has_stencil(void) { return g_pdepth.v && (vk_tex_aspect(g_pdept
 /* ---------- occlusion queries (NVN_COUNTER_TYPE_SAMPLES_PASSED): a counter ResetCounter zeroes, every draw adds to and
    ReportCounter writes on completion. While counting each pass segment has a query slot; a report sums the slots since the
    reset (nvn_mtl.m's visibility slots) ---------- */
-static int g_q_counting, g_q_skipped; static int64_t g_q_cur = -1; static uint32_t *g_q_list; static int g_q_n, g_q_cap;
+static int g_q_counting, g_q_skipped, g_q_draws; static int64_t g_q_cur = -1; static uint32_t *g_q_list; static int g_q_n, g_q_cap;
 static int g_pass_recorded;   /* the open pass has been begun on the command buffer (pass_record) */
 static int g_pass_nodepth, g_force_depth; static uint64_t g_nodepth_passes;   /* the recorded pass left its depth attachment out (pass_record) */
 static void q_begin(void) { if (g_q_counting && g_q_cur < 0 && g_pass_recorded) { g_q_cur = vk_query_alloc(); vkCmdBeginQuery(vk_cb(), vk_query_pool(), (uint32_t)g_q_cur, 0); } }
@@ -61,10 +61,10 @@ static void q_end(int keep) {
     if (keep) { if (g_q_n == g_q_cap) { g_q_cap = g_q_cap ? 2 * g_q_cap : 64; g_q_list = realloc(g_q_list, g_q_cap * sizeof *g_q_list); } g_q_list[g_q_n++] = (uint32_t)g_q_cur; }
     g_q_cur = -1;
 }
-static void q_reset(int pass_open) { q_end(0); g_q_n = 0; g_q_skipped = 0; g_q_counting = 1; if (pass_open) q_begin(); }
+static void q_reset(int pass_open) { q_end(0); g_q_n = 0; g_q_skipped = 0; g_q_draws = 0; g_q_counting = 1; if (pass_open) q_begin(); }
 static void q_report(uint64_t addr, int pass_open) {
     q_end(1);
-    vk_qlist *l = malloc(sizeof *l + (g_q_n ? g_q_n : 1) * sizeof(uint32_t)); l->n = g_q_n; l->skipped = g_q_skipped; memcpy(l->slot, g_q_list, g_q_n * sizeof(uint32_t));
+    vk_qlist *l = malloc(sizeof *l + (g_q_n ? g_q_n : 1) * sizeof(uint32_t)); l->n = g_q_n; l->skipped = g_q_skipped; l->draws = g_q_draws; memcpy(l->slot, g_q_list, g_q_n * sizeof(uint32_t));
     vk_sub_post_samples(addr, l);
     if (pass_open) q_begin();
 }
@@ -122,7 +122,8 @@ static void pass_record(void) {
     /* a pass begun by a draw without depth / stencil test or write leaves its depth attachment out (no load, no store);
        a later draw of it that uses depth splits it (draw, clear_ds) */
     g_pass_nodepth = 0;
-    if (g_pdepth.v && !g_force_depth && !S.ds.dt && !S.ds.dw && !S.ds.st && g_lda.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR && g_lsa.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
+    static int nodepth = -1; if (nodepth < 0) { const char *e = getenv("TOTK_VK_NODEPTH"); nodepth = !(e && !strcmp(e, "0")); }
+    if (nodepth && g_pdepth.v && !g_force_depth && !S.ds.dt && !S.ds.dw && !S.ds.st && g_lda.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR && g_lsa.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
         g_lri.pDepthAttachment = g_lri.pStencilAttachment = NULL; g_pass_nodepth = 1; g_nodepth_passes++; }
     vkCmdBeginRendering(vk_cb(), &g_lri);
     g_pass_recorded = 1; g_passes++; g_frame_passes++; g_gen_state++;
@@ -130,6 +131,8 @@ static void pass_record(void) {
 }
 static void end_pass(int why) {
     if (!g_pass_open) return;
+    static int pclr = -1; if (pclr < 0) { const char *e = getenv("TOTK_VK_PCLR"); pclr = !(e && !strcmp(e, "0")); }
+    if (!g_pass_recorded && !pclr) pass_record();   /* TOTK_VK_PCLR=0: passes that only clear are recorded */
     if (!g_pass_recorded) {   /* nothing drawn: the cleared attachments that cover their whole level go pending */
         int drop = 1;
         for (int i = 0; i < g_pcount; i++) if (g_lca[i].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR && !(g_pass_full >> i & 1)) drop = 0;
@@ -151,6 +154,7 @@ static void end_pass(int why) {
     if (why && chunk && g_draws - at >= (uint64_t)chunk) { void vk_sub_cut(void); vk_sub_cut(); at = g_draws; g_cb_gen++; }
 }
 void vk_replay_end_pass(void) { end_pass(0); pclr_flush(); }
+void vk_replay_outside_pass(void) { end_pass(3); for (int k = 0; k < 6; k++) g_gen_bind[k]++; }   /* an image made mutable is copied (vk_tex.c tex_mutable): sets are rebuilt with its new views; a draw then begins the pass again */
 /* the clears that open a pass become its load operations: from the op that opens it, the run of clears and state changes
    before its first draw (scissor tracked; a render condition, a draw or any other op ends the run). The first clear of an
    attachment that covers the whole render area with every channel is taken (g_taken); the clear op then does nothing */
@@ -805,6 +809,7 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
     if (!p->sh[0] || (fs && !p->sh[1])) { g_skips[3]++; g_q_skipped |= g_q_counting; return; }
     static int each = -1; if (each < 0) { const char *e = getenv("TOTK_VK_FB_DRAW"); each = e && atoi(e); }
     static unsigned prev_fb;
+    if (!g_pass_open && !pass_begin()) return;   /* ended for an image made mutable while the sets were built */
     if (g_pclr_hit) { if (g_pass_recorded) { end_pass(6); pclr_flush(); if (!pass_begin()) return; } else pclr_flush(); }   /* a pending clear of an image this draw samples runs first */
     if (!dfs && fbw && (each || !prev_fb)) { pass_record(); end_pass(7); if (!pass_begin()) return; }
     if (g_pass_recorded && g_pass_nodepth && (S.ds.dt || S.ds.dw || S.ds.st)) { end_pass(5); if (!pass_begin()) return; }   /* the pass left depth out */
@@ -843,6 +848,7 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
             vkCmdDrawIndexed(cb, (uint32_t)di->count, (uint32_t)inst, 0, di->base_vertex, (uint32_t)di->base_instance);
         }
     }
+    g_q_draws += g_q_cur >= 0;
     g_draws++; g_frame_draws++; if (g_pt_on && g_pt_n < PT_MAX) { g_pt[g_pt_n].draws++; pp_note(vs, fs); }
     if (!S.raster_discard) {
         for (int i = 0; i < g_pcount; i++) if (g_patt[i].v && (S.chmask.mask >> (4 * i) & 0xf)) { g_pass_written |= 1u << i; g_lr_dirty |= 1u << i; }

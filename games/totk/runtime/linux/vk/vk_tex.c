@@ -110,6 +110,7 @@ struct vtex {
        every submission that renders it; a write-back then waits for that submission only and swizzles from stage */
     uint64_t render_fence, stage_fence; int wb_count, in_list, in_tiny; VkBuffer stage; VkDeviceMemory stage_mem; uint8_t *stage_cpu; VkDeviceSize stage_size;
     uint64_t key;   /* hash of memory, format, target, size, levels, samples, linearity */
+    VkImageCreateInfo ci; VkFormat pair; int mutable_all;   /* creation info; the sRGB / linear pair the image can be viewed as; any format (vk_tex_view upgrades) */
     struct vtex *next;
 };
 #define TEX_HASH 4096
@@ -121,6 +122,7 @@ VkImage vk_tex_image(vtex *v) { return v->img; }
 void vk_tex_dims(vtex *v, uint32_t *w, uint32_t *h, VkFormat *f) { *w = v->w; *h = v->h; *f = v->fmt; }
 int vk_tex_aspect(vtex *v) { return v->vf->depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | (v->vf->stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)) : v->vf->stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT; }
 static uint32_t mipd(uint32_t s, uint32_t l) { s >>= l; return s ? s : 1; }
+static VkFormat fmt_pair(VkFormat f);
 
 static vtex *tex_make(const tex_t *t) {
     const vk_fmt *vf = vk_format(t->d.format);
@@ -145,12 +147,15 @@ static vtex *tex_make(const tex_t *t) {
     if (ff & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;   /* decals read it in the tile (vk_fbread.c) */
     if (ff & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     if ((ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && v->samples == 1) u |= VK_IMAGE_USAGE_STORAGE_BIT;
-    if (!(u & VK_IMAGE_USAGE_SAMPLED_BIT)) { VKLOG("【红】format %#x (Vulkan %d) cannot be sampled", t->d.format, vf->vk); }
-    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | (v->cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0) |
-        (v->type == VK_IMAGE_TYPE_3D ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0) | (vf->compressed ? VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT : 0),
+    /* no MUTABLE_FORMAT (the driver keeps such images uncompressed, as Metal does for PixelFormatView): an sRGB / linear pair
+       gets it with a format list of the two; a view in another format recreates the image (tex_mutable) */
+    VkFormat pair = fmt_pair(vf->vk); VkImageFormatListCreateInfo fl = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, .viewFormatCount = 2, .pViewFormats = (VkFormat[]){vf->vk, pair}};
+    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = pair ? &fl : NULL, .flags = (pair ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0) | (v->cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0) |
+        (v->type == VK_IMAGE_TYPE_3D ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0),
         .imageType = v->type, .format = vf->vk, .extent = {v->w, v->h, v->depth}, .mipLevels = v->levels, .arrayLayers = v->layers, .samples = (VkSampleCountFlagBits)v->samples,
         .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = u, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
     if (vkCreateImage(V.dev, &ci, NULL, &v->img) != VK_SUCCESS) { VKLOG("【红】image %ux%ux%u fmt %d levels %u layers %u failed", v->w, v->h, v->depth, vf->vk, v->levels, v->layers); free(v); return NULL; }
+    v->ci = ci; v->ci.pNext = NULL; v->pair = pair;
     VkMemoryRequirements req; vkGetImageMemoryRequirements(V.dev, v->img, &req);
     if (!vk_alloc_mem(req, &v->mem)) VKDIE("out of image memory (%llu bytes)", (unsigned long long)req.size);
     VKCHECK(vkBindImageMemory(V.dev, v->img, v->mem.mem, v->mem.off));
@@ -416,12 +421,55 @@ static VkComponentSwizzle swz1(int s, VkComponentSwizzle self) {
                  case NVN_TEXTURE_SWIZZLE_R: return VK_COMPONENT_SWIZZLE_R; case NVN_TEXTURE_SWIZZLE_G: return VK_COMPONENT_SWIZZLE_G;
                  case NVN_TEXTURE_SWIZZLE_B: return VK_COMPONENT_SWIZZLE_B; case NVN_TEXTURE_SWIZZLE_A: return VK_COMPONENT_SWIZZLE_A; default: return self; }
 }
+/* the sRGB / linear counterpart of a format, or 0 */
+static VkFormat fmt_pair(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SRGB; case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+        case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_SRGB; case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+        case VK_FORMAT_BC1_RGB_UNORM_BLOCK: case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: case VK_FORMAT_BC2_UNORM_BLOCK: case VK_FORMAT_BC3_UNORM_BLOCK: case VK_FORMAT_BC7_UNORM_BLOCK: return (VkFormat)(f + 1);
+        case VK_FORMAT_BC1_RGB_SRGB_BLOCK: case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: case VK_FORMAT_BC2_SRGB_BLOCK: case VK_FORMAT_BC3_SRGB_BLOCK: case VK_FORMAT_BC7_SRGB_BLOCK: return (VkFormat)(f - 1);
+        default:
+            if (f >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK) return (VkFormat)((f - VK_FORMAT_ASTC_4x4_UNORM_BLOCK) % 2 ? f - 1 : f + 1);
+            return VK_FORMAT_UNDEFINED;
+    }
+}
+/* a view in a format the image was not made for: the image is made again with MUTABLE_FORMAT and its content copied in the
+   command stream, outside any pass (nvn_mtl.m tex_upgrade_pfv); views made so far go when the submission completes */
+typedef struct { VkImage img; vk_alloc mem; vview *views; int nviews; } old_img;
+static void old_destroy(void *p) { old_img *o = p; for (int i = 0; i < o->nviews; i++) vkDestroyImageView(V.dev, o->views[i].view, NULL); free(o->views); vkDestroyImage(V.dev, o->img, NULL); vk_free_mem(&o->mem); free(o); }
+static uint64_t g_mutable_upgrades;
+static void tex_mutable(vtex *v) {
+    void vk_replay_outside_pass(void); vk_replay_outside_pass();
+    VkImageCreateInfo ci = v->ci; ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT; VkImage img; vk_alloc mem;
+    if (vkCreateImage(V.dev, &ci, NULL, &img) != VK_SUCCESS) { VKLOG("【红】mutable image %ux%u fmt %d failed", v->w, v->h, v->fmt); v->mutable_all = 1; return; }
+    VkMemoryRequirements req; vkGetImageMemoryRequirements(V.dev, img, &req);
+    if (!vk_alloc_mem(req, &mem)) VKDIE("out of image memory (%llu bytes)", (unsigned long long)req.size);
+    VKCHECK(vkBindImageMemory(V.dev, img, mem.mem, mem.off));
+    VkCommandBuffer cb = vk_cb(); VkImageAspectFlags asp = (VkImageAspectFlags)vk_tex_aspect(v);
+    VkImageMemoryBarrier2 b = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = img,
+        .subresourceRange = {asp, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b};
+    vkCmdPipelineBarrier2(cb, &di);
+    VkImageCopy r[16]; uint32_t n = v->levels < 16 ? v->levels : 16;
+    for (uint32_t l = 0; l < n; l++) r[l] = (VkImageCopy){{asp, l, 0, v->layers}, {0, 0, 0}, {asp, l, 0, v->layers}, {0, 0, 0},
+        {mipd(v->w, l), v->type == VK_IMAGE_TYPE_1D ? 1 : mipd(v->h, l), v->type == VK_IMAGE_TYPE_3D ? mipd(v->depth, l) : 1}};
+    if (v->uploaded || v->gpu_owned) vkCmdCopyImage(cb, v->img, VK_IMAGE_LAYOUT_GENERAL, img, VK_IMAGE_LAYOUT_GENERAL, n, r);
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    VkDependencyInfo d2 = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb}; vkCmdPipelineBarrier2(cb, &d2);
+    old_img *o = malloc(sizeof *o); *o = (old_img){v->img, v->mem, v->views, v->nviews}; vk_defer_free(old_destroy, o);
+    v->img = img; v->mem = mem; v->views = NULL; v->nviews = 0; v->ci = ci; v->mutable_all = 1; g_mutable_upgrades++;
+    static int said; if (said++ < 16) VKLOG("image %ux%u format %d made mutable (a view in another format)", v->w, v->h, v->fmt);
+}
 VkImageView vk_tex_view(vtex *v, const tex_t *t, const view_t *vw, int has_view, VkImageViewType type, int attach) {
     vview k = {0};
     int fmt = has_view && vw->set_format ? vw->format : t->d.format;
     const vk_fmt *vf = vk_format(fmt); if (!vf) vf = v->vf;
     if (vf->compressed != v->vf->compressed || vf->depth != v->vf->depth) vf = v->vf;   /* not a compatible view: the image's own format */
     k.fmt = vf->vk; k.type = type;
+    if (k.fmt != v->fmt && !v->mutable_all && k.fmt != v->pair) tex_mutable(v);
     k.level0 = has_view && vw->set_levels ? vw->base_level : 0; k.nlevels = has_view && vw->set_levels && vw->nlevels ? vw->nlevels : v->levels - k.level0;
     k.layer0 = has_view && vw->set_layers ? vw->min_layer : 0; k.nlayers = has_view && vw->set_layers && vw->nlayers ? vw->nlayers : v->layers - k.layer0;
     if (k.level0 >= v->levels) k.level0 = v->levels - 1;
