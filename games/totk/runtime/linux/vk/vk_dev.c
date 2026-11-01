@@ -244,7 +244,8 @@ static void chunk_new(chunk_t *c, VkDeviceSize size) {
     VKCHECK(vkCreateBuffer(V.dev, &bi, NULL, &c->buf));
     VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, c->buf, &req);
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size,
-        .memoryTypeIndex = vk_memtype(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
+        .memoryTypeIndex = vk_memtype(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)};   /* cached: the replay reads back what it wrote (uniform copies) */
+    if (ai.memoryTypeIndex == UINT32_MAX) ai.memoryTypeIndex = vk_memtype(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     VKCHECK(vkAllocateMemory(V.dev, &ai, NULL, &c->mem)); VKCHECK(vkBindBufferMemory(V.dev, c->buf, c->mem, 0));
     VKCHECK(vkMapMemory(V.dev, c->mem, 0, VK_WHOLE_SIZE, 0, (void **)&c->cpu)); c->size = size; c->used = 0;
 }
@@ -307,7 +308,8 @@ void vk_sub_post(int kind, volatile uint32_t *val, uint32_t mode, uint32_t v, ui
     s->posts[s->nposts++] = (post_t){kind, val, mode, v, addr, NULL};
 }
 #define QN 32768
-static VkQueryPool g_qpool; static uint32_t g_qnext; static uint64_t g_qres[QN];
+static VkQueryPool g_qpool; static uint32_t g_qnext; static uint64_t g_qres[QN]; static _Atomic uint64_t g_qrep[2];   /* samples-passed reports of 0 / not 0 */
+void vk_query_stats(uint64_t r[2]) { r[0] = atomic_load(&g_qrep[0]); r[1] = atomic_load(&g_qrep[1]); }
 VkQueryPool vk_query_pool(void) {
     if (!g_qpool) { VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_OCCLUSION, .queryCount = QN};
                     VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &g_qpool)); vkResetQueryPool(V.dev, g_qpool, 0, QN); }
@@ -354,6 +356,7 @@ static void *done_thread(void *arg) {
                             static int vis = -1; if (vis < 0) vis = getenv("TOTK_VK_OCCL_VISIBLE") != NULL;
                             if (vis) sum = 1u << 20;
                             free(o->q); }
+                if (o->q || o->kind == 3) atomic_fetch_add(&g_qrep[sum != 0], 1);
                 uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec);
             }
         }

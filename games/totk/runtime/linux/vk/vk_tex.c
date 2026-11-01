@@ -79,12 +79,14 @@ int vk_tex_registry_get(int id, tex_t *t, view_t *v, int *has_view) {
     if (ok) { *t = g_treg[id].t; *v = g_treg[id].v; *has_view = g_treg[id].has_v; }
     pthread_mutex_unlock(&g_reg_mu); return ok;
 }
+static _Atomic(VkSampler) g_samp_of[4096];   /* the sampler of each sampler pool id, made on first use (vk_sampler_id) */
 void vk_samp_registry_set(int id, const samp_par *p) {
     if (id < 0 || id >= 4096) return;
     atomic_fetch_add_explicit(&g_reg_gen, 1, memory_order_relaxed);
     pthread_mutex_lock(&g_reg_mu);
     if (id >= g_nsreg) { int n = 4096; g_sreg = realloc(g_sreg, n * sizeof *g_sreg); g_sok = realloc(g_sok, n); memset(g_sok + g_nsreg, 0, n - g_nsreg); g_nsreg = n; }
     if (p) { g_sreg[id] = *p; g_sok[id] = 1; } else g_sok[id] = 0;
+    g_samp_of[id] = VK_NULL_HANDLE;
     pthread_mutex_unlock(&g_reg_mu);
 }
 int vk_samp_registry_get(int id, samp_par *p) {
@@ -102,7 +104,7 @@ struct vtex {
     const uint8_t *gmem; uint64_t gsize; uint64_t stamp; int uploaded, gpu_owned, uploadable;
     nvn_texdesc d;
     vview *views; int nviews;
-    int gpu_dirty;  /* rendered since the last write-back */
+    int gpu_dirty, in_dirty;  /* rendered since the last write-back; in g_dirty */
     uint64_t made, last_read; int store_always; uint64_t pruned;   /* store pruning (vk_tex_store_needed) */
     /* staged write-back (nvn_mtl.m's botw_wb_stage_encode): a texture the CPU has read back is copied into stage at the end of
        every submission that renders it; a write-back then waits for that submission only and swizzles from stage */
@@ -112,6 +114,8 @@ struct vtex {
 };
 #define TEX_HASH 4096
 static vtex *g_tex[TEX_HASH]; static pthread_mutex_t g_tex_mu = PTHREAD_MUTEX_INITIALIZER;
+static vtex **g_dirty; static int g_ndirty, g_capdirty;   /* the images with gpu_dirty set at some point (g_tex_mu): what a write-back range searches */
+static void dirty_forget(vtex *v) { if (v->in_dirty) for (int i = 0; i < g_ndirty; i++) if (g_dirty[i] == v) { g_dirty[i] = g_dirty[--g_ndirty]; break; } }   /* g_tex_mu held */
 static uint64_t g_uploads, g_upload_bytes;
 VkImage vk_tex_image(vtex *v) { return v->img; }
 void vk_tex_dims(vtex *v, uint32_t *w, uint32_t *h, VkFormat *f) { *w = v->w; *h = v->h; *f = v->fmt; }
@@ -194,7 +198,7 @@ void vk_tex_release_range(uintptr_t lo, uintptr_t hi) {
     pthread_mutex_lock(&g_tex_mu);
     for (int b = 0; b < TEX_HASH; b++) for (vtex **pp = &g_tex[b]; *pp;) {
         vtex *v = *pp;
-        if ((uintptr_t)v->gmem >= lo && (uintptr_t)v->gmem < hi) { *pp = v->next; if (g_last == v) g_last = NULL; vk_defer_free(tex_destroy, v); } else pp = &v->next;
+        if ((uintptr_t)v->gmem >= lo && (uintptr_t)v->gmem < hi) { *pp = v->next; if (g_last == v) g_last = NULL; dirty_forget(v); vk_defer_free(tex_destroy, v); } else pp = &v->next;
     }
     pthread_mutex_unlock(&g_tex_mu);
 }
@@ -305,6 +309,7 @@ static vtex **g_rendered; static int g_nrendered, g_caprendered;
 #define LATE(v) ((v)->wb_count >= 8 && (v)->gsize <= (1u << 20))
 static vtex **g_tiny; static int g_ntiny, g_captiny;
 void vk_tex_gpu_wrote(vtex *v) { if (v) { v->gpu_owned = 1; v->gpu_dirty = 1; v->render_fence = vk_next_fence();
+      if (!v->in_dirty && v->uploadable) { pthread_mutex_lock(&g_tex_mu); if (g_ndirty == g_capdirty) { g_capdirty = g_capdirty ? 2 * g_capdirty : 256; g_dirty = realloc(g_dirty, g_capdirty * sizeof *g_dirty); } g_dirty[g_ndirty++] = v; v->in_dirty = 1; pthread_mutex_unlock(&g_tex_mu); }
       if (v->uploadable && (v->gsize <= TINY || LATE(v)) && !v->in_tiny) { if (g_ntiny == g_captiny) { g_captiny = g_captiny ? 2 * g_captiny : 64; g_tiny = realloc(g_tiny, g_captiny * sizeof *g_tiny); }
           g_tiny[g_ntiny++] = v; v->in_tiny = 1; }
       if (v->wb_count && !v->in_list) { if (g_nrendered == g_caprendered) { g_caprendered = g_caprendered ? 2 * g_caprendered : 64; g_rendered = realloc(g_rendered, g_caprendered * sizeof *g_rendered); }
@@ -396,8 +401,9 @@ void mtl_finish(void);
 void vk_tex_writeback_range(uintptr_t lo, uintptr_t hi) {
     vtex *list[64]; int n = 0;
     pthread_mutex_lock(&g_tex_mu);
-    for (int b = 0; b < TEX_HASH && n < 64; b++) for (vtex *v = g_tex[b]; v && n < 64; v = v->next)
-        if (v->gpu_dirty && v->uploadable && (uintptr_t)v->gmem < hi && (uintptr_t)v->gmem + v->gsize > lo) list[n++] = v;
+    for (int i = 0; i < g_ndirty; i++) { vtex *v = g_dirty[i];
+        if (!v->gpu_dirty) { v->in_dirty = 0; g_dirty[i--] = g_dirty[--g_ndirty]; continue; }   /* written back since */
+        if (n < 64 && (uintptr_t)v->gmem < hi && (uintptr_t)v->gmem + v->gsize > lo) list[n++] = v; }
     pthread_mutex_unlock(&g_tex_mu);
     if (!n) return;
     for (int i = 0; i < n; i++) writeback(list[i]);
@@ -616,3 +622,10 @@ int vk_tex_store_needed(vtex *v) {
     v->pruned++; g_pruned_stores++; return 0;
 }
 void vk_tex_prune_stats(uint64_t *stores, uint64_t *reads) { *stores = g_pruned_stores; *reads = g_pruned_reads; }
+/* the VkSampler of a sampler pool id, or VK_NULL_HANDLE when the id holds none */
+VkSampler vk_sampler_id(int id) {
+    if (id <= 0 || id >= 4096) return VK_NULL_HANDLE;
+    VkSampler s = atomic_load_explicit(&g_samp_of[id], memory_order_relaxed); if (s) return s;
+    samp_par p; if (!vk_samp_registry_get(id, &p)) return VK_NULL_HANDLE;
+    s = vk_sampler(&p); atomic_store_explicit(&g_samp_of[id], s, memory_order_relaxed); return s;
+}

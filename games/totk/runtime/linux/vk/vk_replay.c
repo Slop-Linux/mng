@@ -292,7 +292,7 @@ static void upd_read(uint64_t addr, void *dst, uint64_t n) {
     }
 }
 /* uniform copies (count, bytes) for the long-frame log */
-static uint64_t g_ucopy[2];
+static uint64_t g_ucopy[2], g_ucopy_all[2];
 /* renamed copies made in this submission, by range and the number of updates they include */
 typedef struct { uint64_t addr, size; int nupd; VkBuffer buf; VkDeviceSize off; const uint8_t *cpu; } shadow_t;
 static shadow_t g_shadow[1024]; static uint64_t g_shadow_epoch, g_shadow_ep[1024];
@@ -312,7 +312,7 @@ static int ubo_range(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *
        range of 64 KiB gets ~1,000 inline updates in some Shrine submissions) */
     int from = 0; const uint8_t *base = (const uint8_t *)(uintptr_t)addr;
     if (g_shadow_ep[slot] == g_shadow_epoch && sh->addr == addr && sh->size == size && sh->nupd < overlap) { from = sh->nupd; base = sh->cpu; }
-    vk_span s = vk_ring(size, 256); memcpy(s.cpu, base, size); g_ucopy[0]++; g_ucopy[1] += size;
+    vk_span s = vk_ring(size, 256); memcpy(s.cpu, base, size); g_ucopy[0]++; g_ucopy[1] += size; g_ucopy_all[0]++; g_ucopy_all[1] += size;
     for (int i = from; i < overlap; i++) {
         uint64_t lo = g_upd[i].dst > addr ? g_upd[i].dst : addr, hi = g_upd[i].dst + g_upd[i].n < addr + size ? g_upd[i].dst + g_upd[i].n : addr + size;
         if (lo < hi) memcpy(s.cpu + (lo - addr), g_upd[i].data + (lo - g_upd[i].dst), hi - lo);
@@ -501,7 +501,7 @@ static VkDescriptorSet stage_set(vshader *s, int stage, int set, VkDescriptorSet
                 if (is_img) h = img_handle(stage, b->handle);
                 else h = packed_handle(stage, b->handle + k * 2);
                 int tid = (int)(h & 0xfffff), sid = (int)(h >> 20) & 0xfff;
-                tex_t t; view_t vw; int hv; VkImageView view = VK_NULL_HANDLE; VkSampler smp = vk_sampler(&g_default_samp);
+                tex_t t; view_t vw; int hv; VkImageView view = VK_NULL_HANDLE; static VkSampler dflt; if (!dflt) dflt = vk_sampler(&g_default_samp); VkSampler smp = dflt;
                 if (tid && vk_tex_registry_get(tid, &t, &vw, &hv)) {
                     vtex *v = vk_tex_get(&t);
                     if (v) {
@@ -520,7 +520,7 @@ static VkDescriptorSet stage_set(vshader *s, int stage, int set, VkDescriptorSet
                                 if (ok && g_nfbp < 8) { g_fbp_bind[g_nfbp] = b->binding; g_fbp_att[g_nfbp++] = a; } else g_fb_bad = 1; } }
                     }
                 }
-                samp_par sp; if (!is_img && sid && vk_samp_registry_get(sid, &sp)) smp = vk_sampler(&sp);
+                if (!is_img && sid) { VkSampler s_ = vk_sampler_id(sid); if (s_) smp = s_; }
                 ii[ni++] = (VkDescriptorImageInfo){is_img ? VK_NULL_HANDLE : smp, view, VK_IMAGE_LAYOUT_GENERAL};
             }
         }
@@ -1123,7 +1123,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
               (unsigned long long)g_dispatches, (unsigned long long)g_copies, (unsigned long long)up, ub / 1e6, (unsigned long long)ug, (unsigned long long)g_skips[0], (unsigned long long)g_skips[1],
               (unsigned long long)g_skips[2], (unsigned long long)g_skips[3], (unsigned long long)g_skips[4], (unsigned long long)g_skips[5], (unsigned long long)g_skips[6]);
         { uint64_t vk_gpu_ns(void), vk_submit_ns(void), vk_end_ns(void); static uint64_t pg, ps, pe; uint64_t g = vk_gpu_ns(), q = vk_submit_ns(), e = vk_end_ns();
-          VKLOG("GPU busy %.2f ms per present over the last 600; submit thread per present: vkEndCommandBuffer %.2f ms, vkQueueSubmit2 %.2f ms", (g - pg) / 1e6 / 600, (e - pe) / 1e6 / 600, (q - ps) / 1e6 / 600); pg = g; ps = q; pe = e; }
+          VKLOG("GPU busy %.2f ms per present over the last 600; submit thread per present: vkEndCommandBuffer %.2f ms, vkQueueSubmit2 %.2f ms; uniform copies %.0f / %.2f MB per present; occlusion reports %llu zero, %llu not", (g - pg) / 1e6 / 600, (e - pe) / 1e6 / 600, (q - ps) / 1e6 / 600, g_ucopy_all[0] / 600.0, g_ucopy_all[1] / 600e6, ({ uint64_t r_[2]; vk_query_stats(r_); (unsigned long long)r_[0]; }), ({ uint64_t r_[2]; vk_query_stats(r_); (unsigned long long)r_[1]; })); pg = g; ps = q; pe = e; memset(g_ucopy_all, 0, sizeof g_ucopy_all); }
         VKLOG("pass ends: submit %llu, targets %llu, buffer copy %llu, texture copy %llu, dispatch %llu, depth needed %llu, texture clear %llu, feedback %llu, update flush %llu",
               (unsigned long long)g_end_why[0], (unsigned long long)g_end_why[1], (unsigned long long)g_end_why[2], (unsigned long long)g_end_why[3], (unsigned long long)g_end_why[4],
               (unsigned long long)g_end_why[5], (unsigned long long)g_end_why[6], (unsigned long long)g_end_why[7], (unsigned long long)g_end_why[8]);
