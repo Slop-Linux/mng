@@ -663,7 +663,7 @@ void vk_tex_mark_read(vtex *v) {
     v->last_read = g_frame + 1;
 }
 int vk_tex_store_needed(vtex *v) {
-    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_VK_PRUNE"); on = !(e && !strcmp(e, "0")); }
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_VK_PRUNE"); on = e && !strcmp(e, "1"); }   /* opt-in: ~1 attachment a frame, and an image read only rarely saw its last stored content */
     if (!on || !v || v->store_always || v->last_read) return 1;
     if (!v->made) v->made = g_frame + 1;
     if (g_frame + 1 - v->made < PRUNE_FRAMES) return 1;
