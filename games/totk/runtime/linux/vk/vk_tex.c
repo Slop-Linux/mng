@@ -520,6 +520,13 @@ VkImageView vk_tex_view(vtex *v, const tex_t *t, const view_t *vw, int has_view,
     if (v->type == VK_IMAGE_TYPE_1D && k.type != VK_IMAGE_VIEW_TYPE_1D_ARRAY) k.type = VK_IMAGE_VIEW_TYPE_1D;
     if (v->type == VK_IMAGE_TYPE_2D && (k.type == VK_IMAGE_VIEW_TYPE_1D || k.type == VK_IMAGE_VIEW_TYPE_1D_ARRAY)) k.type = k.nlayers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     if (v->type == VK_IMAGE_TYPE_3D) { k.layer0 = 0; k.nlayers = 1; }
+    /* a render target in a 3D texture is one depth slice, the view's first layer (nvn_mtl.m: colour attachment depthPlane =
+       min_layer): a 2D view of that slice (the image is 2D-array compatible). The 3D colour-grading table of the menu
+       backgrounds is drawn into its 8 slices by one pass with 8 targets */
+    if (v->type == VK_IMAGE_TYPE_3D && attach) {
+        uint32_t dz = v->depth >> k.level0 ? v->depth >> k.level0 : 1; int z = has_view && vw->set_layers ? vw->min_layer : 0;
+        k.type = VK_IMAGE_VIEW_TYPE_2D; k.layer0 = z < (int)dz ? z : (int)dz - 1; k.nlayers = 1;
+    }
     k.aspect = vf->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : vf->stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
     if (attach) k.aspect = vk_tex_aspect(v);
     if (!attach) {
@@ -710,3 +717,4 @@ VkSampler vk_sampler_id(int id) {
     samp_par p; if (!vk_samp_registry_get(id, &p)) return VK_NULL_HANDLE;
     s = vk_sampler(&p); atomic_store_explicit(&g_samp_of[id], s, memory_order_relaxed); return s;
 }
+int vk_tex_is3d(vtex *v) { return v && v->type == VK_IMAGE_TYPE_3D; }
