@@ -276,6 +276,7 @@ static void output_open(Mixer *m, int rate) {
         fprintf(stderr, "[totk-audio] TOTK_AUDIO_OFF: mixing without an output device (%d channels)\n", m->channels);
         return;
     }
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");   /* SDL's SIGTERM handler only queues a quit event: headless, nothing reads it and the process ignored SIGTERM */
     if (!SDL_WasInit(SDL_INIT_AUDIO) && !SDL_InitSubSystem(SDL_INIT_AUDIO)) {
         m->channels = 2; fprintf(stderr, "[totk-audio] 【红】SDL audio: %s: mixing without sound\n", SDL_GetError()); return;
     }

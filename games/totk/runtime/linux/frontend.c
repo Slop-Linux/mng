@@ -106,6 +106,7 @@ void runtime_front_run(void (*callback)(void)) {
     runtime_gamepad_start();
 #ifdef VK_BACKEND
     if (!getenv("TOTK_HEADLESS")) {
+        SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");   /* SIGTERM ends the process as without SDL */
         if (!SDL_Init(SDL_INIT_VIDEO)) runtime_fail("SDL video");
         int w = 1920, h = 1080; const char *e = getenv("TOTK_WINDOW_SIZE"); if (e) sscanf(e, "%dx%d", &w, &h);
         vk_sdl_window = SDL_CreateWindow("Breath of the Wild — Linux", w, h, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);   /* buffers at the output's pixel size (fractional scale) */
