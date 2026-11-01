@@ -1213,7 +1213,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     g_frame_passes = g_frame_draws = 0; pt_frame(g_presents);
     return g_presents;
 }
-void mtl_init(void) { vk_init(); }
+void mtl_init(void) { vk_init(); void runtime_audio_hold(int); runtime_audio_hold(0); }   /* audio_mixer.c holds the sound until nvn_mtl.m warm_start ends its warm-up; this backend has none */
 void mtl_stats(uint64_t *passes, uint64_t *draws) { *passes = g_passes; *draws = g_draws; }
 void mtl_wb_fence_done(void) {}
 void mtl_prog_release(prog_t *p) { (void)p; }
