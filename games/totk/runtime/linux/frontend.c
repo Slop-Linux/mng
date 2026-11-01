@@ -108,7 +108,7 @@ void runtime_front_run(void (*callback)(void)) {
     if (!getenv("TOTK_HEADLESS")) {
         if (!SDL_Init(SDL_INIT_VIDEO)) runtime_fail("SDL video");
         int w = 1920, h = 1080; const char *e = getenv("TOTK_WINDOW_SIZE"); if (e) sscanf(e, "%dx%d", &w, &h);
-        vk_sdl_window = SDL_CreateWindow("Breath of the Wild — Linux", w, h, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+        vk_sdl_window = SDL_CreateWindow("Breath of the Wild — Linux", w, h, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);   /* buffers at the output's pixel size (fractional scale) */
         if (!vk_sdl_window) { fprintf(stderr, "[totk] SDL window: %s\n", SDL_GetError()); runtime_fail("window"); }
         pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 64u << 20);
         pthread_t th; if (pthread_create(&th, &a, game_thread, (void *)callback)) runtime_fail("game thread");
@@ -116,6 +116,7 @@ void runtime_front_run(void (*callback)(void)) {
             SDL_Event ev;
             if (!SDL_WaitEventTimeout(&ev, 100)) continue;
             if (ev.type == SDL_EVENT_QUIT) { fprintf(stderr, "[totk] window closed\n"); _exit(0); }
+            if (ev.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) { extern _Atomic int vk_window_resized; atomic_store(&vk_window_resized, 1); }   /* the swapchain follows at the next present (vk_dev.c present_now) */
             if ((ev.type == SDL_EVENT_KEY_DOWN || ev.type == SDL_EVENT_KEY_UP) && !ev.key.repeat) { int k = mac_key(ev.key.scancode); if (k >= 0) runtime_input_key((unsigned)k, ev.type == SDL_EVENT_KEY_DOWN); }
         }
     }
