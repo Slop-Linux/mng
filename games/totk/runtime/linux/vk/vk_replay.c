@@ -51,7 +51,7 @@ static int depth_has_stencil(void) { return g_pdepth.v && (vk_tex_aspect(g_pdept
 /* ---------- occlusion queries (NVN_COUNTER_TYPE_SAMPLES_PASSED): a counter ResetCounter zeroes, every draw adds to and
    ReportCounter writes on completion. While counting each pass segment has a query slot; a report sums the slots since the
    reset (nvn_mtl.m's visibility slots) ---------- */
-static int g_q_counting, g_q_skipped, g_q_draws; static int64_t g_q_cur = -1; static uint32_t *g_q_list; static int g_q_n, g_q_cap;
+static int g_q_counting, g_q_skipped, g_q_draws, g_q_open; static int64_t g_q_cur = -1;   /* g_q_open: a reset not yet reported */ static uint32_t *g_q_list; static int g_q_n, g_q_cap;
 static int g_pass_recorded;   /* the open pass has been begun on the command buffer (pass_record) */
 static int g_pass_nodepth, g_force_depth; static uint64_t g_nodepth_passes;   /* the recorded pass left its depth attachment out (pass_record) */
 static void q_begin(void) { if (g_q_counting && g_q_cur < 0 && g_pass_recorded) { g_q_cur = vk_query_alloc(); vkCmdBeginQuery(vk_cb(), vk_query_pool(), (uint32_t)g_q_cur, 0); } }
@@ -61,11 +61,11 @@ static void q_end(int keep) {
     if (keep) { if (g_q_n == g_q_cap) { g_q_cap = g_q_cap ? 2 * g_q_cap : 64; g_q_list = realloc(g_q_list, g_q_cap * sizeof *g_q_list); } g_q_list[g_q_n++] = (uint32_t)g_q_cur; }
     g_q_cur = -1;
 }
-static void q_reset(int pass_open) { q_end(0); g_q_n = 0; g_q_skipped = 0; g_q_draws = 0; g_q_counting = 1; if (pass_open) q_begin(); }
+static void q_reset(int pass_open) { q_end(0); g_q_n = 0; g_q_skipped = 0; g_q_draws = 0; g_q_counting = 1; g_q_open = 1; if (pass_open) q_begin(); }
 static void q_report(uint64_t addr, int pass_open) {
     q_end(1);
     vk_qlist *l = malloc(sizeof *l + (g_q_n ? g_q_n : 1) * sizeof(uint32_t)); l->n = g_q_n; l->skipped = g_q_skipped; l->draws = g_q_draws; memcpy(l->slot, g_q_list, g_q_n * sizeof(uint32_t));
-    vk_sub_post_samples(addr, l);
+    vk_sub_post_samples(addr, l); g_q_open = 0;
     if (pass_open) q_begin();
 }
 
@@ -871,7 +871,7 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
         }
     }
     g_q_draws += g_q_cur >= 0;
-    if (g_q_cur >= 0) { static int log = -1, n; if (log < 0) log = getenv("TOTK_VK_QUERY_LOG") != NULL;
+    if (g_q_cur >= 0 && g_q_open) { static int log = -1, n; if (log < 0) log = getenv("TOTK_VK_QUERY_LOG") != NULL;
         if (log && n++ < 40) VKLOG("counted draw: pass %ux%u colour %d depth %d (nodepth %d), colour mask %#x, depth test %d write %d func %d, stencil %d, cull %d, raster discard %d, vp %.0fx%.0f, prim %d count %d", g_pw, g_ph, g_pcount, g_pdepth.v != NULL, g_pass_nodepth,
             S.chmask.mask, S.ds.dt, S.ds.dw, S.ds.df, S.ds.st, S.poly.cull, S.raster_discard, S.nvp ? S.vp[0][2] : 0.f, S.nvp ? S.vp[0][3] : 0.f, d ? d->prim : di->prim, d ? d->count : di->count); }
     g_draws++; g_frame_draws++; if (g_pt_on && g_pt_n < PT_MAX) { g_pt[g_pt_n].draws++; pp_note(vs, fs); }
@@ -1141,7 +1141,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
        swapchain nothing else holds the game thread back, and a sync wait of the game (every 10 frames in the Shrine) then
        waited for the whole backlog */
     { static int ahead = -1; static uint64_t fence[16]; if (ahead < 0) { const char *e = getenv("TOTK_VK_FRAMES_AHEAD"); ahead = e ? atoi(e) : 2; if (ahead > 15) ahead = 15; }
-      if (ahead > 0) { uint64_t f = fence[(g_presents + 16 - (uint64_t)ahead) % 16]; if (f) mtl_wait(f, UINT64_MAX); fence[g_presents % 16] = mtl_last_fence(); } }
+      if (ahead > 0) { uint64_t f = fence[(g_presents + 16 - (uint64_t)ahead) % 16]; if (f && !mtl_wait(f, 0)) { int a_ = runtime_core_away(); mtl_wait(f, UINT64_MAX); runtime_core_back(&a_); } fence[g_presents % 16] = mtl_last_fence(); } }
     if (t) {
         vtex *v = vk_tex_get(t);
         if (v) { vk_tex_mark_read(v); uint32_t w, h; VkFormat f; vk_tex_dims(v, &w, &h, &f); vk_present_image(vk_tex_image(v), w, h, f); }

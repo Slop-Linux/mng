@@ -233,6 +233,9 @@ void vk_replay_ns(uint64_t ns) { g_wt[3] += ns; }
 /* GPU time: a timestamp at the start and the end of every submission's main command buffer */
 #define TS_RING 512   /* timestamps: (fence % TS_RING, command buffer pair) -> begin / end */
 #define TS_SLOT(s, i) ((uint32_t)(((s)->fence % TS_RING) * 64 + (i)) * 2)
+/* TOTK_VK_GPU_TIMES: 0 none, 1 (default) a timestamp at the start and the end of each submission, 2 around every command
+   buffer pair (the ICD makes a timestamp a barrier plus a compute command: per pair it costs kicks and overlapping spans add up) */
+static int gpu_times(void) { static int m = -1; if (m < 0) { const char *e = getenv("TOTK_VK_GPU_TIMES"); m = e ? atoi(e) : 1; } return m; }
 static VkQueryPool g_ts; static _Atomic uint64_t g_gpu_ns, g_submit_ns, g_end_ns, g_begin_ns, g_ncb_sub;   /* wall time inside vkQueueSubmit2 / vkEndCommandBuffer / vkBeginCommandBuffer (both of a pair), command buffer pairs submitted */
 void vk_cb_stats(uint64_t *begin_ns, uint64_t *pairs) { *begin_ns = atomic_load(&g_begin_ns); *pairs = atomic_load(&g_ncb_sub); }
 uint64_t vk_end_ns(void) { return atomic_load(&g_end_ns); }
@@ -279,10 +282,11 @@ static void cb_pair_begin(sub_t *s, int i) {
     } else vkResetCommandPool(V.dev, s->cb[i].pool, 0);
     uint64_t b0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     s->cb[i].up_used = 0; cb_begin(s->cb[i].up); cb_begin(s->cb[i].main); atomic_fetch_add(&g_begin_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - b0);
-    vkCmdWriteTimestamp2(s->cb[i].main, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g_ts, TS_SLOT(s, i));
+    if (gpu_times() == 2 || (gpu_times() == 1 && i == 0)) vkCmdWriteTimestamp2(s->cb[i].main, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g_ts, TS_SLOT(s, i));
 }
-static void cb_pair_close(sub_t *s, int i) {   /* uploads first, visible to everything after */
-    vkCmdWriteTimestamp2(s->cb[i].main, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_ts, TS_SLOT(s, i) + 1);
+static void cb_pair_close(sub_t *s, int i, int last) {   /* uploads first, visible to everything after */
+    if (gpu_times() == 2) vkCmdWriteTimestamp2(s->cb[i].main, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_ts, TS_SLOT(s, i) + 1);
+    else if (gpu_times() == 1 && last) vkCmdWriteTimestamp2(s->cb[i].main, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_ts, TS_SLOT(s, 0) + 1);
     if (!s->cb[i].up_used) return;
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
         .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
@@ -364,7 +368,7 @@ static void *done_thread(void *arg) {
                 uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec);
             }
         }
-        for (int i = 0; i < s->ncb; i++) { uint64_t t[2]; uint32_t q = TS_SLOT(s, i);
+        for (int i = 0; i < (gpu_times() == 2 ? s->ncb : gpu_times() ? 1 : 0); i++) { uint64_t t[2]; uint32_t q = TS_SLOT(s, i);
           if (vkGetQueryPoolResults(V.dev, g_ts, q, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0]) atomic_fetch_add(&g_gpu_ns, (uint64_t)((t[1] - t[0]) * V.props.limits.timestampPeriod));
           vkResetQueryPool(V.dev, g_ts, q, 2); }
         for (int i = 0; i < s->nfrees; i++) s->frees[i].fn(s->frees[i].p);
@@ -437,7 +441,7 @@ static void jobs_drain(void) {   /* every queued submission and present has reac
    goes on in the next pair; the last part signals the submission's fence */
 void vk_sub_cut(void) {
     sub_t *s = g_open; if (!s || s->ncb == 64) return;
-    cb_pair_close(s, s->ncb - 1); job_push((job_t){.kind = 1, .s = s, .cb = s->ncb - 1, .last = 0});
+    cb_pair_close(s, s->ncb - 1, 0); job_push((job_t){.kind = 1, .s = s, .cb = s->ncb - 1, .last = 0});
     cb_pair_begin(s, s->ncb++);
 }
 uint64_t vk_sub_submit(void) {
@@ -445,7 +449,7 @@ uint64_t vk_sub_submit(void) {
     vk_replay_end_pass();
     { void vk_tex_stage_rendered(VkCommandBuffer cb, uint64_t fence); vk_tex_stage_rendered(vk_cb(), g_open->fence); }
     sub_t *s = g_open; g_open = NULL;
-    int i = s->ncb - 1; cb_pair_close(s, i);
+    int i = s->ncb - 1; cb_pair_close(s, i, 1);
     atomic_store(&g_submitted, s->fence);
     job_push((job_t){.kind = 1, .s = s, .cb = i, .last = 1});
     return s->fence;
