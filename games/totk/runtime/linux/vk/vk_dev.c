@@ -584,6 +584,8 @@ static void present_now(VkImage img, uint32_t w, uint32_t h, VkFormat fmt) {
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .waitSemaphoreCount = 1, .pWaitSemaphores = &g_acq[i], .pWaitDstStageMask = &ws,
         .commandBufferCount = 1, .pCommandBuffers = &cb, .signalSemaphoreCount = 1, .pSignalSemaphores = &g_rel[i]};
     pthread_mutex_lock(&g_queue_mu); VKCHECK(vkQueueSubmit(V.queue, 1, &si, g_pfence[i]));
+    static int waitidle = -1; if (waitidle < 0) { const char *e = getenv("TOTK_VK_PRESENT_WAITIDLE"); waitidle = e && atoi(e) == 1; }
+    if (waitidle) VKCHECK(vkQueueWaitIdle(V.queue));   /* TOTK_VK_PRESENT_WAITIDLE=1 (diagnostic): the blit has finished before the present */
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &g_rel[i], .swapchainCount = 1, .pSwapchains = &g_swap, .pImageIndices = &idx};
     r = vkQueuePresentKHR(V.queue, &pi); pthread_mutex_unlock(&g_queue_mu);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) { vkDeviceWaitIdle(V.dev); vk_window_open(); }
