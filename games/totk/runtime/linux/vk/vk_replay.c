@@ -150,9 +150,9 @@ static void end_pass(int why) {
     q_end(1);
     vkCmdEndRendering(vk_cb()); g_pass_open = 0; g_pass_recorded = 0; pt_close(why);
     full_barrier();
-    /* TOTK_VK_CHUNK_DRAWS=<first>[/<next>] (default 250; 0 off): the submission so far goes to the GPU (vk_sub_cut) once its
-       first part has <first> draws, then every <next> (MNG on macOS: 60/75) */
-    static long first = -1, next; if (first < 0) { const char *e = getenv("TOTK_VK_CHUNK_DRAWS"); first = next = e ? atol(e) : 250; if (e && strchr(e, '/')) next = atol(strchr(e, '/') + 1); }
+    /* TOTK_VK_CHUNK_DRAWS=<first>[/<next>] (default 30/40 as MNG on macOS; 0 off): the submission so far goes to the GPU (vk_sub_cut) once its
+       first part has <first> draws, then every <next> */
+    static long first = -1, next; if (first < 0) { const char *e = getenv("TOTK_VK_CHUNK_DRAWS"); first = e ? atol(e) : 30; next = e ? first : 40; if (e && strchr(e, '/')) next = atol(strchr(e, '/') + 1); }
     if (why && first && g_draws - g_cut_at >= (uint64_t)(g_ncut ? next : first)) { void vk_sub_cut(void); vk_sub_cut(); g_cut_at = g_draws; g_ncut++; g_cb_gen++; }
 }
 void vk_replay_end_pass(void) { end_pass(0); pclr_flush(); }
