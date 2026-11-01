@@ -19,7 +19,7 @@
 
 /* ---------- vk_dev.c ---------- */
 typedef struct {
-    VkInstance inst; VkPhysicalDevice phys; VkDevice dev; VkQueue queue; uint32_t qfam;
+    VkInstance inst; VkPhysicalDevice phys; VkDevice dev; VkQueue queue, queue2; uint32_t qfam;   /* queue2: VK_NULL_HANDLE when the family has one queue */
     VkPhysicalDeviceProperties props; VkPhysicalDeviceMemoryProperties mem;
     VkSemaphore timeline; VkCommandPool cmdpool;
     VkDescriptorSetLayout empty_layout;

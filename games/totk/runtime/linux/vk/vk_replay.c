@@ -185,6 +185,32 @@ static void dump_land(void *p) {
     if (f) fclose(f);
     vkDestroyBuffer(V.dev, d->b, NULL); vkFreeMemory(V.dev, d->m, NULL); free(d);
 }
+static int g_probe_x = -1, g_probe_y, g_probe_w, g_probe_h; static uint64_t g_probe_n;
+static int probe_on(void) { static int init; if (!init) { init = 1; const char *e = getenv("TOTK_VK_PROBE"); if (e) sscanf(e, "%d,%d,%dx%d", &g_probe_x, &g_probe_y, &g_probe_w, &g_probe_h); } return g_probe_x >= 0; }
+typedef struct { VkBuffer b; VkDeviceMemory m; uint64_t n; int na; VkFormat f[8]; } probe_t;
+static void probe_land(void *p) {
+    probe_t *q = p; uint32_t *c; if (vkMapMemory(V.dev, q->m, 0, VK_WHOLE_SIZE, 0, (void **)&c) == VK_SUCCESS) {
+        char s[400]; int o = 0; for (int i = 0; i < q->na; i++) o += snprintf(s + o, sizeof s - o, " a%d(vk%d) %08x", i, q->f[i], c[i]);
+        VKLOG("probe: draw %llu%s", (unsigned long long)q->n, s); vkUnmapMemory(V.dev, q->m); }
+    vkDestroyBuffer(V.dev, q->b, NULL); vkFreeMemory(V.dev, q->m, NULL); free(q);
+}
+static void end_pass(int why);
+static void probe_draw(void) {
+    if ((int)g_pw != g_probe_w || (int)g_ph != g_probe_h) return;
+    uint64_t n = g_probe_n++;
+    end_pass(7);
+    probe_t *q = calloc(1, sizeof *q); q->n = n;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 64, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VKCHECK(vkCreateBuffer(V.dev, &bi, NULL, &q->b)); VkMemoryRequirements rq; vkGetBufferMemoryRequirements(V.dev, q->b, &rq);
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = rq.size, .memoryTypeIndex = vk_memtype(rq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
+    VKCHECK(vkAllocateMemory(V.dev, &ai, NULL, &q->m)); VKCHECK(vkBindBufferMemory(V.dev, q->b, q->m, 0));
+    for (int i = 0; i < g_pcount && i < 8; i++) { vtex *v = g_patt[i].v; if (!v) continue; uint32_t w, h; VkFormat f; vk_tex_dims(v, &w, &h, &f);
+        if (f != VK_FORMAT_R8G8B8A8_UNORM && f != VK_FORMAT_R8G8B8A8_SRGB && f != VK_FORMAT_B10G11R11_UFLOAT_PACK32 && f != VK_FORMAT_A2B10G10R10_UNORM_PACK32 && f != VK_FORMAT_R32_SFLOAT && f != VK_FORMAT_R16G16_SFLOAT && f != VK_FORMAT_R16G16_UNORM) continue;
+        VkBufferImageCopy r = {.bufferOffset = 4 * (VkDeviceSize)i, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)g_patt[i].level, vk_tex_is3d(v) ? 0 : (uint32_t)g_patt[i].layer, 1},
+            .imageOffset = {g_probe_x, g_probe_y, 0}, .imageExtent = {1, 1, 1}};
+        vkCmdCopyImageToBuffer(vk_cb(), vk_tex_image(v), VK_IMAGE_LAYOUT_GENERAL, q->b, 1, &r); q->f[i] = f; q->na = i + 1; }
+    full_barrier(); vk_defer_free(probe_land, q);
+}
 static void dump_attachments(void) {
     static const char *dir; static long left; if (g_dump_first == -2) { const char *e = getenv("TOTK_VK_DUMP"); g_dump_first = -1;
         if (e && strchr(e, ':')) { static char d_[200]; snprintf(d_, sizeof d_, "%.*s", (int)(strchr(e, ':') - e), e); dir = d_; g_dump_first = atol(strchr(e, ':') + 1); left = strchr(strchr(e, ':') + 1, ':') ? atol(strchr(strchr(e, ':') + 1, ':') + 1) : 50;
@@ -1007,10 +1033,13 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
             uint32_t h = packed_handle(1, b->handle); tex_t t; view_t vw; int hv;
             if ((h & 0xfffff) && vk_tex_registry_get((int)(h & 0xfffff), &t, &vw, &hv)) o += snprintf(tx + o, sizeof tx - o, " b%u:s%llu/%#x/%ux%u/swz%d%d%d%d%s", b->binding, (unsigned long long)t.serial, hv && vw.set_format ? vw.format : t.d.format, t.d.width, t.d.height, hv && vw.set_swizzle ? vw.swz[0] : t.d.swizzle_r, hv && vw.set_swizzle ? vw.swz[1] : t.d.swizzle_g, hv && vw.set_swizzle ? vw.swz[2] : t.d.swizzle_b, hv && vw.set_swizzle ? vw.swz[3] : t.d.swizzle_a, t.mem ? "" : "/nomem"); }
         const blend_st *bl = &S.blend[0]; uint32_t aw_, ah_; VkFormat af_ = 0; if (g_patt[0].v) vk_tex_dims(g_patt[0].v, &aw_, &ah_, &af_);
-        VKLOG("draw: pass %ux%u att0 %p fmt %d, vs %s fs %s, blend en %d rgb %d/%d/%d a %d/%d/%d mask %#x, vp %.0f,%.0f %.0fx%.0f, sc %d %d,%d %dx%d, depth t%d w%d, stencil %d, cull %d, prim %d count %d inst %d, tex%s",
-              g_pw, g_ph, (void *)g_patt[0].v, (int)af_, vs ? vs->key : "-", fs ? fs->key : "-", S.color.blend_en & 1, bl->src_rgb, bl->dst_rgb, bl->eq_rgb, bl->src_a, bl->dst_a, bl->eq_a, S.chmask.mask & 0xf,
+        VKLOG("draw #%llu: pass %ux%u att0 %p fmt %d, vs %s fs %s, blend en %d rgb %d/%d/%d a %d/%d/%d mask %#x, vp %.0f,%.0f %.0fx%.0f, sc %d %d,%d %dx%d, depth t%d w%d, stencil %d, cull %d, prim %d count %d inst %d, tex%s",
+              (unsigned long long)g_probe_n, g_pw, g_ph, (void *)g_patt[0].v, (int)af_, vs ? vs->key : "-", fs ? fs->key : "-", S.color.blend_en & 1, bl->src_rgb, bl->dst_rgb, bl->eq_rgb, bl->src_a, bl->dst_a, bl->eq_a, S.chmask.mask & 0xf,
               S.nvp ? S.vp[0][0] : 0, S.nvp ? S.vp[0][1] : 0, S.nvp ? S.vp[0][2] : 0, S.nvp ? S.vp[0][3] : 0, S.has_sc, S.sc.x, S.sc.y, S.sc.w, S.sc.h, S.ds.dt, S.ds.dw, S.ds.st, S.poly.cull, prim, d ? d->count : di->count, inst, tx);
     }
+    /* TOTK_VK_PROBE=<x>,<y>,<w>x<h> (with TOTK_VK_DUMP, its frame): after every draw into a pass of that size the pass is ended
+       and the texel (x, y) of each colour attachment is copied out; logged per draw ("probe: draw n ...") on completion */
+    if (g_dump_first >= 0 && (long)g_presents == g_dump_first && probe_on()) probe_draw();
     { /* first uses of the ICD's link key (driver object.rs graphics(): shader objects, topology, blend / masks, attachment formats, vertex input) */
       VkPrimitiveTopology t_ = topology(prim); uint64_t k_[7] = {(uint64_t)p->sh[0], (uint64_t)sh[1], (uint64_t)t_, g_vi_hash, g_blend_hash, g_rt_hash, (uint64_t)(S.ms.a2c && S.ms.enable)};
       uint64_t h_ = 1469598103934665603ull; const uint8_t *q_ = (const uint8_t *)k_; for (size_t i = 0; i < sizeof k_; i++) h_ = (h_ ^ q_[i]) * 1099511628211ull;
