@@ -648,16 +648,29 @@ static VkStencilOp sop(int o) {
 }
 static int winding_flip(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_VK_WINDING_FLIP"); v = e && atoi(e); } return v; }
 
+/* state set in the command buffer being recorded: a command is emitted only when its arguments differ from the last ones
+   (by a hash of them), so the ICD encodes no repeated state */
+enum { D_VP, D_SC, D_RD, D_CULL, D_FF, D_PM, D_BIASEN, D_BIAS, D_LW, D_DT, D_DW, D_DCMP, D_DBT, D_ST, D_SOPF, D_SOPB, D_SCM, D_SWM, D_SREF,
+       D_CLAMP, D_RS, D_SM, D_A2C, D_LOE, D_BC, D_PR, D_CLIP, D_BEN, D_BEQ, D_WM, D_TOPO, D_SHADERS, D_SETS, D_IB, D_COUNT };
+static uint64_t g_dyn_hash[D_COUNT], g_dyn_cb;
+static uint64_t g_dyn_emitted, g_dyn_skipped;
+static int dyn_changed(int id, const void *p, size_t n) {
+    if (g_dyn_cb != g_cb_gen) { memset(g_dyn_hash, 0, sizeof g_dyn_hash); g_dyn_cb = g_cb_gen; }
+    uint64_t h = 1469598103934665603ull; const uint8_t *b = p; for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ull; h |= 1;
+    if (g_dyn_hash[id] == h) { g_dyn_skipped++; return 0; }
+    g_dyn_hash[id] = h; g_dyn_emitted++; return 1;
+}
 static void set_dynamic(VkCommandBuffer cb) {
     /* viewports: NVN's upper-left origin with the y axis as Metal's (a negative-height Vulkan viewport) */
     VkViewport vp[16]; int nvp = S.nvp ? S.nvp : 1;
+    memset(vp, 0, sizeof vp);
     for (int i = 0; i < nvp; i++) {
         float x = S.nvp ? S.vp[i][0] : 0, y = S.nvp ? S.vp[i][1] : 0, w = S.nvp ? S.vp[i][2] : (float)g_pw, h = S.nvp ? S.vp[i][3] : (float)g_ph;
         if (w == 0) w = 1; if (h == 0) h = 1;
         vp[i] = (VkViewport){x, y + h, w, -h, S.dr[0], S.dr[1]};
         if (vp[i].minDepth < 0) vp[i].minDepth = 0; if (vp[i].minDepth > 1) vp[i].minDepth = 1; if (vp[i].maxDepth < 0) vp[i].maxDepth = 0; if (vp[i].maxDepth > 1) vp[i].maxDepth = 1;
     }
-    vkCmdSetViewportWithCount(cb, (uint32_t)nvp, vp);
+    if (dyn_changed(D_VP, vp, sizeof(VkViewport) * nvp)) vkCmdSetViewportWithCount(cb, (uint32_t)nvp, vp);
     VkRect2D sc[16];
     for (int i = 0; i < nvp; i++) {
         int32_t x0 = 0, y0 = 0, x1 = (int32_t)g_pw, y1 = (int32_t)g_ph;
@@ -665,31 +678,35 @@ static void set_dynamic(VkCommandBuffer cb) {
         if (x1 < x0) x1 = x0; if (y1 < y0) y1 = y0;
         sc[i] = (VkRect2D){{x0, y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
     }
-    vkCmdSetScissorWithCount(cb, (uint32_t)nvp, sc);
-    vkCmdSetRasterizerDiscardEnable(cb, S.raster_discard);
-    vkCmdSetCullMode(cb, S.poly.cull == NVN_FACE_FRONT ? VK_CULL_MODE_FRONT_BIT : S.poly.cull == NVN_FACE_BACK ? VK_CULL_MODE_BACK_BIT : S.poly.cull == NVN_FACE_FRONT_AND_BACK ? VK_CULL_MODE_FRONT_AND_BACK : VK_CULL_MODE_NONE);
-    vkCmdSetFrontFace(cb, ((S.poly.front == NVN_FRONT_FACE_CCW) != winding_flip()) ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE);
-    V.CmdSetPolygonModeEXT(cb, S.poly.mode == NVN_POLYGON_MODE_LINE ? VK_POLYGON_MODE_LINE : S.poly.mode == NVN_POLYGON_MODE_POINT ? VK_POLYGON_MODE_POINT : VK_POLYGON_MODE_FILL);
-    int bias = (S.poly.offset_en & NVN_POLYGON_OFFSET_ENABLE_FILL) != 0;
-    vkCmdSetDepthBiasEnable(cb, bias); vkCmdSetDepthBias(cb, S.po.units, S.po.clamp, S.po.factor);
-    vkCmdSetLineWidth(cb, 1.0f);
+    if (dyn_changed(D_SC, sc, sizeof(VkRect2D) * nvp)) vkCmdSetScissorWithCount(cb, (uint32_t)nvp, sc);
+#define ONE(id, T, val, call) do { T v_ = (val); if (dyn_changed(id, &v_, sizeof v_)) call; } while (0)
+    ONE(D_RD, VkBool32, S.raster_discard, vkCmdSetRasterizerDiscardEnable(cb, v_));
+    ONE(D_CULL, VkCullModeFlags, S.poly.cull == NVN_FACE_FRONT ? VK_CULL_MODE_FRONT_BIT : S.poly.cull == NVN_FACE_BACK ? VK_CULL_MODE_BACK_BIT : S.poly.cull == NVN_FACE_FRONT_AND_BACK ? VK_CULL_MODE_FRONT_AND_BACK : VK_CULL_MODE_NONE, vkCmdSetCullMode(cb, v_));
+    ONE(D_FF, VkFrontFace, ((S.poly.front == NVN_FRONT_FACE_CCW) != winding_flip()) ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE, vkCmdSetFrontFace(cb, v_));
+    ONE(D_PM, VkPolygonMode, S.poly.mode == NVN_POLYGON_MODE_LINE ? VK_POLYGON_MODE_LINE : S.poly.mode == NVN_POLYGON_MODE_POINT ? VK_POLYGON_MODE_POINT : VK_POLYGON_MODE_FILL, V.CmdSetPolygonModeEXT(cb, v_));
+    ONE(D_BIASEN, VkBool32, (S.poly.offset_en & NVN_POLYGON_OFFSET_ENABLE_FILL) != 0, vkCmdSetDepthBiasEnable(cb, v_));
+    { float bias[3] = {S.po.units, S.po.clamp, S.po.factor}; if (dyn_changed(D_BIAS, bias, sizeof bias)) vkCmdSetDepthBias(cb, bias[0], bias[1], bias[2]); }
+    ONE(D_LW, float, 1.0f, vkCmdSetLineWidth(cb, v_));
     int has_d = !g_pass_nodepth && g_pdepth.v && (vk_tex_aspect(g_pdepth.v) & VK_IMAGE_ASPECT_DEPTH_BIT), has_s = !g_pass_nodepth && depth_has_stencil();
-    vkCmdSetDepthTestEnable(cb, has_d && S.ds.dt); vkCmdSetDepthWriteEnable(cb, has_d && S.ds.dw); vkCmdSetDepthCompareOp(cb, cmp(S.ds.df));
-    vkCmdSetDepthBoundsTestEnable(cb, 0);
-    vkCmdSetStencilTestEnable(cb, has_s && S.ds.st);
-    vkCmdSetStencilOp(cb, VK_STENCIL_FACE_FRONT_BIT, sop(S.ds.fail_f), sop(S.ds.zpass_f), sop(S.ds.zfail_f), cmp(S.ds.sf_f));
-    vkCmdSetStencilOp(cb, VK_STENCIL_FACE_BACK_BIT, sop(S.ds.fail_b), sop(S.ds.zpass_b), sop(S.ds.zfail_b), cmp(S.ds.sf_b));
-    vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)S.st_vmask[0]); vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_BACK_BIT, (uint32_t)S.st_vmask[1]);
-    vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)S.st_wmask[0]); vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_BACK_BIT, (uint32_t)S.st_wmask[1]);
-    vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)S.st_ref[0]); vkCmdSetStencilReference(cb, VK_STENCIL_FACE_BACK_BIT, (uint32_t)S.st_ref[1]);
-    V.CmdSetDepthClampEnableEXT(cb, S.depth_clamp);
-    V.CmdSetRasterizationSamplesEXT(cb, VK_SAMPLE_COUNT_1_BIT);
-    VkSampleMask sm = ~0u; V.CmdSetSampleMaskEXT(cb, VK_SAMPLE_COUNT_1_BIT, &sm);
-    V.CmdSetAlphaToCoverageEnableEXT(cb, S.ms.a2c && S.ms.enable);
-    V.CmdSetLogicOpEnableEXT(cb, 0);
-    vkCmdSetBlendConstants(cb, S.blend_color);
-    vkCmdSetPrimitiveRestartEnable(cb, 0);
-    if (V.CmdSetDepthClipEnableEXT) V.CmdSetDepthClipEnableEXT(cb, !S.depth_clamp);
+    ONE(D_DT, VkBool32, has_d && S.ds.dt, vkCmdSetDepthTestEnable(cb, v_));
+    ONE(D_DW, VkBool32, has_d && S.ds.dw, vkCmdSetDepthWriteEnable(cb, v_));
+    ONE(D_DCMP, VkCompareOp, cmp(S.ds.df), vkCmdSetDepthCompareOp(cb, v_));
+    ONE(D_DBT, VkBool32, 0, vkCmdSetDepthBoundsTestEnable(cb, v_));
+    ONE(D_ST, VkBool32, has_s && S.ds.st, vkCmdSetStencilTestEnable(cb, v_));
+    { VkStencilOp o[4] = {sop(S.ds.fail_f), sop(S.ds.zpass_f), sop(S.ds.zfail_f), (VkStencilOp)cmp(S.ds.sf_f)}; if (dyn_changed(D_SOPF, o, sizeof o)) vkCmdSetStencilOp(cb, VK_STENCIL_FACE_FRONT_BIT, o[0], o[1], o[2], (VkCompareOp)o[3]); }
+    { VkStencilOp o[4] = {sop(S.ds.fail_b), sop(S.ds.zpass_b), sop(S.ds.zfail_b), (VkStencilOp)cmp(S.ds.sf_b)}; if (dyn_changed(D_SOPB, o, sizeof o)) vkCmdSetStencilOp(cb, VK_STENCIL_FACE_BACK_BIT, o[0], o[1], o[2], (VkCompareOp)o[3]); }
+    if (dyn_changed(D_SCM, S.st_vmask, sizeof S.st_vmask)) { vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)S.st_vmask[0]); vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_BACK_BIT, (uint32_t)S.st_vmask[1]); }
+    if (dyn_changed(D_SWM, S.st_wmask, sizeof S.st_wmask)) { vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)S.st_wmask[0]); vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_BACK_BIT, (uint32_t)S.st_wmask[1]); }
+    if (dyn_changed(D_SREF, S.st_ref, sizeof S.st_ref)) { vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)S.st_ref[0]); vkCmdSetStencilReference(cb, VK_STENCIL_FACE_BACK_BIT, (uint32_t)S.st_ref[1]); }
+    ONE(D_CLAMP, VkBool32, S.depth_clamp, V.CmdSetDepthClampEnableEXT(cb, v_));
+    ONE(D_RS, VkSampleCountFlagBits, VK_SAMPLE_COUNT_1_BIT, V.CmdSetRasterizationSamplesEXT(cb, v_));
+    { VkSampleMask sm = ~0u; if (dyn_changed(D_SM, &sm, sizeof sm)) V.CmdSetSampleMaskEXT(cb, VK_SAMPLE_COUNT_1_BIT, &sm); }
+    ONE(D_A2C, VkBool32, S.ms.a2c && S.ms.enable, V.CmdSetAlphaToCoverageEnableEXT(cb, v_));
+    ONE(D_LOE, VkBool32, 0, V.CmdSetLogicOpEnableEXT(cb, v_));
+    if (dyn_changed(D_BC, S.blend_color, sizeof S.blend_color)) vkCmdSetBlendConstants(cb, S.blend_color);
+    ONE(D_PR, VkBool32, 0, vkCmdSetPrimitiveRestartEnable(cb, v_));
+    if (V.CmdSetDepthClipEnableEXT) ONE(D_CLIP, VkBool32, !S.depth_clamp, V.CmdSetDepthClipEnableEXT(cb, v_));
+#undef ONE
     int n = g_pcount ? g_pcount : 1;
     VkBool32 en[8]; VkColorBlendEquationEXT eq[8]; VkColorComponentFlags wm[8];
     for (int i = 0; i < n; i++) {
@@ -699,7 +716,9 @@ static void set_dynamic(VkCommandBuffer cb) {
         wm[i] = (S.chmask.mask >> (4 * i)) & 0xf;
         if (g_pslot[i] < 0 || !g_patt[i].v) { en[i] = 0; wm[i] = 0; }
     }
-    V.CmdSetColorBlendEnableEXT(cb, 0, (uint32_t)n, en); V.CmdSetColorBlendEquationEXT(cb, 0, (uint32_t)n, eq); V.CmdSetColorWriteMaskEXT(cb, 0, (uint32_t)n, wm);
+    if (dyn_changed(D_BEN, en, n * sizeof *en)) V.CmdSetColorBlendEnableEXT(cb, 0, (uint32_t)n, en);
+    if (dyn_changed(D_BEQ, eq, n * sizeof *eq)) V.CmdSetColorBlendEquationEXT(cb, 0, (uint32_t)n, eq);
+    if (dyn_changed(D_WM, wm, n * sizeof *wm)) V.CmdSetColorWriteMaskEXT(cb, 0, (uint32_t)n, wm);
 }
 static VkPrimitiveTopology topology(int prim) {
     switch (prim) {
@@ -826,8 +845,8 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
     VkShaderEXT sh[5] = {p->sh[0], fs ? p->sh[1] : VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
     int ns = 2 + ((has_tess() & 1) ? 2 : 0); if (has_tess() & 2) { stages[ns] = VK_SHADER_STAGE_GEOMETRY_BIT; sh[ns] = VK_NULL_HANDLE; ns++; }
     if (!(has_tess() & 1) && (has_tess() & 2)) { stages[2] = VK_SHADER_STAGE_GEOMETRY_BIT; }
-    V.CmdBindShadersEXT(cb, (uint32_t)ns, stages, sh);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pl, 0, 2, sets, 0, NULL);
+    if (dyn_changed(D_SHADERS, sh, sizeof sh)) V.CmdBindShadersEXT(cb, (uint32_t)ns, stages, sh);
+    { uint64_t k_[3] = {(uint64_t)p->pl, (uint64_t)sets[0], (uint64_t)sets[1]}; if (dyn_changed(D_SETS, k_, sizeof k_)) vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pl, 0, 2, sets, 0, NULL); }
     static uint64_t dyn_gen, dyn_sub, vtx_gen, vtx_sub; static vshader *vtx_vs;
     if (dyn_gen != g_gen_state || dyn_sub != g_cb_gen) { set_dynamic(cb); dyn_gen = g_gen_state; dyn_sub = g_cb_gen; }
     if (vtx_gen != g_gen_vtx || vtx_sub != g_cb_gen || vtx_vs != vs) { vertex_input(cb, vs); vtx_gen = g_gen_vtx; vtx_sub = g_cb_gen; vtx_vs = vs; }
@@ -835,16 +854,17 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
     if (prim == NVN_DRAW_PRIMITIVE_QUADS || prim == NVN_DRAW_PRIMITIVE_QUAD_STRIP) {
         VkBuffer qb; VkDeviceSize qo; int n;
         if (!quad_indices(prim, di, d ? d->first : 0, d ? d->count : di->count, &qb, &qo, &n)) return;
-        vkCmdSetPrimitiveTopology(cb, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
-        vkCmdBindIndexBuffer(cb, qb, qo, VK_INDEX_TYPE_UINT32);
+        { VkPrimitiveTopology t_ = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; if (dyn_changed(D_TOPO, &t_, sizeof t_)) vkCmdSetPrimitiveTopology(cb, t_); }
+        { uint64_t k_[3] = {(uint64_t)qb, qo, VK_INDEX_TYPE_UINT32}; if (dyn_changed(D_IB, k_, sizeof k_)) vkCmdBindIndexBuffer(cb, qb, qo, VK_INDEX_TYPE_UINT32); }
         vkCmdDrawIndexed(cb, (uint32_t)n, (uint32_t)inst, 0, di ? di->base_vertex : 0, (uint32_t)(d ? d->base_instance : di->base_instance));
     } else {
-        vkCmdSetPrimitiveTopology(cb, topology(prim));
+        { VkPrimitiveTopology t_ = topology(prim); if (dyn_changed(D_TOPO, &t_, sizeof t_)) vkCmdSetPrimitiveTopology(cb, t_); }
         if (d) vkCmdDraw(cb, (uint32_t)d->count, (uint32_t)inst, (uint32_t)d->first, (uint32_t)d->base_instance);
         else {
             VkBuffer ib; VkDeviceSize io;
             if (!vk_pool_find(di->ibuf, 1, &ib, &io)) { g_skips[4]++; return; }
-            vkCmdBindIndexBuffer(cb, ib, io, di->itype == 0 ? VK_INDEX_TYPE_UINT8_EXT : di->itype == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+            { VkIndexType t_ = di->itype == 0 ? VK_INDEX_TYPE_UINT8_EXT : di->itype == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32; uint64_t k_[3] = {(uint64_t)ib, io, t_};
+              if (dyn_changed(D_IB, k_, sizeof k_)) vkCmdBindIndexBuffer(cb, ib, io, t_); }
             vkCmdDrawIndexed(cb, (uint32_t)di->count, (uint32_t)inst, 0, di->base_vertex, (uint32_t)di->base_instance);
         }
     }
@@ -1129,7 +1149,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
               (unsigned long long)g_dispatches, (unsigned long long)g_copies, (unsigned long long)up, ub / 1e6, (unsigned long long)ug, (unsigned long long)g_skips[0], (unsigned long long)g_skips[1],
               (unsigned long long)g_skips[2], (unsigned long long)g_skips[3], (unsigned long long)g_skips[4], (unsigned long long)g_skips[5], (unsigned long long)g_skips[6]);
         { uint64_t vk_gpu_ns(void), vk_submit_ns(void), vk_end_ns(void); static uint64_t pg, ps, pe; uint64_t g = vk_gpu_ns(), q = vk_submit_ns(), e = vk_end_ns();
-          VKLOG("GPU busy %.2f ms per present over the last 600; submit thread per present: vkEndCommandBuffer %.2f ms, vkQueueSubmit2 %.2f ms; uniform copies %.0f / %.2f MB per present; occlusion reports %llu zero, %llu not", (g - pg) / 1e6 / 600, (e - pe) / 1e6 / 600, (q - ps) / 1e6 / 600, g_ucopy_all[0] / 600.0, g_ucopy_all[1] / 600e6, ({ uint64_t r_[2]; vk_query_stats(r_); (unsigned long long)r_[0]; }), ({ uint64_t r_[2]; vk_query_stats(r_); (unsigned long long)r_[1]; })); pg = g; ps = q; pe = e; memset(g_ucopy_all, 0, sizeof g_ucopy_all); }
+          VKLOG("GPU busy %.2f ms per present over the last 600; submit thread per present: vkEndCommandBuffer %.2f ms, vkQueueSubmit2 %.2f ms; uniform copies %.0f / %.2f MB per present; occlusion reports %llu zero, %llu not; state commands emitted %llu, skipped %llu", (g - pg) / 1e6 / 600, (e - pe) / 1e6 / 600, (q - ps) / 1e6 / 600, g_ucopy_all[0] / 600.0, g_ucopy_all[1] / 600e6, ({ uint64_t r_[2]; vk_query_stats(r_); (unsigned long long)r_[0]; }), ({ uint64_t r_[2]; vk_query_stats(r_); (unsigned long long)r_[1]; }), (unsigned long long)g_dyn_emitted, (unsigned long long)g_dyn_skipped); pg = g; ps = q; pe = e; memset(g_ucopy_all, 0, sizeof g_ucopy_all); }
         VKLOG("pass ends: submit %llu, targets %llu, buffer copy %llu, texture copy %llu, dispatch %llu, depth needed %llu, texture clear %llu, feedback %llu, update flush %llu",
               (unsigned long long)g_end_why[0], (unsigned long long)g_end_why[1], (unsigned long long)g_end_why[2], (unsigned long long)g_end_why[3], (unsigned long long)g_end_why[4],
               (unsigned long long)g_end_why[5], (unsigned long long)g_end_why[6], (unsigned long long)g_end_why[7], (unsigned long long)g_end_why[8]);
