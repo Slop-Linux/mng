@@ -115,6 +115,7 @@ static void pclr_flush(void) {
     g_pclr_run += g_npclr; g_npclr = 0; g_pclr_hit = 0; full_barrier();
 }
 static void pclr_add(vtex *v, int level, int layer, VkImageAspectFlags aspect, VkClearValue val) {
+    if (vk_tex_is3d(v)) layer = 0;   /* a 3D texture has one layer (its clear covers every slice) */
     for (int i = 0; i < g_npclr; i++) if (g_pclr[i].v == v && g_pclr[i].level == level && g_pclr[i].layer == layer) {   /* a later clear replaces the aspects it covers */
         if (!(g_pclr[i].aspect & ~aspect)) { g_pclr[i] = g_pclr[--g_npclr]; i--; continue; }
         pclr_flush(); break;
@@ -213,6 +214,7 @@ static void end_pass(int why) {
     if (!g_pass_recorded) {   /* nothing drawn: the cleared attachments that cover their whole level go pending */
         int drop = 1;
         for (int i = 0; i < g_pcount; i++) if (g_lca[i].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR && !(g_pass_full >> i & 1)) drop = 0;
+        for (int i = 0; i < g_pcount; i++) if (vk_tex_is3d(g_patt[i].v)) drop = 0;   /* a slice of a 3D texture: a pending clear would clear every slice */
         if ((g_lda.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR || g_lsa.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) && !(g_pass_full >> 8 & 1)) drop = 0;
         if (drop) {
             for (int i = 0; i < g_pcount; i++) if (g_lca[i].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) pclr_add(g_patt[i].v, g_patt[i].level, g_patt[i].layer, VK_IMAGE_ASPECT_COLOR_BIT, g_lca[i].clearValue);

@@ -89,6 +89,7 @@ void vk_tex_gpu_wrote(vtex *v);                         /* rendered / copied int
 VkImage vk_tex_image(vtex *v);
 VkImageView vk_tex_view(vtex *v, const tex_t *t, const view_t *view, int has_view, VkImageViewType type, int attach);
 void vk_tex_dims(vtex *v, uint32_t *w, uint32_t *h, VkFormat *f);
+int vk_tex_is3d(vtex *v);
 int vk_tex_aspect(vtex *v);   /* VkImageAspectFlags of the whole format */
 VkSampler vk_sampler(const samp_par *p);
 VkSampler vk_sampler_id(int id);   /* by sampler pool id, cached */
