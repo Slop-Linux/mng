@@ -486,9 +486,11 @@ void mtl_drain(void) { mtl_finish(); }
 /* ---------- window, present, screenshots ---------- */
 void vk_window_open(void) {
     VkSurfaceCapabilitiesKHR caps; VKCHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(V.phys, g_surface, &caps));
-    uint32_t nf = 32; VkSurfaceFormatKHR fm[32]; VKCHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(V.phys, g_surface, &nf, fm));
+    uint32_t nf = 0; VKCHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(V.phys, g_surface, &nf, NULL)); VkSurfaceFormatKHR *fm = calloc(nf ? nf : 1, sizeof *fm);
+    VkResult fr = vkGetPhysicalDeviceSurfaceFormatsKHR(V.phys, g_surface, &nf, fm); if (fr != VK_SUCCESS && fr != VK_INCOMPLETE) VKDIE("surface formats: %d", fr);
     VkSurfaceFormatKHR f = fm[0]; for (uint32_t i = 0; i < nf; i++) if (fm[i].format == VK_FORMAT_B8G8R8A8_UNORM || fm[i].format == VK_FORMAT_R8G8B8A8_UNORM) { f = fm[i]; break; }
-    uint32_t npm = 8; VkPresentModeKHR pm[8]; vkGetPhysicalDeviceSurfacePresentModesKHR(V.phys, g_surface, &npm, pm);
+    free(fm);
+    uint32_t npm = 8; VkPresentModeKHR pm[8]; vkGetPhysicalDeviceSurfacePresentModesKHR(V.phys, g_surface, &npm, pm);   /* VK_INCOMPLETE keeps the first 8 */
     /* TOTK_VK_PRESENT=fifo | mailbox | immediate; by default mailbox, else immediate, else fifo (uncapped) */
     const char *want = getenv("TOTK_VK_PRESENT"); VkPresentModeKHR order[3] = {VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_FIFO_KHR};
     if (want && !strcmp(want, "fifo")) order[0] = order[1] = VK_PRESENT_MODE_FIFO_KHR; else if (want && !strcmp(want, "immediate")) order[0] = VK_PRESENT_MODE_IMMEDIATE_KHR;
