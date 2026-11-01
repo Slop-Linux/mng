@@ -70,6 +70,7 @@ typedef struct { int n, skipped; uint32_t slot[]; } vk_qlist;
 VkQueryPool vk_query_pool(void);
 uint32_t vk_query_alloc(void);
 void vk_sub_post_samples(uint64_t addr, vk_qlist *l);
+void vk_query_stats(uint64_t r[2]);   /* samples-passed reports of 0 / not 0 so far */
 
 /* window and present */
 void vk_window_open(void);
@@ -89,6 +90,7 @@ VkImageView vk_tex_view(vtex *v, const tex_t *t, const view_t *view, int has_vie
 void vk_tex_dims(vtex *v, uint32_t *w, uint32_t *h, VkFormat *f);
 int vk_tex_aspect(vtex *v);   /* VkImageAspectFlags of the whole format */
 VkSampler vk_sampler(const samp_par *p);
+VkSampler vk_sampler_id(int id);   /* by sampler pool id, cached */
 void vk_tex_registry_set(int id, const tex_t *t, const view_t *v);
 int vk_tex_registry_get(int id, tex_t *t, view_t *v, int *has_view);
 void vk_samp_registry_set(int id, const samp_par *p);
