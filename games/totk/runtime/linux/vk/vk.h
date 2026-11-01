@@ -41,6 +41,7 @@ typedef struct {
 } vk_ctx;
 extern vk_ctx V;
 void vk_init(void);
+int runtime_core_away(void); void runtime_core_back(int *away);   /* GPU waits on a guest thread give its virtual core to other workers (runtime/threads.c) */
 uint32_t vk_memtype(uint32_t bits, VkMemoryPropertyFlags want);
 
 /* image memory: suballocated from 64 MiB device-local blocks (maxMemoryAllocationCount is 4096) */

@@ -389,15 +389,16 @@ static void writeback(vtex *v) {
     if (log) VKLOG("write-back fmt %#x %ux%ux%u levels %u layers %u (%llu bytes) count %d %s", v->d.format, v->w, v->h, v->depth, v->levels, v->layers, (unsigned long long)v->gsize, v->wb_count,
                    v->stage && v->stage_fence && v->stage_fence == v->render_fence ? "staged" : "sync");
     if (sbpb && v->gmem && v->stage && v->stage_fence && v->stage_fence == v->render_fence) {
-        mtl_wait(v->stage_fence, UINT64_MAX); wb_swizzle(v, v->stage_cpu, sbw, sbh, sbpb);
+        { int a_ = runtime_core_away(); mtl_wait(v->stage_fence, UINT64_MAX); runtime_core_back(&a_); }   /* the GPU wait gives the guest core to other workers (nvn_mtl.m wb_wait_gpu, #552) */
+        wb_swizzle(v, v->stage_cpu, sbw, sbh, sbpb);
         v->gpu_dirty = 0; g_wb++; g_wb_staged++; g_wb_bytes += v->stage_size; return;
     }
-    mtl_finish();
+    { int a_ = runtime_core_away(); mtl_finish(); runtime_core_back(&a_); }
     int bw = 1, bh = 1, bpb = nvn_fmt_bpb(v->d.format, &bw, &bh);
     if (!bpb || !v->gmem) return;
     VkDeviceSize total = wb_size(v, bw, bh, bpb); VkBuffer b; VkDeviceMemory m; uint8_t *src;
     host_buffer(total, &b, &m, &src);
-    VkCommandBuffer cb = vk_oneshot_begin(); wb_copies(v, cb, b, bw, bh, bpb); vk_oneshot_end(cb);
+    VkCommandBuffer cb = vk_oneshot_begin(); wb_copies(v, cb, b, bw, bh, bpb); { int a_ = runtime_core_away(); vk_oneshot_end(cb); runtime_core_back(&a_); }
     wb_swizzle(v, src, bw, bh, bpb);
     vkUnmapMemory(V.dev, m); vkDestroyBuffer(V.dev, b, NULL); vkFreeMemory(V.dev, m, NULL);
     v->gpu_dirty = 0; g_wb++; g_wb_bytes += total;
@@ -595,7 +596,7 @@ static vtex *tex_find(const tex_t *t) {
 static void texels_image(vtex *v, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *lin, size_t wb, size_t hb, int nz, int to_image) {
     int is3d = v->type == VK_IMAGE_TYPE_3D; VkDeviceSize n = (VkDeviceSize)wb * hb * nz; VkBuffer b; VkDeviceMemory m; uint8_t *cpu;
     if (!to_image) vk_tex_mark_read(v);
-    mtl_finish(); host_buffer(n, &b, &m, &cpu);
+    { int a_ = runtime_core_away(); mtl_finish(); runtime_core_back(&a_); } host_buffer(n, &b, &m, &cpu);
     if (to_image) memcpy(cpu, lin, n);
     VkCommandBuffer cb = vk_oneshot_begin();
     VkImageAspectFlags asp = (VkImageAspectFlags)vk_tex_aspect(v); if (asp & VK_IMAGE_ASPECT_DEPTH_BIT) asp = VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -604,7 +605,7 @@ static void texels_image(vtex *v, unsigned level, unsigned layer0, const NVNcopy
             .imageOffset = {r->xoffset, r->yoffset, is3d ? r->zoffset + z : 0}, .imageExtent = {(uint32_t)r->width, (uint32_t)(r->height ? r->height : 1), 1}};
         if (to_image) vkCmdCopyBufferToImage(cb, b, v->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c); else vkCmdCopyImageToBuffer(cb, v->img, VK_IMAGE_LAYOUT_GENERAL, b, 1, &c);
     }
-    vk_oneshot_end(cb);
+    { int a_ = runtime_core_away(); vk_oneshot_end(cb); runtime_core_back(&a_); }
     if (!to_image) memcpy(lin, cpu, n);
     vkUnmapMemory(V.dev, m); vkDestroyBuffer(V.dev, b, NULL); vkFreeMemory(V.dev, m, NULL);
 }
