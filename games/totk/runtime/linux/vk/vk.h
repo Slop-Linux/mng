@@ -122,3 +122,5 @@ vshader *vk_shader_get(const uint8_t *control, const uint8_t *code, int stage, c
 #define VK_FB_BINDING 120
 uint32_t *vk_fbread_spv(const uint32_t *w, size_t n, const int bind[], const int att[], int k, size_t *out_n);
 vshader *vk_shader_fbread(vshader *fs, const int bind[], const int att[], int k);
+void vk_shader_stats(uint64_t s[4]);   /* variants loaded, ns, translated, ns */
+void vk_warm_start(void); int vk_warm_take(const char *vs, const char *fs, VkShaderEXT out[2]); int vk_warm_wait(int timeout_ms); void vk_warm_stats(uint64_t s[3]);   /* vk_shader.c: shader-object warm-up */
