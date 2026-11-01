@@ -561,10 +561,64 @@ static void shot(VkImage img, uint32_t w, uint32_t h, VkFormat fmt, uint64_t n) 
     vkUnmapMemory(V.dev, m); vkDestroyBuffer(V.dev, b, NULL); vkFreeMemory(V.dev, m, NULL);
     vkFreeCommandBuffers(V.dev, g_pool2, 1, &cb);
 }
+/* TOTK_VK_SEQ=<path>:<first present>:<count>: each presented picture of the range, scaled to SEQ_W x SEQ_H on the GPU without
+   waiting (a ring of SEQ_N), appended to <path> as raw RGB once its copy completed; the log gets per present the mean
+   absolute difference (0-255) to the previous picture (d1) and to the one before it (d2): a flash is d1 high on two
+   consecutive presents with d2 low on the second */
+#define SEQ_W 320
+#define SEQ_H 180
+#define SEQ_N 4
+static struct { VkImage img; VkDeviceMemory imem, bmem; VkBuffer buf; uint8_t *cpu; VkCommandBuffer cb; VkFence fence; uint64_t n; int busy; } g_seq[SEQ_N];
+static void seq_land(int k) {
+    static FILE *f; static uint8_t prev[2][SEQ_W * SEQ_H * 3]; static uint64_t seen; static const char *path;
+    if (!g_seq[k].busy) return;
+    VKCHECK(vkWaitForFences(V.dev, 1, &g_seq[k].fence, 1, UINT64_MAX)); g_seq[k].busy = 0;
+    if (!f) { const char *e = getenv("TOTK_VK_SEQ"); char p[1024]; snprintf(p, sizeof p, "%.*s", (int)(strchr(e, ':') - e), e); path = e; f = fopen(p, "wb"); if (!f) return; }
+    uint8_t cur[SEQ_W * SEQ_H * 3]; const uint8_t *s = g_seq[k].cpu; double d1 = 0, d2 = 0;
+    for (int i = 0; i < SEQ_W * SEQ_H; i++) for (int c = 0; c < 3; c++) { uint8_t v = s[4 * i + c]; cur[3 * i + c] = v; d1 += abs(v - prev[0][3 * i + c]); d2 += abs(v - prev[1][3 * i + c]); }
+    fwrite(cur, 1, sizeof cur, f); fflush(f);
+    double np = SEQ_W * SEQ_H * 3.0;
+    if (seen >= 2) VKLOG("seq present %llu d1 %.2f d2 %.2f", (unsigned long long)g_seq[k].n, d1 / np, d2 / np);
+    memcpy(prev[1], prev[0], sizeof cur); memcpy(prev[0], cur, sizeof cur); seen++; (void)path;
+}
+static void seq_frame(VkImage img, uint32_t w, uint32_t h, uint64_t n) {
+    static long first = -1, count; if (first == -1) { const char *e = getenv("TOTK_VK_SEQ"); const char *c = e ? strchr(e, ':') : NULL; first = c ? atol(c + 1) : -2; count = c && strchr(c + 1, ':') ? atol(strchr(c + 1, ':') + 1) : 600; }
+    if (first < 0 || (long)n < first) return;
+    int k = (int)(n % SEQ_N);
+    seq_land(k);
+    if ((long)n >= first + count) { for (int i = 0; i < SEQ_N; i++) seq_land((k + 1 + i) % SEQ_N); return; }
+    if (!g_seq[k].img) {
+        VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = {SEQ_W, SEQ_H, 1}, .mipLevels = 1, .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+        VKCHECK(vkCreateImage(V.dev, &ci, NULL, &g_seq[k].img)); VkMemoryRequirements rq; vkGetImageMemoryRequirements(V.dev, g_seq[k].img, &rq);
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = rq.size, .memoryTypeIndex = vk_memtype(rq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+        VKCHECK(vkAllocateMemory(V.dev, &ai, NULL, &g_seq[k].imem)); VKCHECK(vkBindImageMemory(V.dev, g_seq[k].img, g_seq[k].imem, 0));
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = SEQ_W * SEQ_H * 4, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VKCHECK(vkCreateBuffer(V.dev, &bi, NULL, &g_seq[k].buf)); vkGetBufferMemoryRequirements(V.dev, g_seq[k].buf, &rq);
+        ai = (VkMemoryAllocateInfo){.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = rq.size, .memoryTypeIndex = vk_memtype(rq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
+        VKCHECK(vkAllocateMemory(V.dev, &ai, NULL, &g_seq[k].bmem)); VKCHECK(vkBindBufferMemory(V.dev, g_seq[k].buf, g_seq[k].bmem, 0)); VKCHECK(vkMapMemory(V.dev, g_seq[k].bmem, 0, VK_WHOLE_SIZE, 0, (void **)&g_seq[k].cpu));
+        g_seq[k].cb = cb_new_in(g_pool2); VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VKCHECK(vkCreateFence(V.dev, &fi, NULL, &g_seq[k].fence));
+    }
+    VKCHECK(vkResetFences(V.dev, 1, &g_seq[k].fence));
+    VkCommandBuffer cb = g_seq[k].cb; vkResetCommandBuffer(cb, 0); cb_begin(cb);
+    barrier_img(cb, g_seq[k].img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int)w, (int)h, 1}}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {SEQ_W, SEQ_H, 1}}};
+    vkCmdBlitImage(cb, img, VK_IMAGE_LAYOUT_GENERAL, g_seq[k].img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
+    barrier_img(cb, g_seq[k].img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy r = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {SEQ_W, SEQ_H, 1}};
+    vkCmdCopyImageToBuffer(cb, g_seq[k].img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_seq[k].buf, 1, &r);
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_HOST_READ_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb}; vkCmdPipelineBarrier2(cb, &di);
+    VKCHECK(vkEndCommandBuffer(cb));
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+    pthread_mutex_lock(&g_queue_mu); VKCHECK(vkQueueSubmit(V.queue, 1, &si, g_seq[k].fence)); pthread_mutex_unlock(&g_queue_mu);
+    g_seq[k].n = n; g_seq[k].busy = 1;
+}
 void vk_present_image(VkImage img, uint32_t w, uint32_t h, VkFormat fmt) { job_push((job_t){.kind = 2, .img = img, .w = w, .h = h, .fmt = fmt}); }
 static void present_now(VkImage img, uint32_t w, uint32_t h, VkFormat fmt) {
     g_presents++;
-    shot(img, w, h, fmt, g_presents);
+    shot(img, w, h, fmt, g_presents); seq_frame(img, w, h, g_presents);
     if (!g_swap) return;
     unsigned i = g_acq_i++ % 8;
     VKCHECK(vkWaitForFences(V.dev, 1, &g_pfence[i], 1, UINT64_MAX));
