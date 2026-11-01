@@ -310,12 +310,12 @@ static shadow_t g_shadow[1024]; static uint64_t g_shadow_epoch, g_shadow_ep[1024
 static int pool_shadow(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_VK_POOL_SHADOW"); v = e && atoi(e) == 1; if (v) VKLOG("pool shadow: buffer ranges read from copies"); } return v; }
 static uint64_t g_pshadow[2];   /* ranges copied, ranges left in place (too large) */
 static int range_copy(uint64_t addr, uint64_t size, int direct, VkBuffer *buf, VkDeviceSize *off, VkDeviceSize *range);
-/* TOTK_VK_UBO_SNAPSHOT=1 (nvn_mtl.m usnap, TOTK_UBO_SNAPSHOT): a uniform range is read from a copy of its memory taken at its
+/* uniform snapshot (nvn_mtl.m usnap, TOTK_UBO_SNAPSHOT; TOTK_VK_UBO_SNAPSHOT=0 off): a uniform range is read from a copy of its memory taken at its
    first binding in the submission, so game threads that rebuild constant pools while the GPU is still on the frame (the
    one-submission early release of TOTK_SYNC_LAG) do not reach the GPU. A range the GPU writes (buffer copy, image-to-buffer
    copy, writable storage buffer) in this submission or in one not yet completed is read from memory, and a copy it
    overlaps is dropped from then on (nvn_mtl.m pend table, US_DROPPED) */
-static int ubo_snapshot(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_VK_UBO_SNAPSHOT"); v = e && atoi(e) == 1; if (v) VKLOG("uniform snapshot: uniform ranges read from copies taken at their first binding in a submission"); } return v; }
+static int ubo_snapshot(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_VK_UBO_SNAPSHOT"); v = !(e && !strcmp(e, "0")); if (v) VKLOG("uniform snapshot: uniform ranges read from copies taken at their first binding in a submission"); } return v; }
 #define GW_MAX 4096
 static struct { uint64_t lo, hi, fence; } g_gw[GW_MAX]; static int g_ngw; static uint64_t g_gw_over, g_usnap[3];   /* g_usnap: copies, reads from memory (GPU-written), copies dropped */
 static int gw_hits(uint64_t lo, uint64_t hi) {
