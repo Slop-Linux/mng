@@ -19,6 +19,7 @@ uint32_t vk_memtype(uint32_t bits, VkMemoryPropertyFlags want) {
 
 /* ---------- window (created by the frontend on the main thread) ---------- */
 SDL_Window *vk_sdl_window;   /* runtime/linux/frontend.c */
+_Atomic int vk_window_resized;   /* frontend.c: SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED */
 static VkSurfaceKHR g_surface; static VkSwapchainKHR g_swap; static VkImage g_swap_img[8]; static uint32_t g_nswap, g_sw, g_sh; static VkFormat g_swap_fmt;
 static VkSemaphore g_acq[8], g_rel[8]; static unsigned g_acq_i; static VkCommandBuffer g_pcb[8]; static VkFence g_pfence[8];
 
@@ -496,7 +497,7 @@ void vk_window_open(void) {
     if (want && !strcmp(want, "fifo")) order[0] = order[1] = VK_PRESENT_MODE_FIFO_KHR; else if (want && !strcmp(want, "immediate")) order[0] = VK_PRESENT_MODE_IMMEDIATE_KHR;
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
     for (int k = 2; k >= 0; k--) for (uint32_t i = 0; i < npm; i++) if (pm[i] == order[k]) mode = order[k];
-    int w = 1920, h = 1080; SDL_GetWindowSizeInPixels(vk_sdl_window, &w, &h);
+    int w = 1920, h = 1080; SDL_GetWindowSizeInPixels(vk_sdl_window, &w, &h); if (w <= 0 || h <= 0) { w = 1920; h = 1080; }
     g_sw = caps.currentExtent.width != UINT32_MAX ? caps.currentExtent.width : (uint32_t)w; g_sh = caps.currentExtent.height != UINT32_MAX ? caps.currentExtent.height : (uint32_t)h;
     VkSwapchainCreateInfoKHR sc = {.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = g_surface, .minImageCount = caps.minImageCount + 1 > 3 ? caps.minImageCount + 1 : 3,
         .imageFormat = f.format, .imageColorSpace = f.colorSpace, .imageExtent = {g_sw, g_sh}, .imageArrayLayers = 1,
@@ -620,6 +621,7 @@ static void present_now(VkImage img, uint32_t w, uint32_t h, VkFormat fmt) {
     g_presents++;
     shot(img, w, h, fmt, g_presents); seq_frame(img, w, h, g_presents);
     if (!g_swap) return;
+    if (atomic_exchange(&vk_window_resized, 0)) { vkDeviceWaitIdle(V.dev); vk_window_open(); }   /* the window's pixel size changed (frontend.c) */
     unsigned i = g_acq_i++ % 8;
     VKCHECK(vkWaitForFences(V.dev, 1, &g_pfence[i], 1, UINT64_MAX));
     uint32_t idx; VkResult r = vkAcquireNextImageKHR(V.dev, g_swap, UINT64_MAX, g_acq[i], VK_NULL_HANDLE, &idx);
@@ -629,8 +631,16 @@ static void present_now(VkImage img, uint32_t w, uint32_t h, VkFormat fmt) {
     if (!g_pcb[i]) g_pcb[i] = cb_new_in(g_pool2);   /* recorded on the submit thread: its own pool */
     VkCommandBuffer cb = g_pcb[i]; vkResetCommandBuffer(cb, 0); cb_begin(cb);
     barrier_img(cb, g_swap_img[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    /* the picture keeps its aspect: scaled to fit, centred, black bars when the window's aspect differs */
+    double sc_ = (double)g_sw / w < (double)g_sh / h ? (double)g_sw / w : (double)g_sh / h;
+    int dw = (int)(w * sc_ + 0.5), dh = (int)(h * sc_ + 0.5), x0 = ((int)g_sw - dw) / 2, y0 = ((int)g_sh - dh) / 2;
+    if (dw != (int)g_sw || dh != (int)g_sh) {
+        VkClearColorValue black = {{0, 0, 0, 1}}; VkImageSubresourceRange rr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cb, g_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rr);
+        barrier_img(cb, g_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    }
     VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int)w, (int)h, 1}},
-                      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {(int)g_sw, (int)g_sh, 1}}};
+                      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{x0, y0, 0}, {x0 + dw, y0 + dh, 1}}};
     vkCmdBlitImage(cb, img, VK_IMAGE_LAYOUT_GENERAL, g_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
     barrier_img(cb, g_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     VKCHECK(vkEndCommandBuffer(cb));
