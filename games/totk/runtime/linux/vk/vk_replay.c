@@ -1031,11 +1031,16 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
         char tx[512]; int o = 0; tx[0] = 0;
         for (int i = 0; fs && i < fs->nb && o < 440; i++) { const vk_rbind *b = &fs->b[i]; if (b->kind != RB_TEX) continue;
             uint32_t h = packed_handle(1, b->handle); tex_t t; view_t vw; int hv;
-            if ((h & 0xfffff) && vk_tex_registry_get((int)(h & 0xfffff), &t, &vw, &hv)) o += snprintf(tx + o, sizeof tx - o, " b%u:s%llu/%#x/%ux%u/swz%d%d%d%d%s", b->binding, (unsigned long long)t.serial, hv && vw.set_format ? vw.format : t.d.format, t.d.width, t.d.height, hv && vw.set_swizzle ? vw.swz[0] : t.d.swizzle_r, hv && vw.set_swizzle ? vw.swz[1] : t.d.swizzle_g, hv && vw.set_swizzle ? vw.swz[2] : t.d.swizzle_b, hv && vw.set_swizzle ? vw.swz[3] : t.d.swizzle_a, t.mem ? "" : "/nomem"); }
+            if ((h & 0xfffff) && vk_tex_registry_get((int)(h & 0xfffff), &t, &vw, &hv)) o += snprintf(tx + o, sizeof tx - o, " b%u:s%llu/%#x/%ux%u/swz%d%d%d%d%s", b->binding, (unsigned long long)t.serial, hv && vw.set_format ? vw.format : t.d.format, t.d.width, t.d.height, hv && vw.set_swizzle ? vw.swz[0] : t.d.swizzle_r, hv && vw.set_swizzle ? vw.swz[1] : t.d.swizzle_g, hv && vw.set_swizzle ? vw.swz[2] : t.d.swizzle_b, hv && vw.set_swizzle ? vw.swz[3] : t.d.swizzle_a, t.mem ? "" : "/nomem");
+                { vtex *tv_ = vk_tex_get(&t); if (o < 440) o += snprintf(tx + o, sizeof tx - o, "/st%d", vk_tex_state(tv_)); }
+                { samp_par sp_; int sid_ = (int)(h >> 20) & 0xfff; if (sid_ && vk_samp_registry_get(sid_, &sp_) && o < 440) o += snprintf(tx + o, sizeof tx - o, "/samp%d:f%d%d lod %.1f..%.1f bias %.2f an %.0f", sid_, sp_.minf, sp_.magf, sp_.lod_min, sp_.lod_max, sp_.lod_bias, sp_.aniso); } }
+        char va[400]; int vo = 0; va[0] = 0;   /* vertex attributes the shader reads: location:NVN format/stream+offset, stream stride / divisor */
+        for (int l = 0; l < 16 && vo < 360; l++) if (vs && (vs->in_mask >> l & 1)) { va_st a_ = {0}; if (l < S.nattr) memcpy(&a_, &S.attr[l], 4);
+            vo += snprintf(va + vo, sizeof va - vo, " %d:%#x/s%d+%d(st%u d%u)", l, a_.fmt, a_.stream, a_.offset, a_.stream < 16 ? S.stream[a_.stream].stride : 0, a_.stream < 16 ? S.stream[a_.stream].divisor : 0); }
         const blend_st *bl = &S.blend[0]; uint32_t aw_, ah_; VkFormat af_ = 0; if (g_patt[0].v) vk_tex_dims(g_patt[0].v, &aw_, &ah_, &af_);
-        VKLOG("draw #%llu: pass %ux%u att0 %p fmt %d, vs %s fs %s, blend en %d rgb %d/%d/%d a %d/%d/%d mask %#x, vp %.0f,%.0f %.0fx%.0f, sc %d %d,%d %dx%d, depth t%d w%d, stencil %d, cull %d, prim %d count %d inst %d, tex%s",
+        VKLOG("draw #%llu: pass %ux%u att0 %p fmt %d, vs %s fs %s, blend en %d rgb %d/%d/%d a %d/%d/%d mask %#x, vp %.0f,%.0f %.0fx%.0f, sc %d %d,%d %dx%d, depth t%d w%d, stencil %d, cull %d, prim %d count %d inst %d, attr%s, tex%s",
               (unsigned long long)g_probe_n, g_pw, g_ph, (void *)g_patt[0].v, (int)af_, vs ? vs->key : "-", fs ? fs->key : "-", S.color.blend_en & 1, bl->src_rgb, bl->dst_rgb, bl->eq_rgb, bl->src_a, bl->dst_a, bl->eq_a, S.chmask.mask & 0xf,
-              S.nvp ? S.vp[0][0] : 0, S.nvp ? S.vp[0][1] : 0, S.nvp ? S.vp[0][2] : 0, S.nvp ? S.vp[0][3] : 0, S.has_sc, S.sc.x, S.sc.y, S.sc.w, S.sc.h, S.ds.dt, S.ds.dw, S.ds.st, S.poly.cull, prim, d ? d->count : di->count, inst, tx);
+              S.nvp ? S.vp[0][0] : 0, S.nvp ? S.vp[0][1] : 0, S.nvp ? S.vp[0][2] : 0, S.nvp ? S.vp[0][3] : 0, S.has_sc, S.sc.x, S.sc.y, S.sc.w, S.sc.h, S.ds.dt, S.ds.dw, S.ds.st, S.poly.cull, prim, d ? d->count : di->count, inst, va, tx);
     }
     /* TOTK_VK_PROBE=<x>,<y>,<w>x<h> (with TOTK_VK_DUMP, its frame): after every draw into a pass of that size the pass is ended
        and the texel (x, y) of each colour attachment is copied out; logged per draw ("probe: draw n ...") on completion */

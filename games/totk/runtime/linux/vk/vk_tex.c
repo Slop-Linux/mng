@@ -720,3 +720,4 @@ VkSampler vk_sampler_id(int id) {
     s = vk_sampler(&p); atomic_store_explicit(&g_samp_of[id], s, memory_order_relaxed); return s;
 }
 int vk_tex_is3d(vtex *v) { return v && v->type == VK_IMAGE_TYPE_3D; }
+int vk_tex_state(vtex *v) { return !v ? -1 : (v->uploaded ? 1 : 0) | (v->gpu_owned ? 2 : 0) | (v->mirrored ? 4 : 0) | (v->uploadable ? 8 : 0); }   /* diagnostics: uploaded, GPU-owned, mirrored, uploadable */
