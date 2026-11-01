@@ -1181,11 +1181,11 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     { /* a frame over 60 ms: where the time went (vk_wait_stats; mtl_wait counts every thread) */
       static uint64_t pt, pw[4]; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC), w[4]; void vk_wait_stats(uint64_t[4]); vk_wait_stats(w);
       static uint64_t lim; if (!lim) { const char *e = getenv("TOTK_VK_LONG_MS"); lim = (e ? atol(e) : 60) * 1000000ull; }   /* TOTK_VK_LONG_MS: the threshold */
-      static uint64_t pmk[2], pup[3], pgpu; uint64_t up_[3], gpu_ = 0; void vk_tex_stats(uint64_t *, uint64_t *, uint64_t *); vk_tex_stats(&up_[0], &up_[1], &up_[2]); { uint64_t vk_gpu_ns(void); gpu_ = vk_gpu_ns(); }
-      if (pt && now - pt > lim && g_presents > 8000) { static int n; if (n++ < 200) VKLOG("long frame at present %llu: %.1f ms; job queue full %.1f, mtl_wait %.1f, one-shot %.1f, replay %.1f ms; shader objects %llu / %.1f ms, uploads %llu / %.1f MB, GPU %.1f ms since the last present", (unsigned long long)g_presents,
-          (now - pt) / 1e6, (w[0] - pw[0]) / 1e6, (w[1] - pw[1]) / 1e6, (w[2] - pw[2]) / 1e6, (w[3] - pw[3]) / 1e6, (unsigned long long)(g_mk[0] - pmk[0]), (g_mk[1] - pmk[1]) / 1e6, (unsigned long long)(up_[0] - pup[0]), (up_[1] - pup[1]) / 1e6, (gpu_ - pgpu) / 1e6);
+      static uint64_t pmk[2], pup[3], pgpu, pdisp; uint64_t up_[3], gpu_ = 0; void vk_tex_stats(uint64_t *, uint64_t *, uint64_t *); vk_tex_stats(&up_[0], &up_[1], &up_[2]); { uint64_t vk_gpu_ns(void); gpu_ = vk_gpu_ns(); }
+      if (pt && now - pt > lim && g_presents > 8000) { static int n; if (n++ < 200) VKLOG("long frame at present %llu: %.1f ms; job queue full %.1f, mtl_wait %.1f, one-shot %.1f, replay %.1f ms; shader objects %llu / %.1f ms, uploads %llu / %.1f MB, GPU %.1f ms since the last present; this frame %llu passes / %llu draws / %llu dispatches", (unsigned long long)g_presents,
+          (now - pt) / 1e6, (w[0] - pw[0]) / 1e6, (w[1] - pw[1]) / 1e6, (w[2] - pw[2]) / 1e6, (w[3] - pw[3]) / 1e6, (unsigned long long)(g_mk[0] - pmk[0]), (g_mk[1] - pmk[1]) / 1e6, (unsigned long long)(up_[0] - pup[0]), (up_[1] - pup[1]) / 1e6, (gpu_ - pgpu) / 1e6, (unsigned long long)g_frame_passes, (unsigned long long)g_frame_draws, (unsigned long long)(g_dispatches - pdisp));
           if (n < 4) VKLOG("  uniform copies %llu, %.1f MB", (unsigned long long)g_ucopy[0], g_ucopy[1] / 1e6); }
-      memset(g_ucopy, 0, sizeof g_ucopy); memcpy(pmk, g_mk, sizeof pmk); memcpy(pup, up_, sizeof pup); pgpu = gpu_;
+      memset(g_ucopy, 0, sizeof g_ucopy); memcpy(pmk, g_mk, sizeof pmk); memcpy(pup, up_, sizeof pup); pgpu = gpu_; pdisp = g_dispatches;
       pt = now; memcpy(pw, w, sizeof w); }
     /* frames in flight: present N waits until the GPU finished the frame of present N - TOTK_VK_FRAMES_AHEAD (2). Without a
        swapchain nothing else holds the game thread back, and a sync wait of the game (every 10 frames in the Shrine) then
