@@ -303,13 +303,23 @@ static uint64_t g_ucopy[2], g_ucopy_all[2];
 typedef struct { uint64_t addr, size; int nupd; VkBuffer buf; VkDeviceSize off; const uint8_t *cpu; } shadow_t;
 static shadow_t g_shadow[1024]; static uint64_t g_shadow_epoch, g_shadow_ep[1024];
 /* a uniform range as the GPU would read it at this point: memory plus the pending updates that overlap it */
+/* TOTK_VK_POOL_SHADOW=1 (diagnostic): uniform, vertex, index and read-only storage ranges are read from a copy made at
+   replay instead of the game's memory (zero copy), up to 16 MiB a range */
+static int pool_shadow(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_VK_POOL_SHADOW"); v = e && atoi(e) == 1; if (v) VKLOG("pool shadow: buffer ranges read from copies"); } return v; }
+static uint64_t g_pshadow[2];   /* ranges copied, ranges left in place (too large) */
+static int range_copy(uint64_t addr, uint64_t size, int direct, VkBuffer *buf, VkDeviceSize *off, VkDeviceSize *range);
 static int ubo_range(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off, VkDeviceSize *range) {
     if (!addr) return 0;
     if (!size || size > 65536) size = 65536;
+    return range_copy(addr, size, !pool_shadow(), buf, off, range);
+}
+/* a buffer range as the GPU would read it here; direct: the game's memory itself when no pending update overlaps it */
+static int range_copy(uint64_t addr, uint64_t size, int direct, VkBuffer *buf, VkDeviceSize *off, VkDeviceSize *range) {
     int overlap = 0;   /* 1 + the last pending update that overlaps the range */
     for (int i = g_nupd - 1; i >= 0 && !overlap; i--) if (g_upd[i].dst < addr + size && addr < g_upd[i].dst + g_upd[i].n) overlap = i + 1;
     VkBuffer b; VkDeviceSize o;
-    if (!overlap && vk_pool_find(addr, size, &b, &o) && !(o & 255)) { *buf = b; *off = o; *range = size; return 1; }
+    if (!overlap && direct && vk_pool_find(addr, size, &b, &o) && !(o & 255)) { *buf = b; *off = o; *range = size; return 1; }
+    if (!direct) g_pshadow[0]++;
     if (!vk_pool_find(addr, 1, &b, &o)) return 0;
     unsigned slot = (unsigned)((addr >> 8) ^ size) & 1023;
     shadow_t *sh = &g_shadow[slot];
@@ -483,6 +493,7 @@ static VkDescriptorSet stage_set(vshader *s, int stage, int set, VkDescriptorSet
             if (addr) {
                 uint64_t lo = addr & ~255ull; VkBuffer pb; VkDeviceSize po;
                 if (vk_pool_find(lo, 1, &pb, &po)) { buf = pb; o = po; range = size ? (addr - lo) + size : VK_WHOLE_SIZE; }
+                if (buf && size && !(b->flags & 1) && pool_shadow()) { VkDeviceSize n_ = (addr - lo) + size; if (n_ <= (16u << 20)) range_copy(lo, n_, 0, &buf, &o, &range); else g_pshadow[1]++; }
             }
             bi[nb] = (VkDescriptorBufferInfo){buf, o, range};
             x.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; x.pBufferInfo = &bi[nb++];
@@ -750,6 +761,7 @@ static void vertex_input(VkCommandBuffer cb, vshader *vs) {
         if (s < 16) {
             stride = S.stream[s].stride; div = S.stream[s].divisor;
             if (S.vbuf[s].address && vk_pool_find(S.vbuf[s].address, 1, &b, &o)) sz = S.vbuf[s].size ? S.vbuf[s].size : VK_WHOLE_SIZE;
+            if (b && sz != VK_WHOLE_SIZE && pool_shadow()) { if (sz <= (16u << 20)) range_copy(S.vbuf[s].address, sz, 0, &b, &o, &sz); else g_pshadow[1]++; }
         }
         if (!b) { vk_span z = vk_ring(64, 16); memset(z.cpu, 0, 64); b = z.buf; o = z.off; sz = 64; stride = 0; div = 0; }
         bd[nbd++] = (VkVertexInputBindingDescription2EXT){.sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT, .binding = (uint32_t)s, .stride = stride,
@@ -865,6 +877,7 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
         else {
             VkBuffer ib; VkDeviceSize io;
             if (!vk_pool_find(di->ibuf, 1, &ib, &io)) { g_skips[4]++; return; }
+            if (pool_shadow()) { VkDeviceSize n_ = (VkDeviceSize)di->count * (di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4), r_; if (n_ && n_ <= (16u << 20)) range_copy(di->ibuf, n_, 0, &ib, &io, &r_); }
             { VkIndexType t_ = di->itype == 0 ? VK_INDEX_TYPE_UINT8_EXT : di->itype == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32; uint64_t k_[3] = {(uint64_t)ib, io, t_};
               if (dyn_changed(D_IB, k_, sizeof k_)) vkCmdBindIndexBuffer(cb, ib, io, t_); }
             vkCmdDrawIndexed(cb, (uint32_t)di->count, (uint32_t)inst, 0, di->base_vertex, (uint32_t)di->base_instance);
@@ -1098,6 +1111,8 @@ void mtl_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }
 static uint64_t g_sub_t0;
 void mtl_sub_begin(void) { vk_sub_open(); g_sub_t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC); g_cut_at = g_draws; g_ncut = 0; }
 uint64_t mtl_sub_commit(void) { upd_flush(); g_shadow_epoch++; g_sub_gen++; g_cb_gen++; g_dyn_set = 0; g_dpool = VK_NULL_HANDLE; uint64_t f = vk_sub_submit();
+    static int sync = -1; if (sync < 0) { const char *e = getenv("TOTK_VK_SYNC_SUBMIT"); sync = e && atoi(e) == 1; if (sync) VKLOG("sync submit: every submission completes on the GPU before the game continues"); }
+    if (sync && f && !mtl_wait(f, 0)) { int a_ = runtime_core_away(); mtl_wait(f, UINT64_MAX); runtime_core_back(&a_); }   /* TOTK_VK_SYNC_SUBMIT=1 (diagnostic) */
     void vk_replay_ns(uint64_t); vk_replay_ns(clock_gettime_nsec_np(CLOCK_MONOTONIC) - g_sub_t0); return f; }
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) { copy_b2b(src, dst, n); }
 void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { vk_sub_post(1, val, mode, v, 0); }
@@ -1156,6 +1171,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
               (unsigned long long)g_skips[2], (unsigned long long)g_skips[3], (unsigned long long)g_skips[4], (unsigned long long)g_skips[5], (unsigned long long)g_skips[6]);
         { uint64_t vk_gpu_ns(void), vk_submit_ns(void), vk_end_ns(void); void vk_cb_stats(uint64_t *, uint64_t *); static uint64_t pg, ps, pe, pb, pc; uint64_t g = vk_gpu_ns(), q = vk_submit_ns(), e = vk_end_ns(), bn, cn; vk_cb_stats(&bn, &cn);
           VKLOG("GPU busy %.2f ms per present over the last 600; submit thread per present: vkEndCommandBuffer %.2f ms, vkQueueSubmit2 %.2f ms; %.1f command buffer pairs, vkBeginCommandBuffer %.2f ms (game thread); uniform copies %.0f / %.2f MB per present; occlusion reports %llu zero, %llu not; state commands emitted %llu, skipped %llu", (g - pg) / 1e6 / 600, (e - pe) / 1e6 / 600, (q - ps) / 1e6 / 600, (cn - pc) / 600.0, (bn - pb) / 1e6 / 600, g_ucopy_all[0] / 600.0, g_ucopy_all[1] / 600e6, ({ uint64_t r_[2]; vk_query_stats(r_); (unsigned long long)r_[0]; }), ({ uint64_t r_[2]; vk_query_stats(r_); (unsigned long long)r_[1]; }), (unsigned long long)g_dyn_emitted, (unsigned long long)g_dyn_skipped); pg = g; ps = q; pe = e; pb = bn; pc = cn; memset(g_ucopy_all, 0, sizeof g_ucopy_all); }
+        if (pool_shadow()) VKLOG("pool shadow: %llu ranges copied, %llu over 16 MiB left in place", (unsigned long long)g_pshadow[0], (unsigned long long)g_pshadow[1]);
         VKLOG("pass ends: submit %llu, targets %llu, buffer copy %llu, texture copy %llu, dispatch %llu, depth needed %llu, texture clear %llu, feedback %llu, update flush %llu",
               (unsigned long long)g_end_why[0], (unsigned long long)g_end_why[1], (unsigned long long)g_end_why[2], (unsigned long long)g_end_why[3], (unsigned long long)g_end_why[4],
               (unsigned long long)g_end_why[5], (unsigned long long)g_end_why[6], (unsigned long long)g_end_why[7], (unsigned long long)g_end_why[8]);
