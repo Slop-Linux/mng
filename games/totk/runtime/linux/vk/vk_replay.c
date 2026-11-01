@@ -279,6 +279,7 @@ static void upd_add(uint64_t dst, const uint8_t *data, uint64_t n) {
     g_upd[g_nupd++] = (upd_t){dst, n, s.buf, s.off, s.cpu};
 }
 /* the updates land in memory at the end of the submission (after every draw that used a renamed copy) */
+static void gw_add(uint64_t lo, uint64_t hi);
 static void upd_flush(void) {
     if (!g_nupd) return;
     end_pass(8);
@@ -286,6 +287,7 @@ static void upd_flush(void) {
         VkBuffer b; VkDeviceSize o;
         if (!vk_pool_find(g_upd[i].dst, g_upd[i].n, &b, &o)) continue;
         VkBufferCopy c = {g_upd[i].soff, o, g_upd[i].n}; vkCmdCopyBuffer(vk_cb(), g_upd[i].src, b, 1, &c);
+        gw_add(g_upd[i].dst, g_upd[i].dst + g_upd[i].n);   /* lands at the end of the submission: the next submissions read it from memory once completed */
     }
     full_barrier(); g_nupd = 0;
 }
@@ -308,15 +310,43 @@ static shadow_t g_shadow[1024]; static uint64_t g_shadow_epoch, g_shadow_ep[1024
 static int pool_shadow(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_VK_POOL_SHADOW"); v = e && atoi(e) == 1; if (v) VKLOG("pool shadow: buffer ranges read from copies"); } return v; }
 static uint64_t g_pshadow[2];   /* ranges copied, ranges left in place (too large) */
 static int range_copy(uint64_t addr, uint64_t size, int direct, VkBuffer *buf, VkDeviceSize *off, VkDeviceSize *range);
+/* TOTK_VK_UBO_SNAPSHOT=1 (nvn_mtl.m usnap, TOTK_UBO_SNAPSHOT): a uniform range is read from a copy of its memory taken at its
+   first binding in the submission, so game threads that rebuild constant pools while the GPU is still on the frame (the
+   one-submission early release of TOTK_SYNC_LAG) do not reach the GPU. A range the GPU writes (buffer copy, image-to-buffer
+   copy, writable storage buffer) in this submission or in one not yet completed is read from memory, and a copy it
+   overlaps is dropped from then on (nvn_mtl.m pend table, US_DROPPED) */
+static int ubo_snapshot(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_VK_UBO_SNAPSHOT"); v = e && atoi(e) == 1; if (v) VKLOG("uniform snapshot: uniform ranges read from copies taken at their first binding in a submission"); } return v; }
+#define GW_MAX 4096
+static struct { uint64_t lo, hi, fence; } g_gw[GW_MAX]; static int g_ngw; static uint64_t g_gw_over, g_usnap[3];   /* g_usnap: copies, reads from memory (GPU-written), copies dropped */
+static int gw_hits(uint64_t lo, uint64_t hi) {
+    uint64_t done = vk_done(); if (g_gw_over > done) return 1;
+    int n = 0; for (int i = 0; i < g_ngw; i++) if (g_gw[i].fence > done) g_gw[n++] = g_gw[i]; g_ngw = n;
+    for (int i = 0; i < g_ngw; i++) if (lo < g_gw[i].hi && g_gw[i].lo < hi) return 1;
+    return 0;
+}
+static void gw_add(uint64_t lo, uint64_t hi) {   /* a GPU write of guest memory recorded in the open submission (adjacent writes of one submission merge) */
+    if (!(ubo_snapshot() || pool_shadow()) || lo >= hi) return;
+    uint64_t f = vk_next_fence();
+    if (g_ngw && g_gw[g_ngw - 1].fence == f && lo <= g_gw[g_ngw - 1].hi && g_gw[g_ngw - 1].lo <= hi) {
+        if (lo < g_gw[g_ngw - 1].lo) g_gw[g_ngw - 1].lo = lo; if (hi > g_gw[g_ngw - 1].hi) g_gw[g_ngw - 1].hi = hi; return; }
+    if (g_ngw == GW_MAX) gw_hits(0, 0);
+    if (g_ngw < GW_MAX) g_gw[g_ngw++] = (typeof(g_gw[0])){lo, hi, f}; else g_gw_over = f;
+}
+static void gw_note(uint64_t lo, uint64_t hi) {   /* and the copies of this submission it overlaps are dropped */
+    if (!(ubo_snapshot() || pool_shadow()) || lo >= hi) return;
+    gw_add(lo, hi);
+    for (int i = 0; i < 1024; i++) if (g_shadow_ep[i] == g_shadow_epoch && g_shadow[i].addr < hi && lo < g_shadow[i].addr + g_shadow[i].size) { g_shadow_ep[i] = 0; g_usnap[2]++; }
+}
 static int ubo_range(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off, VkDeviceSize *range) {
     if (!addr) return 0;
     if (!size || size > 65536) size = 65536;
-    return range_copy(addr, size, !pool_shadow(), buf, off, range);
+    return range_copy(addr, size, !(pool_shadow() || ubo_snapshot()), buf, off, range);
 }
 /* a buffer range as the GPU would read it here; direct: the game's memory itself when no pending update overlaps it */
 static int range_copy(uint64_t addr, uint64_t size, int direct, VkBuffer *buf, VkDeviceSize *off, VkDeviceSize *range) {
     int overlap = 0;   /* 1 + the last pending update that overlaps the range */
     for (int i = g_nupd - 1; i >= 0 && !overlap; i--) if (g_upd[i].dst < addr + size && addr < g_upd[i].dst + g_upd[i].n) overlap = i + 1;
+    if (!direct && gw_hits(addr, addr + size)) { direct = 1; g_usnap[1]++; } else if (!direct) g_usnap[0]++;
     VkBuffer b; VkDeviceSize o;
     if (!overlap && direct && vk_pool_find(addr, size, &b, &o) && !(o & 255)) { *buf = b; *off = o; *range = size; return 1; }
     if (!direct) g_pshadow[0]++;
@@ -497,7 +527,7 @@ static VkDescriptorSet stage_set(vshader *s, int stage, int set, VkDescriptorSet
             }
             bi[nb] = (VkDescriptorBufferInfo){buf, o, range};
             x.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; x.pBufferInfo = &bi[nb++];
-            if (buf && (b->flags & 1)) { /* written by the shader */ }
+            if (buf && (b->flags & 1)) gw_note(addr, addr + (size ? size : (16u << 20)));   /* written by the shader */
         } else if (b->kind == RB_IA) {   /* a decal variant's input attachment: the colour attachment itself */
             ii[ni] = (VkDescriptorImageInfo){VK_NULL_HANDLE, b->slot >= 0 && b->slot < 8 ? g_patt[b->slot].view : VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL};
             x.descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT; x.pImageInfo = &ii[ni++];
@@ -949,6 +979,7 @@ static void copy_b2b(uint64_t src, uint64_t dst, uint64_t n) {
         vk_span t = vk_ring(n, 16); VkBufferCopy a = {so, t.off, n}, b = {t.off, dof, n};
         vkCmdCopyBuffer(cb, sb, t.buf, 1, &a); full_barrier(); vkCmdCopyBuffer(cb, t.buf, db, 1, &b);
     } else { VkBufferCopy c = {so, dof, n}; vkCmdCopyBuffer(cb, sb, db, 1, &c); }
+    gw_note(dst, dst + n);
     full_barrier(); g_copies++;
 }
 static int region_level(const view_t *v, int has) { return has && v->set_levels ? v->base_level : 0; }
@@ -965,7 +996,8 @@ static void copy_b2t(const p_copy_b2t *c, int to_buffer) {
         (uint32_t)region_level(&c->view, c->has_view), (uint32_t)(region_layer(&c->view, c->has_view) + (is3d ? 0 : z0)), is3d ? 1 : (uint32_t)depth},
         .imageOffset = {c->r.xoffset, c->r.yoffset, is3d ? z0 : 0}, .imageExtent = {(uint32_t)c->r.width, (uint32_t)(c->r.height ? c->r.height : 1), is3d ? (uint32_t)depth : 1}};
     if (r.bufferOffset & 3) { static int said; if (!said++) VKLOG("【红】buffer/texture copy at an unaligned buffer offset"); g_skips[6]++; return; }
-    if (to_buffer) { vk_tex_mark_read(v); vkCmdCopyImageToBuffer(vk_cb(), vk_tex_image(v), VK_IMAGE_LAYOUT_GENERAL, b, 1, &r); }
+    if (to_buffer) { vk_tex_mark_read(v); vkCmdCopyImageToBuffer(vk_cb(), vk_tex_image(v), VK_IMAGE_LAYOUT_GENERAL, b, 1, &r);
+        uint64_t pitch = S.copy_stride ? S.copy_stride : (uint64_t)((r.imageExtent.width + bw - 1) / bw) * (bpb ? bpb : 16); gw_note(c->src, c->src + pitch * ((r.imageExtent.height + bh - 1) / bh) * r.imageExtent.depth); }
     else { vk_tex_upload_if_stale(v, t); vkCmdCopyBufferToImage(vk_cb(), b, vk_tex_image(v), VK_IMAGE_LAYOUT_GENERAL, 1, &r); vk_tex_gpu_wrote(v); }
     full_barrier(); g_copies++;
 }
@@ -1172,6 +1204,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
         { uint64_t vk_gpu_ns(void), vk_submit_ns(void), vk_end_ns(void); void vk_cb_stats(uint64_t *, uint64_t *); static uint64_t pg, ps, pe, pb, pc; uint64_t g = vk_gpu_ns(), q = vk_submit_ns(), e = vk_end_ns(), bn, cn; vk_cb_stats(&bn, &cn);
           VKLOG("GPU busy %.2f ms per present over the last 600; submit thread per present: vkEndCommandBuffer %.2f ms, vkQueueSubmit2 %.2f ms; %.1f command buffer pairs, vkBeginCommandBuffer %.2f ms (game thread); uniform copies %.0f / %.2f MB per present; occlusion reports %llu zero, %llu not; state commands emitted %llu, skipped %llu", (g - pg) / 1e6 / 600, (e - pe) / 1e6 / 600, (q - ps) / 1e6 / 600, (cn - pc) / 600.0, (bn - pb) / 1e6 / 600, g_ucopy_all[0] / 600.0, g_ucopy_all[1] / 600e6, ({ uint64_t r_[2]; vk_query_stats(r_); (unsigned long long)r_[0]; }), ({ uint64_t r_[2]; vk_query_stats(r_); (unsigned long long)r_[1]; }), (unsigned long long)g_dyn_emitted, (unsigned long long)g_dyn_skipped); pg = g; ps = q; pe = e; pb = bn; pc = cn; memset(g_ucopy_all, 0, sizeof g_ucopy_all); }
         if (pool_shadow()) VKLOG("pool shadow: %llu ranges copied, %llu over 16 MiB left in place", (unsigned long long)g_pshadow[0], (unsigned long long)g_pshadow[1]);
+        if (ubo_snapshot() || pool_shadow()) VKLOG("snapshot: %llu ranges copied, %llu read from memory (GPU-written, %d writes pending), %llu copies dropped by GPU writes", (unsigned long long)g_usnap[0], (unsigned long long)g_usnap[1], g_ngw, (unsigned long long)g_usnap[2]);
         VKLOG("pass ends: submit %llu, targets %llu, buffer copy %llu, texture copy %llu, dispatch %llu, depth needed %llu, texture clear %llu, feedback %llu, update flush %llu",
               (unsigned long long)g_end_why[0], (unsigned long long)g_end_why[1], (unsigned long long)g_end_why[2], (unsigned long long)g_end_why[3], (unsigned long long)g_end_why[4],
               (unsigned long long)g_end_why[5], (unsigned long long)g_end_why[6], (unsigned long long)g_end_why[7], (unsigned long long)g_end_why[8]);
