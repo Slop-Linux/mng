@@ -372,11 +372,12 @@ static int range_copy(uint64_t addr, uint64_t size, int direct, VkBuffer *buf, V
 typedef struct pair_t { vshader *vs, *fs; VkShaderEXT sh[2]; VkPipelineLayout pl; struct pair_t *next; } pair_t;
 static pair_t *g_pairs[1024];
 typedef struct comp_t { vshader *cs; VkShaderEXT sh; VkPipelineLayout pl; struct comp_t *next; } comp_t;
+static uint64_t g_mk[2];   /* shader objects created, ns (long-frame log) */
 static comp_t *g_comps[256];
 static VkShaderEXT make_shader(vshader *s, VkShaderStageFlagBits stage, VkShaderStageFlags next, VkDescriptorSetLayout *layouts, int nl) {
     VkShaderCreateInfoEXT ci = {.sType = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT, .stage = stage, .nextStage = next, .codeType = VK_SHADER_CODE_TYPE_SPIRV_EXT,
         .codeSize = s->nwords * 4, .pCode = s->spv, .pName = "main", .setLayoutCount = (uint32_t)nl, .pSetLayouts = layouts};
-    VkShaderEXT o; VkResult r = V.CreateShadersEXT(V.dev, 1, &ci, NULL, &o);
+    uint64_t t0_ = clock_gettime_nsec_np(CLOCK_MONOTONIC); VkShaderEXT o; VkResult r = V.CreateShadersEXT(V.dev, 1, &ci, NULL, &o); g_mk[0]++; g_mk[1] += clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0_;
     if (r != VK_SUCCESS) { VKLOG("【红】shader %s (stage %d) did not compile: %d", s->key, s->stage, r); return VK_NULL_HANDLE; }
     return o;
 }
@@ -1180,10 +1181,11 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     { /* a frame over 60 ms: where the time went (vk_wait_stats; mtl_wait counts every thread) */
       static uint64_t pt, pw[4]; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC), w[4]; void vk_wait_stats(uint64_t[4]); vk_wait_stats(w);
       static uint64_t lim; if (!lim) { const char *e = getenv("TOTK_VK_LONG_MS"); lim = (e ? atol(e) : 60) * 1000000ull; }   /* TOTK_VK_LONG_MS: the threshold */
-      if (pt && now - pt > lim && g_presents > 8000) { static int n; if (n++ < 40) VKLOG("long frame at present %llu: %.1f ms; job queue full %.1f, mtl_wait %.1f, one-shot %.1f, replay %.1f ms", (unsigned long long)g_presents,
-          (now - pt) / 1e6, (w[0] - pw[0]) / 1e6, (w[1] - pw[1]) / 1e6, (w[2] - pw[2]) / 1e6, (w[3] - pw[3]) / 1e6);
+      static uint64_t pmk[2], pup[3], pgpu; uint64_t up_[3], gpu_ = 0; void vk_tex_stats(uint64_t *, uint64_t *, uint64_t *); vk_tex_stats(&up_[0], &up_[1], &up_[2]); { uint64_t vk_gpu_ns(void); gpu_ = vk_gpu_ns(); }
+      if (pt && now - pt > lim && g_presents > 8000) { static int n; if (n++ < 200) VKLOG("long frame at present %llu: %.1f ms; job queue full %.1f, mtl_wait %.1f, one-shot %.1f, replay %.1f ms; shader objects %llu / %.1f ms, uploads %llu / %.1f MB, GPU %.1f ms since the last present", (unsigned long long)g_presents,
+          (now - pt) / 1e6, (w[0] - pw[0]) / 1e6, (w[1] - pw[1]) / 1e6, (w[2] - pw[2]) / 1e6, (w[3] - pw[3]) / 1e6, (unsigned long long)(g_mk[0] - pmk[0]), (g_mk[1] - pmk[1]) / 1e6, (unsigned long long)(up_[0] - pup[0]), (up_[1] - pup[1]) / 1e6, (gpu_ - pgpu) / 1e6);
           if (n < 4) VKLOG("  uniform copies %llu, %.1f MB", (unsigned long long)g_ucopy[0], g_ucopy[1] / 1e6); }
-      memset(g_ucopy, 0, sizeof g_ucopy);
+      memset(g_ucopy, 0, sizeof g_ucopy); memcpy(pmk, g_mk, sizeof pmk); memcpy(pup, up_, sizeof pup); pgpu = gpu_;
       pt = now; memcpy(pw, w, sizeof w); }
     /* frames in flight: present N waits until the GPU finished the frame of present N - TOTK_VK_FRAMES_AHEAD (2). Without a
        swapchain nothing else holds the game thread back, and a sync wait of the game (every 10 frames in the Shrine) then
