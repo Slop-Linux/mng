@@ -71,6 +71,7 @@ static void q_report(uint64_t addr, int pass_open) {
 
 /* why passes end: 0 submit, 1 targets, 2 buffer copy, 3 texture copy, 4 dispatch, 5 depth needed by a pass begun without, 6 texture clear, 7 feedback, 8 uniform update flush */
 static uint64_t g_end_why[9];
+static uint64_t g_cut_at; static int g_ncut;   /* draws when the submission was last cut (or opened), cuts in it */
 /* TOTK_VK_PASS_TIMES=<present>: GPU time of every pass and dispatch of the frame after that present, logged by time with
    its targets, load operations, draws and why it ended (timestamps around each) */
 #define PT_MAX 1024
@@ -149,9 +150,10 @@ static void end_pass(int why) {
     q_end(1);
     vkCmdEndRendering(vk_cb()); g_pass_open = 0; g_pass_recorded = 0; pt_close(why);
     full_barrier();
-    /* TOTK_VK_CHUNK_DRAWS (500; 0 off): after that many draws the submission so far goes to the GPU (vk_sub_cut) */
-    static long chunk = -1; static uint64_t at; if (chunk < 0) { const char *e = getenv("TOTK_VK_CHUNK_DRAWS"); chunk = e ? atol(e) : 500; }
-    if (why && chunk && g_draws - at >= (uint64_t)chunk) { void vk_sub_cut(void); vk_sub_cut(); at = g_draws; g_cb_gen++; }
+    /* TOTK_VK_CHUNK_DRAWS=<first>[/<next>] (default 250; 0 off): the submission so far goes to the GPU (vk_sub_cut) once its
+       first part has <first> draws, then every <next> (MNG on macOS: 60/75) */
+    static long first = -1, next; if (first < 0) { const char *e = getenv("TOTK_VK_CHUNK_DRAWS"); first = next = e ? atol(e) : 250; if (e && strchr(e, '/')) next = atol(strchr(e, '/') + 1); }
+    if (why && first && g_draws - g_cut_at >= (uint64_t)(g_ncut ? next : first)) { void vk_sub_cut(void); vk_sub_cut(); g_cut_at = g_draws; g_ncut++; g_cb_gen++; }
 }
 void vk_replay_end_pass(void) { end_pass(0); pclr_flush(); }
 void vk_replay_outside_pass(void) { end_pass(3); for (int k = 0; k < 6; k++) g_gen_bind[k]++; }   /* an image made mutable is copied (vk_tex.c tex_mutable): sets are rebuilt with its new views; a draw then begins the pass again */
@@ -869,6 +871,9 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
         }
     }
     g_q_draws += g_q_cur >= 0;
+    if (g_q_cur >= 0) { static int log = -1, n; if (log < 0) log = getenv("TOTK_VK_QUERY_LOG") != NULL;
+        if (log && n++ < 40) VKLOG("counted draw: pass %ux%u colour %d depth %d (nodepth %d), colour mask %#x, depth test %d write %d func %d, stencil %d, cull %d, raster discard %d, vp %.0fx%.0f, prim %d count %d", g_pw, g_ph, g_pcount, g_pdepth.v != NULL, g_pass_nodepth,
+            S.chmask.mask, S.ds.dt, S.ds.dw, S.ds.df, S.ds.st, S.poly.cull, S.raster_discard, S.nvp ? S.vp[0][2] : 0.f, S.nvp ? S.vp[0][3] : 0.f, d ? d->prim : di->prim, d ? d->count : di->count); }
     g_draws++; g_frame_draws++; if (g_pt_on && g_pt_n < PT_MAX) { g_pt[g_pt_n].draws++; pp_note(vs, fs); }
     if (!S.raster_discard) {
         for (int i = 0; i < g_pcount; i++) if (g_patt[i].v && (S.chmask.mask >> (4 * i) & 0xf)) { g_pass_written |= 1u << i; g_lr_dirty |= 1u << i; }
@@ -1091,7 +1096,7 @@ void mtl_exec(const uint8_t *p) {
 }
 void mtl_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }
 static uint64_t g_sub_t0;
-void mtl_sub_begin(void) { vk_sub_open(); g_sub_t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC); }
+void mtl_sub_begin(void) { vk_sub_open(); g_sub_t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC); g_cut_at = g_draws; g_ncut = 0; }
 uint64_t mtl_sub_commit(void) { upd_flush(); g_shadow_epoch++; g_sub_gen++; g_cb_gen++; g_dyn_set = 0; g_dpool = VK_NULL_HANDLE; uint64_t f = vk_sub_submit();
     void vk_replay_ns(uint64_t); vk_replay_ns(clock_gettime_nsec_np(CLOCK_MONOTONIC) - g_sub_t0); return f; }
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) { copy_b2b(src, dst, n); }
@@ -1148,8 +1153,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
               (unsigned long long)g_presents, (unsigned long long)g_passes, (unsigned long long)g_draws, (unsigned long long)g_frame_passes, (unsigned long long)g_frame_draws,
               (unsigned long long)g_dispatches, (unsigned long long)g_copies, (unsigned long long)up, ub / 1e6, (unsigned long long)ug, (unsigned long long)g_skips[0], (unsigned long long)g_skips[1],
               (unsigned long long)g_skips[2], (unsigned long long)g_skips[3], (unsigned long long)g_skips[4], (unsigned long long)g_skips[5], (unsigned long long)g_skips[6]);
-        { uint64_t vk_gpu_ns(void), vk_submit_ns(void), vk_end_ns(void); static uint64_t pg, ps, pe; uint64_t g = vk_gpu_ns(), q = vk_submit_ns(), e = vk_end_ns();
-          VKLOG("GPU busy %.2f ms per present over the last 600; submit thread per present: vkEndCommandBuffer %.2f ms, vkQueueSubmit2 %.2f ms; uniform copies %.0f / %.2f MB per present; occlusion reports %llu zero, %llu not; state commands emitted %llu, skipped %llu", (g - pg) / 1e6 / 600, (e - pe) / 1e6 / 600, (q - ps) / 1e6 / 600, g_ucopy_all[0] / 600.0, g_ucopy_all[1] / 600e6, ({ uint64_t r_[2]; vk_query_stats(r_); (unsigned long long)r_[0]; }), ({ uint64_t r_[2]; vk_query_stats(r_); (unsigned long long)r_[1]; }), (unsigned long long)g_dyn_emitted, (unsigned long long)g_dyn_skipped); pg = g; ps = q; pe = e; memset(g_ucopy_all, 0, sizeof g_ucopy_all); }
+        { uint64_t vk_gpu_ns(void), vk_submit_ns(void), vk_end_ns(void); void vk_cb_stats(uint64_t *, uint64_t *); static uint64_t pg, ps, pe, pb, pc; uint64_t g = vk_gpu_ns(), q = vk_submit_ns(), e = vk_end_ns(), bn, cn; vk_cb_stats(&bn, &cn);
+          VKLOG("GPU busy %.2f ms per present over the last 600; submit thread per present: vkEndCommandBuffer %.2f ms, vkQueueSubmit2 %.2f ms; %.1f command buffer pairs, vkBeginCommandBuffer %.2f ms (game thread); uniform copies %.0f / %.2f MB per present; occlusion reports %llu zero, %llu not; state commands emitted %llu, skipped %llu", (g - pg) / 1e6 / 600, (e - pe) / 1e6 / 600, (q - ps) / 1e6 / 600, (cn - pc) / 600.0, (bn - pb) / 1e6 / 600, g_ucopy_all[0] / 600.0, g_ucopy_all[1] / 600e6, ({ uint64_t r_[2]; vk_query_stats(r_); (unsigned long long)r_[0]; }), ({ uint64_t r_[2]; vk_query_stats(r_); (unsigned long long)r_[1]; }), (unsigned long long)g_dyn_emitted, (unsigned long long)g_dyn_skipped); pg = g; ps = q; pe = e; pb = bn; pc = cn; memset(g_ucopy_all, 0, sizeof g_ucopy_all); }
         VKLOG("pass ends: submit %llu, targets %llu, buffer copy %llu, texture copy %llu, dispatch %llu, depth needed %llu, texture clear %llu, feedback %llu, update flush %llu",
               (unsigned long long)g_end_why[0], (unsigned long long)g_end_why[1], (unsigned long long)g_end_why[2], (unsigned long long)g_end_why[3], (unsigned long long)g_end_why[4],
               (unsigned long long)g_end_why[5], (unsigned long long)g_end_why[6], (unsigned long long)g_end_why[7], (unsigned long long)g_end_why[8]);

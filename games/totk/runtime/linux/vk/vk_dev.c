@@ -214,7 +214,7 @@ struct sub {
     /* command buffers (prologue for uploads, main), each pair with its own pool: recorded on the game thread, ended and
        submitted on the submit thread; a long submission is cut into several (vk_sub_cut) so the GPU starts on the first while
        the next is recorded and encoded */
-    struct { VkCommandPool pool; VkCommandBuffer up, main; int up_used; } cb[16]; int ncb;
+    struct { VkCommandPool pool; VkCommandBuffer up, main; int up_used; } cb[64]; int ncb;
     uint32_t q_first, q_n;   /* occlusion query slots taken while it was recorded */
     chunk_t *chunks; int nchunks;
     post_t *posts; int nposts, capposts;
@@ -232,8 +232,9 @@ void vk_wait_stats(uint64_t w[4]) { for (int i = 0; i < 4; i++) w[i] = atomic_lo
 void vk_replay_ns(uint64_t ns) { g_wt[3] += ns; }
 /* GPU time: a timestamp at the start and the end of every submission's main command buffer */
 #define TS_RING 512   /* timestamps: (fence % TS_RING, command buffer pair) -> begin / end */
-#define TS_SLOT(s, i) ((uint32_t)(((s)->fence % TS_RING) * 16 + (i)) * 2)
-static VkQueryPool g_ts; static _Atomic uint64_t g_gpu_ns, g_submit_ns, g_end_ns;   /* wall time inside vkQueueSubmit2 / vkEndCommandBuffer of the submissions */
+#define TS_SLOT(s, i) ((uint32_t)(((s)->fence % TS_RING) * 64 + (i)) * 2)
+static VkQueryPool g_ts; static _Atomic uint64_t g_gpu_ns, g_submit_ns, g_end_ns, g_begin_ns, g_ncb_sub;   /* wall time inside vkQueueSubmit2 / vkEndCommandBuffer / vkBeginCommandBuffer (both of a pair), command buffer pairs submitted */
+void vk_cb_stats(uint64_t *begin_ns, uint64_t *pairs) { *begin_ns = atomic_load(&g_begin_ns); *pairs = atomic_load(&g_ncb_sub); }
 uint64_t vk_end_ns(void) { return atomic_load(&g_end_ns); }
 uint64_t vk_submit_ns(void) { return atomic_load(&g_submit_ns); }
 uint64_t vk_gpu_ns(void) { return atomic_load(&g_gpu_ns); }
@@ -276,7 +277,8 @@ static void cb_pair_begin(sub_t *s, int i) {
         VkCommandPoolCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, .queueFamilyIndex = V.qfam};
         VKCHECK(vkCreateCommandPool(V.dev, &cpi, NULL, &s->cb[i].pool)); s->cb[i].up = cb_new_in(s->cb[i].pool); s->cb[i].main = cb_new_in(s->cb[i].pool);
     } else vkResetCommandPool(V.dev, s->cb[i].pool, 0);
-    s->cb[i].up_used = 0; cb_begin(s->cb[i].up); cb_begin(s->cb[i].main);
+    uint64_t b0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    s->cb[i].up_used = 0; cb_begin(s->cb[i].up); cb_begin(s->cb[i].main); atomic_fetch_add(&g_begin_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - b0);
     vkCmdWriteTimestamp2(s->cb[i].main, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g_ts, TS_SLOT(s, i));
 }
 static void cb_pair_close(sub_t *s, int i) {   /* uploads first, visible to everything after */
@@ -294,7 +296,7 @@ void vk_sub_open(void) {
     sub_t *s = g_free_subs; if (s) g_free_subs = s->next; pthread_mutex_unlock(&g_sub_mu);
     if (!s) s = calloc(1, sizeof *s);
     s->fence = atomic_fetch_add(&g_fence_next, 1); s->nchunks = 0; s->nposts = 0; s->nfrees = 0; s->next = NULL; s->q_n = 0;
-    if (!g_ts) { VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 32 * TS_RING}; VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &g_ts)); vkResetQueryPool(V.dev, g_ts, 0, 32 * TS_RING); }
+    if (!g_ts) { VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 128 * TS_RING}; VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &g_ts)); vkResetQueryPool(V.dev, g_ts, 0, 128 * TS_RING); }
     s->ncb = 1; cb_pair_begin(s, 0);
     g_open = s;
 }
@@ -393,6 +395,7 @@ static VkCommandPool g_pool2;   /* command buffers recorded on the submit thread
 static void submit_now(sub_t *s, int i, int last) {
     uint64_t e0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);   /* the ICD may encode at the end of the command buffer: here, off the game thread */
     VKCHECK(vkEndCommandBuffer(s->cb[i].up)); VKCHECK(vkEndCommandBuffer(s->cb[i].main)); atomic_fetch_add(&g_end_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - e0);
+    atomic_fetch_add(&g_ncb_sub, 1);
     VkCommandBufferSubmitInfo cbs[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cb[i].up}, {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cb[i].main}};
     VkSemaphoreSubmitInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = V.timeline, .value = s->fence, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = s->cb[i].up_used ? 2 : 1, .pCommandBufferInfos = s->cb[i].up_used ? cbs : cbs + 1,
@@ -433,7 +436,7 @@ static void jobs_drain(void) {   /* every queued submission and present has reac
 /* a long submission goes to the GPU in parts: the open command buffers are closed and queued (between passes) and recording
    goes on in the next pair; the last part signals the submission's fence */
 void vk_sub_cut(void) {
-    sub_t *s = g_open; if (!s || s->ncb == 16) return;
+    sub_t *s = g_open; if (!s || s->ncb == 64) return;
     cb_pair_close(s, s->ncb - 1); job_push((job_t){.kind = 1, .s = s, .cb = s->ncb - 1, .last = 0});
     cb_pair_begin(s, s->ncb++);
 }
