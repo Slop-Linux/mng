@@ -187,19 +187,20 @@ static void dump_land(void *p) {
 }
 static int g_probe_x = -1, g_probe_y, g_probe_w, g_probe_h; static uint64_t g_probe_n;
 static int probe_on(void) { static int init; if (!init) { init = 1; const char *e = getenv("TOTK_VK_PROBE"); if (e) sscanf(e, "%d,%d,%dx%d", &g_probe_x, &g_probe_y, &g_probe_w, &g_probe_h); } return g_probe_x >= 0; }
-typedef struct { VkBuffer b; VkDeviceMemory m; uint64_t n; int na; VkFormat f[8]; } probe_t;
+typedef struct { VkBuffer b; VkDeviceMemory m; uint64_t n; int na; VkFormat f[8]; uint32_t w, h; } probe_t;
 static void probe_land(void *p) {
     probe_t *q = p; uint32_t *c; if (vkMapMemory(V.dev, q->m, 0, VK_WHOLE_SIZE, 0, (void **)&c) == VK_SUCCESS) {
         char s[400]; int o = 0; for (int i = 0; i < q->na; i++) o += snprintf(s + o, sizeof s - o, " a%d(vk%d) %08x", i, q->f[i], c[i]);
-        VKLOG("probe: draw %llu%s", (unsigned long long)q->n, s); vkUnmapMemory(V.dev, q->m); }
+        VKLOG("probe: draw %llu pass %ux%u%s", (unsigned long long)q->n, q->w, q->h, s); vkUnmapMemory(V.dev, q->m); }
     vkDestroyBuffer(V.dev, q->b, NULL); vkFreeMemory(V.dev, q->m, NULL); free(q);
 }
 static void end_pass(int why);
 static void probe_draw(void) {
-    if ((int)g_pw != g_probe_w || (int)g_ph != g_probe_h) return;
+    if (g_pw < 64 || g_ph < 36) return;   /* every pass of at least 64x36: the probe point scaled from <w>x<h> to the pass size */
+    int px_ = (int)((int64_t)g_probe_x * g_pw / g_probe_w), py_ = (int)((int64_t)g_probe_y * g_ph / g_probe_h);
     uint64_t n = g_probe_n++;
     end_pass(7);
-    probe_t *q = calloc(1, sizeof *q); q->n = n;
+    probe_t *q = calloc(1, sizeof *q); q->n = n; q->w = g_pw; q->h = g_ph;
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 64, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VKCHECK(vkCreateBuffer(V.dev, &bi, NULL, &q->b)); VkMemoryRequirements rq; vkGetBufferMemoryRequirements(V.dev, q->b, &rq);
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = rq.size, .memoryTypeIndex = vk_memtype(rq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
@@ -207,7 +208,7 @@ static void probe_draw(void) {
     for (int i = 0; i < g_pcount && i < 8; i++) { vtex *v = g_patt[i].v; if (!v) continue; uint32_t w, h; VkFormat f; vk_tex_dims(v, &w, &h, &f);
         if (f != VK_FORMAT_R8G8B8A8_UNORM && f != VK_FORMAT_R8G8B8A8_SRGB && f != VK_FORMAT_B10G11R11_UFLOAT_PACK32 && f != VK_FORMAT_A2B10G10R10_UNORM_PACK32 && f != VK_FORMAT_R32_SFLOAT && f != VK_FORMAT_R16G16_SFLOAT && f != VK_FORMAT_R16G16_UNORM) continue;
         VkBufferImageCopy r = {.bufferOffset = 4 * (VkDeviceSize)i, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)g_patt[i].level, vk_tex_is3d(v) ? 0 : (uint32_t)g_patt[i].layer, 1},
-            .imageOffset = {g_probe_x, g_probe_y, 0}, .imageExtent = {1, 1, 1}};
+            .imageOffset = {px_, py_, 0}, .imageExtent = {1, 1, 1}};
         vkCmdCopyImageToBuffer(vk_cb(), vk_tex_image(v), VK_IMAGE_LAYOUT_GENERAL, q->b, 1, &r); q->f[i] = f; q->na = i + 1; }
     full_barrier(); vk_defer_free(probe_land, q);
 }
