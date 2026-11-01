@@ -3,6 +3,8 @@
    until the targets change or a copy, dispatch, texture clear, texture-invalidating barrier or the end of the submission
    needs it closed. Draws use shader objects with all state dynamic; descriptors come from per-submission pools. */
 #include "vk.h"
+#include <math.h>
+#include <unistd.h>
 #include "../../../third_party/d2r_gfx/host/front.h"
 
 uint64_t vk_sub_submit(void);
@@ -92,6 +94,18 @@ static void full_barrier(void) {
 typedef struct { vtex *v; int level, layer; VkImageAspectFlags aspect; VkClearValue val; } pclr_t;
 #define PCLR 64
 static pclr_t g_pclr[PCLR]; static int g_npclr, g_pclr_hit; static uint64_t g_pclr_loads, g_pclr_run, g_pass_dropped;
+static uint64_t g_presents;
+/* TOTK_VK_FMT_LOG=N (diagnostic): the first N distinct (kind, memory, NVN format, view format, size) of render targets,
+   sampled textures and texture copies, with the Vulkan image and its format */
+static void fmt_log(const char *kind, const tex_t *t, int vfmt, const vtex *v, const char *extra) {
+    static long left = -1; if (left < 0) { const char *e = getenv("TOTK_VK_FMT_LOG"); left = e ? atol(e) : 0; }
+    if (left <= 0 || !t) return;
+    static uint64_t seen[4096]; uint64_t k = ((uint64_t)(uintptr_t)t->mem * 31 + (uint64_t)t->d.format * 7 + (uint64_t)vfmt * 131 + t->d.width * 8191ull + t->d.height) ^ (uint64_t)(uintptr_t)kind;
+    for (int i = 0; i < 4096; i++) { if (seen[i] == k) return; if (!seen[i]) { seen[i] = k; break; } }
+    left--; uint32_t w = 0, h = 0; VkFormat f = 0; if (v) vk_tex_dims((vtex *)v, &w, &h, &f);
+    VKLOG("fmt %s: mem %p serial %llu NVN fmt %#x view %#x %ux%u lv %u flags %#x -> image %p vk fmt %d %ux%u%s%s (present %llu)", kind, (void *)t->mem, (unsigned long long)t->serial, t->d.format, vfmt,
+          t->d.width, t->d.height, t->d.levels, t->d.flags, (void *)v, f, w, h, extra ? " " : "", extra ? extra : "", (unsigned long long)g_presents);
+}
 static void pclr_flush(void) {
     if (!g_npclr) return;
     for (int i = 0; i < g_npclr; i++) { const pclr_t *e = &g_pclr[i]; VkImageSubresourceRange r = {e->aspect, (uint32_t)e->level, 1, (uint32_t)e->layer, 1};
@@ -130,6 +144,56 @@ static void pass_record(void) {
     g_pass_recorded = 1; g_passes++; g_frame_passes++; g_gen_state++;
     q_begin();
 }
+/* TOTK_VK_DUMP=<dir>:<first present>:<count>: from that present on, every colour attachment of a pass is copied out at the
+   pass end (in the submission, no wait) and written as <dir>/d<present>-<n>-<w>x<h>-vk<format>.ppm once it completed;
+   <count> pictures in all */
+typedef struct { VkBuffer b; VkDeviceMemory m; uint32_t w, h; VkFormat f; char path[256]; } dump_t;
+static float h2f(uint16_t h) { uint32_t s = h >> 15, e = h >> 10 & 31, m = h & 1023; float v = e ? ldexpf((float)(m | 1024), (int)e - 25) : ldexpf((float)m, -24); return s ? -v : v; }
+static uint8_t f2b(float x) { x = x < 0 ? 0 : x > 1 ? 1 : x; return (uint8_t)(x * 255 + 0.5f); }
+static void dump_land(void *p) {
+    dump_t *d = p; uint8_t *c; FILE *f = fopen(d->path, "wb");
+    if (f && vkMapMemory(V.dev, d->m, 0, VK_WHOLE_SIZE, 0, (void **)&c) == VK_SUCCESS) {
+        fprintf(f, "P6\n%u %u\n255\n", d->w, d->h);
+        int bpp = d->f == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 4;
+        for (uint32_t i = 0; i < d->w * d->h; i++) { uint8_t px[3]; uint32_t v; memcpy(&v, c + (size_t)bpp * i, 4);
+            if (d->f == VK_FORMAT_A2B10G10R10_UNORM_PACK32) { px[0] = (v & 1023) >> 2; px[1] = (v >> 10 & 1023) >> 2; px[2] = (v >> 20 & 1023) >> 2; }
+            else if (d->f == VK_FORMAT_B10G11R11_UFLOAT_PACK32) { uint32_t r = v & 2047, g = v >> 11 & 2047, b = v >> 22 & 1023;
+                px[0] = f2b(ldexpf((float)((r & 63) | ((r >> 6) ? 64 : 0)), (int)(r >> 6) - 21)); px[1] = f2b(ldexpf((float)((g & 63) | ((g >> 6) ? 64 : 0)), (int)(g >> 6) - 21)); px[2] = f2b(ldexpf((float)((b & 31) | ((b >> 5) ? 32 : 0)), (int)(b >> 5) - 20)); }
+            else if (bpp == 8) { uint16_t h4[4]; memcpy(h4, c + 8 * i, 8); px[0] = f2b(h2f(h4[0])); px[1] = f2b(h2f(h4[1])); px[2] = f2b(h2f(h4[2])); }
+            else if (d->f == VK_FORMAT_B8G8R8A8_UNORM || d->f == VK_FORMAT_B8G8R8A8_SRGB) { px[0] = c[4 * i + 2]; px[1] = c[4 * i + 1]; px[2] = c[4 * i]; }
+            else { px[0] = c[4 * i]; px[1] = c[4 * i + 1]; px[2] = c[4 * i + 2]; }
+            fwrite(px, 1, 3, f); }
+        vkUnmapMemory(V.dev, d->m);
+    }
+    if (f) fclose(f);
+    vkDestroyBuffer(V.dev, d->b, NULL); vkFreeMemory(V.dev, d->m, NULL); free(d);
+}
+static char trig[256]; static uint64_t trig_chk;
+static void dump_attachments(void) {
+    static const char *dir; static long first = -2, left; if (first == -2) { const char *e = getenv("TOTK_VK_DUMP"); first = -1;
+        if (e && strchr(e, ':')) { static char d_[200]; snprintf(d_, sizeof d_, "%.*s", (int)(strchr(e, ':') - e), e); dir = d_; first = atol(strchr(e, ':') + 1); left = strchr(strchr(e, ':') + 1, ':') ? atol(strchr(strchr(e, ':') + 1, ':') + 1) : 50;
+            const char *c = strchr(e, ':') + 1;   /* <dir>:<trigger file>:<count>: dumps start once the file appears (it is removed) */
+            if (!(*c >= '0' && *c <= '9')) { snprintf(trig, sizeof trig, "%.*s", (int)(strchr(c, ':') ? strchr(c, ':') - c : (long)strlen(c)), c); first = -3; } } }
+    if (first == -3 && g_presents != trig_chk) { trig_chk = g_presents; if (!access(trig, F_OK)) { unlink(trig); first = (long)g_presents; VKLOG("dump: triggered at present %llu", (unsigned long long)g_presents); } }
+    if (first < 0 || (long)g_presents < first || left <= 0) return;
+    static uint64_t n; int dumped = 0;
+    for (int i = 0; i < g_pcount && left > 0; i++) { vtex *v = g_patt[i].v; if (!v || g_patt[i].level || g_patt[i].layer) continue;
+        uint32_t w, h; VkFormat f; vk_tex_dims(v, &w, &h, &f); int bpp = f == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 4;
+        if (f != VK_FORMAT_A2B10G10R10_UNORM_PACK32 && f != VK_FORMAT_B10G11R11_UFLOAT_PACK32 && f != VK_FORMAT_R8G8B8A8_UNORM && f != VK_FORMAT_R8G8B8A8_SRGB && f != VK_FORMAT_B8G8R8A8_UNORM && f != VK_FORMAT_B8G8R8A8_SRGB && f != VK_FORMAT_R16G16B16A16_SFLOAT) continue;
+        dump_t *d = calloc(1, sizeof *d); d->w = w; d->h = h; d->f = f; snprintf(d->path, sizeof d->path, "%s/d%llu-%llu-%ux%u-vk%d.ppm", dir, (unsigned long long)g_presents, (unsigned long long)n++, w, h, f);
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (VkDeviceSize)w * h * bpp, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VKCHECK(vkCreateBuffer(V.dev, &bi, NULL, &d->b)); VkMemoryRequirements rq; vkGetBufferMemoryRequirements(V.dev, d->b, &rq);
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = rq.size, .memoryTypeIndex = vk_memtype(rq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
+        VKCHECK(vkAllocateMemory(V.dev, &ai, NULL, &d->m)); VKCHECK(vkBindBufferMemory(V.dev, d->b, d->m, 0));
+        VkBufferImageCopy r = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
+        vkCmdCopyImageToBuffer(vk_cb(), vk_tex_image(v), VK_IMAGE_LAYOUT_GENERAL, d->b, 1, &r);
+        vk_defer_free(dump_land, d); left--;
+        VKLOG("dump: present %llu attachment %d %ux%u vk %d -> %s", (unsigned long long)g_presents, i, w, h, f, d->path); dumped = 1;
+    }
+    if (dumped) { VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_HOST_READ_BIT};
+        VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb}; vkCmdPipelineBarrier2(vk_cb(), &di); }
+}
 static void end_pass(int why) {
     if (!g_pass_open) return;
     static int pclr = -1; if (pclr < 0) { const char *e = getenv("TOTK_VK_PCLR"); pclr = !(e && !strcmp(e, "0")); }
@@ -149,7 +213,7 @@ static void end_pass(int why) {
     g_end_why[why]++;
     q_end(1);
     vkCmdEndRendering(vk_cb()); g_pass_open = 0; g_pass_recorded = 0; pt_close(why);
-    full_barrier();
+    full_barrier(); dump_attachments();
     /* TOTK_VK_CHUNK_DRAWS=<first>[/<next>] (default 30/40 as MNG on macOS; 0 off): the submission so far goes to the GPU (vk_sub_cut) once its
        first part has <first> draws, then every <next> */
     static long first = -1, next; if (first < 0) { const char *e = getenv("TOTK_VK_CHUNK_DRAWS"); first = e ? atol(e) : 30; next = e ? first : 40; if (e && strchr(e, '/')) next = atol(strchr(e, '/') + 1); }
@@ -222,6 +286,7 @@ static int pass_begin(void) {
         int lv = S.rt.has_cview[i] && S.rt.cview[i].set_levels ? S.rt.cview[i].base_level : 0; tw = tw >> lv ? tw >> lv : 1; th = th >> lv ? th >> lv : 1;
         if (tw < w) w = tw; if (th < h) h = th;
         if (!(S.rt.has_cview[i] && S.rt.cview[i].set_format && S.rt.cview[i].format != t->d.format)) { aw[i] = tw; ah[i] = th; }   /* pending clears: the image's own format only */
+        fmt_log("target", t, S.rt.has_cview[i] && S.rt.cview[i].set_format ? S.rt.cview[i].format : t->d.format, v, NULL);
         vk_tex_upload_if_stale(v, t); vk_tex_gpu_wrote(v);
         g_patt[i] = (att_t){v, view, lv, S.rt.has_cview[i] && S.rt.cview[i].set_layers ? S.rt.cview[i].min_layer : 0}; g_pslot[i] = i;
         ca[i] = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
@@ -557,6 +622,7 @@ static VkDescriptorSet stage_set(vshader *s, int stage, int set, VkDescriptorSet
                         if (g_npclr) for (int i = 0; i < g_npclr; i++) g_pclr_hit |= g_pclr[i].v == v;
                         if (is_img) vk_tex_gpu_wrote(v);
                         view = vk_tex_view(v, &t, &vw, hv, view_type(b->stype), 0);
+                        fmt_log(is_img ? "image" : "sampled", &t, hv && vw.set_format ? vw.format : t.d.format, v, stage == 0 ? "vertex" : stage == 5 ? "compute" : NULL);
                         /* the sampled levels / layers include an attachment's own: the pass must land first */
                         int l0 = hv && vw.set_levels ? vw.base_level : 0, nl = hv && vw.set_levels && vw.nlevels ? vw.nlevels : 64;
                         int y0 = hv && vw.set_layers ? vw.min_layer : 0, ny = hv && vw.set_layers && vw.nlayers ? vw.nlayers : 4096;
@@ -1019,6 +1085,7 @@ static void copy_t2t(const p_copy_t2t *c) {
         VkImageCopy r = {b.srcSubresource, b.srcOffsets[0], b.dstSubresource, b.dstOffsets[0], {(uint32_t)c->sr.width, (uint32_t)(c->sr.height ? c->sr.height : 1), 1}};
         vkCmdCopyImage(vk_cb(), vk_tex_image(s), VK_IMAGE_LAYOUT_GENERAL, vk_tex_image(d), VK_IMAGE_LAYOUT_GENERAL, 1, &r);
     } else vkCmdBlitImage(vk_cb(), vk_tex_image(s), VK_IMAGE_LAYOUT_GENERAL, vk_tex_image(d), VK_IMAGE_LAYOUT_GENERAL, 1, &b, (c->flags & 1) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    { char x_[96]; snprintf(x_, sizeof x_, "to fmt %#x %ux%u mem %p (%s)", c->dst->d.format, c->dst->d.width, c->dst->d.height, (void *)c->dst->mem, same && (sf == df || (as & VK_IMAGE_ASPECT_DEPTH_BIT)) ? "copy" : "blit"); fmt_log("copy", c->src, c->has_sv && c->sv.set_format ? c->sv.format : c->src->d.format, s, x_); }
     vk_tex_mark_read(s); vk_tex_gpu_wrote(d); full_barrier(); g_copies++;
 }
 /* a texture clear goes pending (pclr_add); one of an attachment of the open pass ends that pass first. Draws of the open
