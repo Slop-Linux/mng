@@ -41,6 +41,7 @@ static uint64_t g_passes, g_draws, g_dispatches, g_copies, g_skips[8], g_frame_p
 /* ---------- the pass ---------- */
 typedef struct { vtex *v; VkImageView view; int level, layer; } att_t;
 static char trig[256]; static uint64_t trig_chk; static long g_dump_first = -2;   /* TOTK_VK_DUMP: the present the dump started at */
+static uint64_t g_vi_hash, g_blend_hash, g_rt_hash, g_links;   /* the parts of the ICD link key last set; first-use link keys counted */
 static int g_pass_open; static att_t g_patt[8], g_pdepth; static int g_pslot[8]; static uint32_t g_pw, g_ph; static int g_pcount;
 static int g_dyn_set;   /* every dynamic state set once in this command buffer */
 /* attachments (bit 0-7 colour, 8 depth / stencil) written by a draw or clear of the open pass. A draw sampling one of them
@@ -147,6 +148,8 @@ static void pass_record(void) {
         for (int i = 0; i < g_pcount; i++) if (g_patt[i].v) { uint32_t w_, h_; VkFormat f_; vk_tex_dims(g_patt[i].v, &w_, &h_, &f_); if (w_ == aw_ && h_ == ah_ && (af_ < 0 || (int)f_ == af_)) { g_dump_first = (long)g_presents; VKLOG("dump: armed dump starts at present %llu", (unsigned long long)g_presents); break; } }
     }
     if (g_dump_first >= 0 && (long)g_presents == g_dump_first) VKLOG("pass: %ux%u att0 load %d clear %.3f %.3f %.3f %.3f, %d colour, depth %d load %d clear %.3f", g_pw, g_ph, g_pcount ? (int)g_lca[0].loadOp : -1, g_lca[0].clearValue.color.float32[0], g_lca[0].clearValue.color.float32[1], g_lca[0].clearValue.color.float32[2], g_lca[0].clearValue.color.float32[3], g_pcount, g_pdepth.v != NULL, (int)g_lda.loadOp, g_lda.clearValue.depthStencil.depth);
+    { uint64_t h_ = (uint64_t)g_pcount; for (int i = 0; i < g_pcount; i++) { uint32_t w_, h2_; VkFormat f_ = 0; if (g_patt[i].v) vk_tex_dims(g_patt[i].v, &w_, &h2_, &f_); h_ = h_ * 1099511628211ull + (uint64_t)f_; }
+      if (g_lri.pDepthAttachment && g_pdepth.v) { uint32_t w_, h2_; VkFormat f_; vk_tex_dims(g_pdepth.v, &w_, &h2_, &f_); h_ = h_ * 1099511628211ull + (uint64_t)f_ + 77; } g_rt_hash = h_; }
     vkCmdBeginRendering(vk_cb(), &g_lri);
     g_pass_recorded = 1; g_passes++; g_frame_passes++; g_gen_state++;
     q_begin();
@@ -467,10 +470,8 @@ static pair_t *pair_get(vshader *vs, vshader *fs) {
     VkDescriptorSetLayout l[2] = {vs->layout, fs ? fs->layout : V.empty_layout};
     VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 2, .pSetLayouts = l};
     VKCHECK(vkCreatePipelineLayout(V.dev, &pli, NULL, &p->pl));
-    VkShaderEXT w_[2];
-    if (vk_warm_take(vs->key, fs ? fs->key : "-", w_)) { p->sh[0] = w_[0]; p->sh[1] = fs ? w_[1] : VK_NULL_HANDLE; }   /* compiled by the warm-up */
-    else { p->sh[0] = make_shader(vs, VK_SHADER_STAGE_VERTEX_BIT, fs ? VK_SHADER_STAGE_FRAGMENT_BIT : 0, l, 2);
-           if (fs) p->sh[1] = make_shader(fs, VK_SHADER_STAGE_FRAGMENT_BIT, 0, l, 2); }
+    p->sh[0] = make_shader(vs, VK_SHADER_STAGE_VERTEX_BIT, fs ? VK_SHADER_STAGE_FRAGMENT_BIT : 0, l, 2);
+    if (fs) p->sh[1] = make_shader(fs, VK_SHADER_STAGE_FRAGMENT_BIT, 0, l, 2);
     p->next = g_pairs[h]; g_pairs[h] = p; return p;
 }
 static comp_t *comp_get(vshader *cs) {
@@ -479,7 +480,7 @@ static comp_t *comp_get(vshader *cs) {
     comp_t *c = calloc(1, sizeof *c); c->cs = cs;
     VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &cs->layout};
     VKCHECK(vkCreatePipelineLayout(V.dev, &pli, NULL, &c->pl));
-    VkShaderEXT w_[2]; if (vk_warm_take(cs->key, "compute", w_)) c->sh = w_[0]; else c->sh = make_shader(cs, VK_SHADER_STAGE_COMPUTE_BIT, 0, &cs->layout, 1);
+    c->sh = make_shader(cs, VK_SHADER_STAGE_COMPUTE_BIT, 0, &cs->layout, 1);
     c->next = g_comps[h]; g_comps[h] = c; return c;
 }
 /* descriptor pools: taken by a submission, reset when it completes */
@@ -845,6 +846,8 @@ static void set_dynamic(VkCommandBuffer cb) {
     if (dyn_changed(D_BEN, en, n * sizeof *en)) V.CmdSetColorBlendEnableEXT(cb, 0, (uint32_t)n, en);
     if (dyn_changed(D_BEQ, eq, n * sizeof *eq)) V.CmdSetColorBlendEquationEXT(cb, 0, (uint32_t)n, eq);
     if (dyn_changed(D_WM, wm, n * sizeof *wm)) V.CmdSetColorWriteMaskEXT(cb, 0, (uint32_t)n, wm);
+    { uint64_t h_ = 1469598103934665603ull; const uint8_t *q_[3] = {(const uint8_t *)en, (const uint8_t *)eq, (const uint8_t *)wm}; size_t l_[3] = {n * sizeof *en, n * sizeof *eq, n * sizeof *wm};
+      for (int j = 0; j < 3; j++) for (size_t i = 0; i < l_[j]; i++) h_ = (h_ ^ q_[j][i]) * 1099511628211ull; for (int i = 0; i < n; i++) if (!en[i]) h_ ^= (uint64_t)i * 0x9e3779b97f4a7c15ull; g_blend_hash = h_; }
 }
 static VkPrimitiveTopology topology(int prim) {
     switch (prim) {
@@ -884,6 +887,8 @@ static void vertex_input(VkCommandBuffer cb, vshader *vs) {
     }
     (void)strides;
     V.CmdSetVertexInputEXT(cb, (uint32_t)nbd, bd, (uint32_t)nad, ad);
+    { uint64_t h_ = 1469598103934665603ull; for (int i = 0; i < nbd; i++) { uint32_t v_[4] = {bd[i].binding, bd[i].stride, bd[i].inputRate, bd[i].divisor}; for (int b = 0; b < 16; b++) h_ = (h_ ^ ((const uint8_t *)v_)[b]) * 1099511628211ull; }
+      for (int i = 0; i < nad; i++) { uint32_t v_[4] = {ad[i].location, ad[i].binding, (uint32_t)ad[i].format, ad[i].offset}; for (int b = 0; b < 16; b++) h_ = (h_ ^ ((const uint8_t *)v_)[b]) * 1099511628211ull; } g_vi_hash = h_; }
 }
 /* quads and quad strips: an index list of triangles */
 static int quad_indices(int prim, const p_draw_idx *di, int first, int count, VkBuffer *b, VkDeviceSize *o, int *n) {
@@ -1006,6 +1011,13 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
               g_pw, g_ph, (void *)g_patt[0].v, (int)af_, vs ? vs->key : "-", fs ? fs->key : "-", S.color.blend_en & 1, bl->src_rgb, bl->dst_rgb, bl->eq_rgb, bl->src_a, bl->dst_a, bl->eq_a, S.chmask.mask & 0xf,
               S.nvp ? S.vp[0][0] : 0, S.nvp ? S.vp[0][1] : 0, S.nvp ? S.vp[0][2] : 0, S.nvp ? S.vp[0][3] : 0, S.has_sc, S.sc.x, S.sc.y, S.sc.w, S.sc.h, S.ds.dt, S.ds.dw, S.ds.st, S.poly.cull, prim, d ? d->count : di->count, inst, tx);
     }
+    { /* first uses of the ICD's link key (driver object.rs graphics(): shader objects, topology, blend / masks, attachment formats, vertex input) */
+      VkPrimitiveTopology t_ = topology(prim); uint64_t k_[7] = {(uint64_t)p->sh[0], (uint64_t)sh[1], (uint64_t)t_, g_vi_hash, g_blend_hash, g_rt_hash, (uint64_t)(S.ms.a2c && S.ms.enable)};
+      uint64_t h_ = 1469598103934665603ull; const uint8_t *q_ = (const uint8_t *)k_; for (size_t i = 0; i < sizeof k_; i++) h_ = (h_ ^ q_[i]) * 1099511628211ull;
+      static uint64_t *set_; static size_t cap_ = 0, n_ = 0; if (!set_) { cap_ = 1u << 16; set_ = calloc(cap_, 8); }
+      if (!h_) h_ = 1; size_t i_ = h_ & (cap_ - 1); while (set_[i_] && set_[i_] != h_) i_ = (i_ + 1) & (cap_ - 1);
+      if (!set_[i_]) { set_[i_] = h_; n_++; g_links++;
+          if (n_ * 2 > cap_) { uint64_t *o_ = set_; size_t oc_ = cap_; cap_ *= 2; set_ = calloc(cap_, 8); for (size_t j = 0; j < oc_; j++) if (o_[j]) { size_t k = o_[j] & (cap_ - 1); while (set_[k]) k = (k + 1) & (cap_ - 1); set_[k] = o_[j]; } free(o_); } } }
     g_q_draws += g_q_cur >= 0;
     if (g_q_cur >= 0 && g_q_open) { static int log = -1, n; if (log < 0) log = getenv("TOTK_VK_QUERY_LOG") != NULL;
         if (log && n++ < 40) VKLOG("counted draw: pass %ux%u colour %d depth %d (nodepth %d), colour mask %#x, depth test %d write %d func %d, stencil %d, cull %d, raster discard %d, vp %.0fx%.0f, prim %d count %d", g_pw, g_ph, g_pcount, g_pdepth.v != NULL, g_pass_nodepth,
@@ -1277,11 +1289,11 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     { /* a frame over 60 ms: where the time went (vk_wait_stats; mtl_wait counts every thread) */
       static uint64_t pt, pw[4]; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC), w[4]; void vk_wait_stats(uint64_t[4]); vk_wait_stats(w);
       static uint64_t lim; if (!lim) { const char *e = getenv("TOTK_VK_LONG_MS"); lim = (e ? atol(e) : 60) * 1000000ull; }   /* TOTK_VK_LONG_MS: the threshold */
-      static uint64_t pmk[2], pup[3], pgpu, pdisp, psh[4]; uint64_t up_[3], gpu_ = 0, sh_[4]; vk_shader_stats(sh_); void vk_tex_stats(uint64_t *, uint64_t *, uint64_t *); vk_tex_stats(&up_[0], &up_[1], &up_[2]); { uint64_t vk_gpu_ns(void); gpu_ = vk_gpu_ns(); }
-      if (pt && now - pt > lim && g_presents > 8000) { static int n; if (n++ < 200) VKLOG("long frame at present %llu: %.1f ms; job queue full %.1f, mtl_wait %.1f, one-shot %.1f, replay %.1f ms; shader objects %llu / %.1f ms, uploads %llu / %.1f MB, GPU %.1f ms since the last present; this frame %llu passes / %llu draws / %llu dispatches; variants loaded %llu / %.1f ms, translated %llu / %.1f ms", (unsigned long long)g_presents,
-          (now - pt) / 1e6, (w[0] - pw[0]) / 1e6, (w[1] - pw[1]) / 1e6, (w[2] - pw[2]) / 1e6, (w[3] - pw[3]) / 1e6, (unsigned long long)(g_mk[0] - pmk[0]), (g_mk[1] - pmk[1]) / 1e6, (unsigned long long)(up_[0] - pup[0]), (up_[1] - pup[1]) / 1e6, (gpu_ - pgpu) / 1e6, (unsigned long long)g_frame_passes, (unsigned long long)g_frame_draws, (unsigned long long)(g_dispatches - pdisp), (unsigned long long)(sh_[0] - psh[0]), (sh_[1] - psh[1]) / 1e6, (unsigned long long)(sh_[2] - psh[2]), (sh_[3] - psh[3]) / 1e6);
+      static uint64_t pmk[2], pup[3], pgpu, pdisp, psh[4], plink; uint64_t up_[3], gpu_ = 0, sh_[4]; vk_shader_stats(sh_); void vk_tex_stats(uint64_t *, uint64_t *, uint64_t *); vk_tex_stats(&up_[0], &up_[1], &up_[2]); { uint64_t vk_gpu_ns(void); gpu_ = vk_gpu_ns(); }
+      if (pt && now - pt > lim && g_presents > 8000) { static int n; if (n++ < 200) VKLOG("long frame at present %llu: %.1f ms; job queue full %.1f, mtl_wait %.1f, one-shot %.1f, replay %.1f ms; shader objects %llu / %.1f ms, new link keys %llu, uploads %llu / %.1f MB, GPU %.1f ms since the last present; this frame %llu passes / %llu draws / %llu dispatches; variants loaded %llu / %.1f ms, translated %llu / %.1f ms", (unsigned long long)g_presents,
+          (now - pt) / 1e6, (w[0] - pw[0]) / 1e6, (w[1] - pw[1]) / 1e6, (w[2] - pw[2]) / 1e6, (w[3] - pw[3]) / 1e6, (unsigned long long)(g_mk[0] - pmk[0]), (g_mk[1] - pmk[1]) / 1e6, (unsigned long long)(g_links - plink), (unsigned long long)(up_[0] - pup[0]), (up_[1] - pup[1]) / 1e6, (gpu_ - pgpu) / 1e6, (unsigned long long)g_frame_passes, (unsigned long long)g_frame_draws, (unsigned long long)(g_dispatches - pdisp), (unsigned long long)(sh_[0] - psh[0]), (sh_[1] - psh[1]) / 1e6, (unsigned long long)(sh_[2] - psh[2]), (sh_[3] - psh[3]) / 1e6);
           if (n < 4) VKLOG("  uniform copies %llu, %.1f MB", (unsigned long long)g_ucopy[0], g_ucopy[1] / 1e6); }
-      memset(g_ucopy, 0, sizeof g_ucopy); memcpy(pmk, g_mk, sizeof pmk); memcpy(pup, up_, sizeof pup); pgpu = gpu_; pdisp = g_dispatches; memcpy(psh, sh_, sizeof psh);
+      memset(g_ucopy, 0, sizeof g_ucopy); memcpy(pmk, g_mk, sizeof pmk); memcpy(pup, up_, sizeof pup); pgpu = gpu_; pdisp = g_dispatches; memcpy(psh, sh_, sizeof psh); plink = g_links;
       pt = now; memcpy(pw, w, sizeof w); }
     /* frames in flight: present N waits until the GPU finished the frame of present N - TOTK_VK_FRAMES_AHEAD (2). Without a
        swapchain nothing else holds the game thread back, and a sync wait of the game (every 10 frames in the Shrine) then
@@ -1303,7 +1315,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
           VKLOG("GPU busy %.2f ms per present over the last 600; submit thread per present: vkEndCommandBuffer %.2f ms, vkQueueSubmit2 %.2f ms; %.1f command buffer pairs, vkBeginCommandBuffer %.2f ms (game thread); uniform copies %.0f / %.2f MB per present; occlusion reports %llu zero, %llu not; state commands emitted %llu, skipped %llu", (g - pg) / 1e6 / 600, (e - pe) / 1e6 / 600, (q - ps) / 1e6 / 600, (cn - pc) / 600.0, (bn - pb) / 1e6 / 600, g_ucopy_all[0] / 600.0, g_ucopy_all[1] / 600e6, ({ uint64_t r_[2]; vk_query_stats(r_); (unsigned long long)r_[0]; }), ({ uint64_t r_[2]; vk_query_stats(r_); (unsigned long long)r_[1]; }), (unsigned long long)g_dyn_emitted, (unsigned long long)g_dyn_skipped); pg = g; ps = q; pe = e; pb = bn; pc = cn; memset(g_ucopy_all, 0, sizeof g_ucopy_all); }
         if (pool_shadow()) VKLOG("pool shadow: %llu ranges copied, %llu over 16 MiB left in place", (unsigned long long)g_pshadow[0], (unsigned long long)g_pshadow[1]);
         if (ubo_snapshot() || pool_shadow()) VKLOG("snapshot: %llu ranges copied, %llu read from memory (GPU-written, %d writes pending), %llu copies dropped by GPU writes", (unsigned long long)g_usnap[0], (unsigned long long)g_usnap[1], g_ngw, (unsigned long long)g_usnap[2]);
-        { uint64_t ws_[3]; vk_warm_stats(ws_); VKLOG("shader objects: %llu created in frames (%.1f ms); warm-up %llu ready, %llu taken, %llu new pairs listed", (unsigned long long)g_mk[0], g_mk[1] / 1e6, (unsigned long long)ws_[0], (unsigned long long)ws_[1], (unsigned long long)ws_[2]); }
+        { uint64_t s_[4]; vk_shader_stats(s_); VKLOG("shader objects: %llu created (%.1f ms); first-use link keys %llu; variants loaded %llu (%.1f ms), translated %llu (%.1f ms)", (unsigned long long)g_mk[0], g_mk[1] / 1e6, (unsigned long long)g_links, (unsigned long long)s_[0], s_[1] / 1e6, (unsigned long long)s_[2], s_[3] / 1e6); }
         VKLOG("pass ends: submit %llu, targets %llu, buffer copy %llu, texture copy %llu, dispatch %llu, depth needed %llu, texture clear %llu, feedback %llu, update flush %llu",
               (unsigned long long)g_end_why[0], (unsigned long long)g_end_why[1], (unsigned long long)g_end_why[2], (unsigned long long)g_end_why[3], (unsigned long long)g_end_why[4],
               (unsigned long long)g_end_why[5], (unsigned long long)g_end_why[6], (unsigned long long)g_end_why[7], (unsigned long long)g_end_why[8]);
@@ -1312,7 +1324,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     g_frame_passes = g_frame_draws = 0; pt_frame(g_presents);
     return g_presents;
 }
-void mtl_init(void) { vk_init(); vk_warm_start(); void runtime_audio_hold(int); runtime_audio_hold(0); }   /* audio_mixer.c holds the sound until nvn_mtl.m warm_start ends its warm-up; this backend has none */
+void mtl_init(void) { vk_init(); void runtime_audio_hold(int); runtime_audio_hold(0); }   /* audio_mixer.c holds the sound until nvn_mtl.m warm_start ends its warm-up; this backend has none */
 void mtl_stats(uint64_t *passes, uint64_t *draws) { *passes = g_passes; *draws = g_draws; }
 void mtl_wb_fence_done(void) {}
 void mtl_prog_release(prog_t *p) { (void)p; }
@@ -1324,7 +1336,7 @@ void mtl_shot_at_present(const tex_t *t) { (void)t; }
 int mtl_display_hz(void) { return 0; }
 int mtl_link_active(void) { return 0; }
 int mtl_link_wait_tick(uint64_t timeout_ns, unsigned frame_ticks) { (void)timeout_ns; (void)frame_ticks; return 0; }
-int mtl_warm_wait(int timeout_ms) { return vk_warm_wait(timeout_ms); }   /* the first world frame waits for the shader-object warm-up (hle_nvn.c, as nvn_mtl.m) */
+int mtl_warm_wait(int timeout_ms) { (void)timeout_ms; return 0; }
 void mtl_set_frame(uint64_t f) { (void)f; }
 void mtl_ub_present(double iv_ms) { (void)iv_ms; }
 void mtl_note_world(void) {}
