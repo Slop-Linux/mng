@@ -185,8 +185,8 @@ static void dump_land(void *p) {
     if (f) fclose(f);
     vkDestroyBuffer(V.dev, d->b, NULL); vkFreeMemory(V.dev, d->m, NULL); free(d);
 }
-static int g_probe_x = -1, g_probe_y, g_probe_w, g_probe_h; static uint64_t g_probe_n;
-static int probe_on(void) { static int init; if (!init) { init = 1; const char *e = getenv("TOTK_VK_PROBE"); if (e) sscanf(e, "%d,%d,%dx%d", &g_probe_x, &g_probe_y, &g_probe_w, &g_probe_h); } return g_probe_x >= 0; }
+static int g_probe_x = -1, g_probe_y, g_probe_w, g_probe_h, g_probe_pass; static uint64_t g_probe_n;   /* g_probe_pass (TOTK_VK_PROBE=...,pass): probed at each pass end as the frame makes its passes, no split per draw */
+static int probe_on(void) { static int init; if (!init) { init = 1; const char *e = getenv("TOTK_VK_PROBE"); if (e) { sscanf(e, "%d,%d,%dx%d", &g_probe_x, &g_probe_y, &g_probe_w, &g_probe_h); g_probe_pass = strstr(e, ",pass") != NULL; } } return g_probe_x >= 0; }
 typedef struct { VkBuffer b; VkDeviceMemory m; uint64_t n; int na; VkFormat f[8]; uint32_t w, h; } probe_t;
 static void probe_land(void *p) {
     probe_t *q = p; uint32_t *c; if (vkMapMemory(V.dev, q->m, 0, VK_WHOLE_SIZE, 0, (void **)&c) == VK_SUCCESS) {
@@ -195,11 +195,11 @@ static void probe_land(void *p) {
     vkDestroyBuffer(V.dev, q->b, NULL); vkFreeMemory(V.dev, q->m, NULL); free(q);
 }
 static void end_pass(int why);
-static void probe_draw(void) {
+static void probe_draw(int split) {
     if (g_pw < 64 || g_ph < 36) return;   /* every pass of at least 64x36: the probe point scaled from <w>x<h> to the pass size */
     int px_ = (int)((int64_t)g_probe_x * g_pw / g_probe_w), py_ = (int)((int64_t)g_probe_y * g_ph / g_probe_h);
     uint64_t n = g_probe_n++;
-    end_pass(7);
+    if (split) end_pass(7);
     probe_t *q = calloc(1, sizeof *q); q->n = n; q->w = g_pw; q->h = g_ph;
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 64, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VKCHECK(vkCreateBuffer(V.dev, &bi, NULL, &q->b)); VkMemoryRequirements rq; vkGetBufferMemoryRequirements(V.dev, q->b, &rq);
@@ -257,7 +257,7 @@ static void end_pass(int why) {
     g_end_why[why]++;
     q_end(1);
     vkCmdEndRendering(vk_cb()); g_pass_open = 0; g_pass_recorded = 0; pt_close(why);
-    full_barrier(); dump_attachments();
+    full_barrier(); dump_attachments(); if (g_probe_pass && g_dump_first >= 0 && (long)g_presents == g_dump_first) probe_draw(0);
     /* TOTK_VK_CHUNK_DRAWS=<first>[/<next>] (default 30/40 as MNG on macOS; 0 off): the submission so far goes to the GPU (vk_sub_cut) once its
        first part has <first> draws, then every <next> */
     static long first = -1, next; if (first < 0) { const char *e = getenv("TOTK_VK_CHUNK_DRAWS"); first = e ? atol(e) : 30; next = e ? first : 40; if (e && strchr(e, '/')) next = atol(strchr(e, '/') + 1); }
@@ -1045,7 +1045,7 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
     }
     /* TOTK_VK_PROBE=<x>,<y>,<w>x<h> (with TOTK_VK_DUMP, its frame): after every draw into a pass of that size the pass is ended
        and the texel (x, y) of each colour attachment is copied out; logged per draw ("probe: draw n ...") on completion */
-    if (g_dump_first >= 0 && (long)g_presents == g_dump_first && probe_on()) probe_draw();
+    if (g_dump_first >= 0 && (long)g_presents == g_dump_first && probe_on() && !g_probe_pass) probe_draw(1);
     { /* first uses of the ICD's link key (driver object.rs graphics(): shader objects, topology, blend / masks, attachment formats, vertex input) */
       VkPrimitiveTopology t_ = topology(prim); uint64_t k_[7] = {(uint64_t)p->sh[0], (uint64_t)sh[1], (uint64_t)t_, g_vi_hash, g_blend_hash, g_rt_hash, (uint64_t)(S.ms.a2c && S.ms.enable)};
       uint64_t h_ = 1469598103934665603ull; const uint8_t *q_ = (const uint8_t *)k_; for (size_t i = 0; i < sizeof k_; i++) h_ = (h_ ^ q_[i]) * 1099511628211ull;
