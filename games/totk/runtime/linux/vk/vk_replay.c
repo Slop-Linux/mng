@@ -1103,6 +1103,9 @@ static void copy_t2t(const p_copy_t2t *c) {
         .srcOffsets = {{c->sr.xoffset, c->sr.yoffset, 0}, {c->sr.xoffset + c->sr.width, c->sr.yoffset + (c->sr.height ? c->sr.height : 1), 1}},
         .dstSubresource = {ad, (uint32_t)region_level(&c->dv, c->has_dv), (uint32_t)(dl + c->dr.zoffset), 1},
         .dstOffsets = {{c->dr.xoffset, c->dr.yoffset, 0}, {c->dr.xoffset + c->dr.width, c->dr.yoffset + (c->dr.height ? c->dr.height : 1), 1}}};
+    /* a 3D texture's slice is a z offset (nvn_mtl.m copy: depthPlane / origin.z), not an array layer */
+    if (vk_tex_is3d(s)) { b.srcSubresource.baseArrayLayer = 0; b.srcOffsets[0].z = sl + c->sr.zoffset; b.srcOffsets[1].z = b.srcOffsets[0].z + 1; }
+    if (vk_tex_is3d(d)) { b.dstSubresource.baseArrayLayer = 0; b.dstOffsets[0].z = dl + c->dr.zoffset; b.dstOffsets[1].z = b.dstOffsets[0].z + 1; }
     int same = c->sr.width == c->dr.width && c->sr.height == c->dr.height;
     uint32_t sw, sh, dw, dh; VkFormat sf, df; vk_tex_dims(s, &sw, &sh, &sf); vk_tex_dims(d, &dw, &dh, &df);
     if (same && (sf == df || (as & VK_IMAGE_ASPECT_DEPTH_BIT))) {
