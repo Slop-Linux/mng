@@ -40,6 +40,7 @@ static uint64_t g_passes, g_draws, g_dispatches, g_copies, g_skips[8], g_frame_p
 
 /* ---------- the pass ---------- */
 typedef struct { vtex *v; VkImageView view; int level, layer; } att_t;
+static char trig[256]; static uint64_t trig_chk; static long g_dump_first = -2;   /* TOTK_VK_DUMP: the present the dump started at */
 static int g_pass_open; static att_t g_patt[8], g_pdepth; static int g_pslot[8]; static uint32_t g_pw, g_ph; static int g_pcount;
 static int g_dyn_set;   /* every dynamic state set once in this command buffer */
 /* attachments (bit 0-7 colour, 8 depth / stencil) written by a draw or clear of the open pass. A draw sampling one of them
@@ -140,6 +141,7 @@ static void pass_record(void) {
     static int nodepth = -1; if (nodepth < 0) { const char *e = getenv("TOTK_VK_NODEPTH"); nodepth = !(e && !strcmp(e, "0")); }
     if (nodepth && g_pdepth.v && !g_force_depth && !S.ds.dt && !S.ds.dw && !S.ds.st && g_lda.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR && g_lsa.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
         g_lri.pDepthAttachment = g_lri.pStencilAttachment = NULL; g_pass_nodepth = 1; g_nodepth_passes++; }
+    if (g_dump_first >= 0 && (long)g_presents == g_dump_first) VKLOG("pass: %ux%u att0 load %d clear %.3f %.3f %.3f %.3f, %d colour, depth %d load %d clear %.3f", g_pw, g_ph, g_pcount ? (int)g_lca[0].loadOp : -1, g_lca[0].clearValue.color.float32[0], g_lca[0].clearValue.color.float32[1], g_lca[0].clearValue.color.float32[2], g_lca[0].clearValue.color.float32[3], g_pcount, g_pdepth.v != NULL, (int)g_lda.loadOp, g_lda.clearValue.depthStencil.depth);
     vkCmdBeginRendering(vk_cb(), &g_lri);
     g_pass_recorded = 1; g_passes++; g_frame_passes++; g_gen_state++;
     q_begin();
@@ -163,19 +165,25 @@ static void dump_land(void *p) {
             else if (d->f == VK_FORMAT_B8G8R8A8_UNORM || d->f == VK_FORMAT_B8G8R8A8_SRGB) { px[0] = c[4 * i + 2]; px[1] = c[4 * i + 1]; px[2] = c[4 * i]; }
             else { px[0] = c[4 * i]; px[1] = c[4 * i + 1]; px[2] = c[4 * i + 2]; }
             fwrite(px, 1, 3, f); }
+        { char ap[270]; snprintf(ap, sizeof ap, "%.*s-alpha.pgm", (int)strlen(d->path) - 4, d->path); FILE *g = fopen(ap, "wb");   /* alpha as grey */
+          if (g) { fprintf(g, "P5\n%u %u\n255\n", d->w, d->h); int bpp = d->f == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 4;
+            for (uint32_t i = 0; i < d->w * d->h; i++) { uint32_t v; memcpy(&v, c + (size_t)bpp * i, 4); uint8_t a;
+                if (d->f == VK_FORMAT_A2B10G10R10_UNORM_PACK32) a = (uint8_t)((v >> 30) * 85); else if (d->f == VK_FORMAT_B10G11R11_UFLOAT_PACK32) a = 255;
+                else if (bpp == 8) { uint16_t h4[4]; memcpy(h4, c + 8 * i, 8); a = f2b(h2f(h4[3])); } else a = c[4 * i + 3];
+                fputc(a, g); }
+            fclose(g); } }
         vkUnmapMemory(V.dev, d->m);
     }
     if (f) fclose(f);
     vkDestroyBuffer(V.dev, d->b, NULL); vkFreeMemory(V.dev, d->m, NULL); free(d);
 }
-static char trig[256]; static uint64_t trig_chk;
 static void dump_attachments(void) {
-    static const char *dir; static long first = -2, left; if (first == -2) { const char *e = getenv("TOTK_VK_DUMP"); first = -1;
-        if (e && strchr(e, ':')) { static char d_[200]; snprintf(d_, sizeof d_, "%.*s", (int)(strchr(e, ':') - e), e); dir = d_; first = atol(strchr(e, ':') + 1); left = strchr(strchr(e, ':') + 1, ':') ? atol(strchr(strchr(e, ':') + 1, ':') + 1) : 50;
+    static const char *dir; static long left; if (g_dump_first == -2) { const char *e = getenv("TOTK_VK_DUMP"); g_dump_first = -1;
+        if (e && strchr(e, ':')) { static char d_[200]; snprintf(d_, sizeof d_, "%.*s", (int)(strchr(e, ':') - e), e); dir = d_; g_dump_first = atol(strchr(e, ':') + 1); left = strchr(strchr(e, ':') + 1, ':') ? atol(strchr(strchr(e, ':') + 1, ':') + 1) : 50;
             const char *c = strchr(e, ':') + 1;   /* <dir>:<trigger file>:<count>: dumps start once the file appears (it is removed) */
-            if (!(*c >= '0' && *c <= '9')) { snprintf(trig, sizeof trig, "%.*s", (int)(strchr(c, ':') ? strchr(c, ':') - c : (long)strlen(c)), c); first = -3; } } }
-    if (first == -3 && g_presents != trig_chk) { trig_chk = g_presents; if (!access(trig, F_OK)) { unlink(trig); first = (long)g_presents; VKLOG("dump: triggered at present %llu", (unsigned long long)g_presents); } }
-    if (first < 0 || (long)g_presents < first || left <= 0) return;
+            if (!(*c >= '0' && *c <= '9')) { snprintf(trig, sizeof trig, "%.*s", (int)(strchr(c, ':') ? strchr(c, ':') - c : (long)strlen(c)), c); g_dump_first = -3; } } }
+    if (g_dump_first == -3 && g_presents != trig_chk) { trig_chk = g_presents; if (!access(trig, F_OK)) { unlink(trig); g_dump_first = (long)g_presents; VKLOG("dump: triggered at present %llu", (unsigned long long)g_presents); } }
+    if (g_dump_first < 0 || (long)g_presents < g_dump_first || left <= 0) return;
     static uint64_t n; int dumped = 0;
     for (int i = 0; i < g_pcount && left > 0; i++) { vtex *v = g_patt[i].v; if (!v || g_patt[i].level || g_patt[i].layer) continue;
         uint32_t w, h; VkFormat f; vk_tex_dims(v, &w, &h, &f); int bpp = f == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 4;
@@ -979,6 +987,16 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
               if (dyn_changed(D_IB, k_, sizeof k_)) vkCmdBindIndexBuffer(cb, ib, io, t_); }
             vkCmdDrawIndexed(cb, (uint32_t)di->count, (uint32_t)inst, 0, di->base_vertex, (uint32_t)di->base_instance);
         }
+    }
+    if (g_dump_first >= 0 && (long)g_presents == g_dump_first) {   /* TOTK_VK_DUMP frame: every draw with its target, blend, mask, viewport and fragment textures */
+        char tx[512]; int o = 0; tx[0] = 0;
+        for (int i = 0; fs && i < fs->nb && o < 440; i++) { const vk_rbind *b = &fs->b[i]; if (b->kind != RB_TEX) continue;
+            uint32_t h = packed_handle(1, b->handle); tex_t t; view_t vw; int hv;
+            if ((h & 0xfffff) && vk_tex_registry_get((int)(h & 0xfffff), &t, &vw, &hv)) o += snprintf(tx + o, sizeof tx - o, " b%u:s%llu/%#x/%ux%u%s", b->binding, (unsigned long long)t.serial, hv && vw.set_format ? vw.format : t.d.format, t.d.width, t.d.height, t.mem ? "" : "/nomem"); }
+        const blend_st *bl = &S.blend[0]; uint32_t aw_, ah_; VkFormat af_ = 0; if (g_patt[0].v) vk_tex_dims(g_patt[0].v, &aw_, &ah_, &af_);
+        VKLOG("draw: pass %ux%u att0 %p fmt %d, vs %p fs %p, blend en %d rgb %d/%d/%d a %d/%d/%d mask %#x, vp %.0f,%.0f %.0fx%.0f, sc %d %d,%d %dx%d, depth t%d w%d, stencil %d, cull %d, prim %d count %d inst %d, tex%s",
+              g_pw, g_ph, (void *)g_patt[0].v, (int)af_, (void *)vs, (void *)fs, S.color.blend_en & 1, bl->src_rgb, bl->dst_rgb, bl->eq_rgb, bl->src_a, bl->dst_a, bl->eq_a, S.chmask.mask & 0xf,
+              S.nvp ? S.vp[0][0] : 0, S.nvp ? S.vp[0][1] : 0, S.nvp ? S.vp[0][2] : 0, S.nvp ? S.vp[0][3] : 0, S.has_sc, S.sc.x, S.sc.y, S.sc.w, S.sc.h, S.ds.dt, S.ds.dw, S.ds.st, S.poly.cull, prim, d ? d->count : di->count, inst, tx);
     }
     g_q_draws += g_q_cur >= 0;
     if (g_q_cur >= 0 && g_q_open) { static int log = -1, n; if (log < 0) log = getenv("TOTK_VK_QUERY_LOG") != NULL;
