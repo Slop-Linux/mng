@@ -101,7 +101,7 @@ typedef struct { VkImageViewType type; VkFormat fmt; uint32_t level0, nlevels, l
 struct vtex {
     uint64_t serial; VkImage img; vk_alloc mem; VkFormat fmt; const vk_fmt *vf; int nvn_format;
     uint32_t w, h, depth, layers, levels, samples; VkImageType type; int cube;
-    const uint8_t *gmem; uint64_t gsize; uint64_t stamp; int uploaded, gpu_owned, uploadable;
+    const uint8_t *gmem; uint64_t gsize; uint64_t stamp; int uploaded, gpu_owned, uploadable, mirrored;   /* mirrored: content from pool memory (tex_mirrored) */
     nvn_texdesc d;
     vview *views; int nviews;
     int gpu_dirty, in_dirty;  /* rendered since the last write-back; in g_dirty */
@@ -124,6 +124,7 @@ int vk_tex_aspect(vtex *v) { return v->vf->depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | 
 static uint32_t mipd(uint32_t s, uint32_t l) { s >>= l; return s ? s : 1; }
 static VkFormat fmt_pair(VkFormat f);
 
+static int tex_mirrored(const tex_t *t);
 static vtex *tex_make(const tex_t *t) {
     const vk_fmt *vf = vk_format(t->d.format);
     if (!vf) { static int said[256]; if (t->d.format < 256 && !said[t->d.format]++) VKLOG("【红】texture format %#x has no Vulkan format", t->d.format); return NULL; }
@@ -168,11 +169,35 @@ static vtex *tex_make(const tex_t *t) {
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b};
     vkCmdPipelineBarrier2(cb, &di);
     v->gmem = t->mem; v->gsize = t->L.size;
-    { int bw, bh; v->uploadable = t->mem && !vf->depth && !vf->stencil && v->samples == 1 && nvn_fmt_bpb(t->d.format, &bw, &bh) != 0; }
+    { int bw, bh; v->uploadable = t->mem && !vf->depth && !vf->stencil && v->samples == 1 && nvn_fmt_bpb(t->d.format, &bw, &bh) != 0; v->mirrored = tex_mirrored(t); }
     return v;
 }
+/* nvn_mtl.m tex_mirrored: a texture whose pool memory holds its content (a layout call, or a CPU-mapped pool without
+   display / compressible / zcull flags, single-sampled colour) is uploaded from that memory; the others are GPU-owned and
+   start empty (TOTK_TEX_MIRROR=0: every texture as mirrored) */
+static int tex_mirrored(const tex_t *t) {
+    if (!t || !t->mem) return 0;
+    if (t->has_layout) return 1;
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_TEX_MIRROR"); on = !e || atoi(e); }
+    if (!on) return 1;
+    const pool_t *p = t->pool;
+    if (!p || p->host || !(p->flags & (NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_CPU_CACHED))) return 0;
+    if (t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_ADAPTIVE_ZCULL | NVN_TEXTURE_FLAGS_DEPTH16_PREFER_FAST_CLEAR | NVN_TEXTURE_FLAGS_ZCULL_SUPPORT_STENCIL)) return 0;
+    if (t->d.samples > 1 || t->d.target == 10) return 0;
+    if (t->d.format >= 0x31 && t->d.format <= 0x36) return 0;
+    return 1;
+}
+/* nvn_mtl.m stor_acquire: texture objects over the same memory with the same layout share one image; another format of
+   the same texel size reads it through a format view (vk_tex_view makes the image mutable). Compressible storage keeps an
+   image per format (the storage changes hands with the format), block-compressed formats one per format
+   (TOTK_TEX_SHARE=0: one image per format everywhere) */
+static int tex_share(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_TEX_SHARE"); on = !e || atoi(e); } return on; }
 static uint64_t tex_key(const tex_t *t) {
-    uint64_t k[6] = {t->mem ? (uint64_t)(uintptr_t)t->mem : t->serial | (1ull << 63), (uint64_t)t->d.format | (uint64_t)t->d.target << 16 | (uint64_t)(t->d.flags & 0x54) << 32,
+    uint64_t fk = (uint64_t)t->d.format; int bw = 1, bh = 1, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    const vk_fmt *vf = vk_format(t->d.format);
+    int compressed = (t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE) && t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_COMPRESSIBLE);
+    if (tex_share() && t->mem && bpb && bw == 1 && bh == 1 && vf && !compressed) fk = 0x10000 | (uint64_t)bpb << 4 | (uint64_t)(vf->depth ? 1 : 0) << 2 | (uint64_t)(vf->stencil ? 1 : 0) << 3;
+    uint64_t k[6] = {t->mem ? (uint64_t)(uintptr_t)t->mem : t->serial | (1ull << 63), fk | (uint64_t)t->d.target << 20 | (uint64_t)(t->d.flags & 0x54) << 32,
                      (uint64_t)t->d.width | (uint64_t)t->d.height << 32, (uint64_t)t->d.depth | (uint64_t)t->d.levels << 32, (uint64_t)t->d.samples | (uint64_t)t->d.stride << 32,
                      (uint64_t)(t->d.pkg_block_h & 0xff)};
     uint64_t h = 1469598103934665603ull; const uint8_t *b = (const uint8_t *)k; for (size_t i = 0; i < sizeof k; i++) h = (h ^ b[i]) * 1099511628211ull;
@@ -185,7 +210,14 @@ vtex *vk_tex_get(const tex_t *t) {
     pthread_mutex_lock(&g_tex_mu);
     if (g_last && g_last_key == key) { vtex *v = g_last; pthread_mutex_unlock(&g_tex_mu); return v; }
     vtex *v = g_tex[key % TEX_HASH]; while (v && v->key != key) v = v->next;
-    if (!v && (v = tex_make(t))) { v->key = key; v->next = g_tex[key % TEX_HASH]; g_tex[key % TEX_HASH] = v; }
+    if (!v && (v = tex_make(t))) {
+        /* TOTK_VK_ALIAS_LOG=N: the first N images made over memory another image (another format / size / levels) already covers */
+        static long alog = -1; if (alog < 0) { const char *e = getenv("TOTK_VK_ALIAS_LOG"); alog = e ? atol(e) : 0; }
+        if (alog > 0 && t->mem) for (int b = 0; b < TEX_HASH && alog > 0; b++) for (vtex *o = g_tex[b]; o && alog > 0; o = o->next)
+            if (o->gmem && o->gmem < (const uint8_t *)t->mem + v->gsize && (const uint8_t *)t->mem < o->gmem + o->gsize) { alog--;
+                VKLOG("alias: serial %llu fmt %#x %ux%u lv %u flags %#x tgt %d at %p+%#llx over serial %llu fmt %#x %ux%u lv %u flags %#x tgt %d at %p+%#llx (gpu_owned %d, uploaded %d)", (unsigned long long)t->serial, t->d.format, t->d.width, t->d.height, t->d.levels, t->d.flags, t->d.target, (void *)t->mem, (unsigned long long)v->gsize,
+                      (unsigned long long)o->serial, o->d.format, o->d.width, o->d.height, o->d.levels, o->d.flags, o->d.target, (void *)o->gmem, (unsigned long long)o->gsize, o->gpu_owned, o->uploaded); }
+        v->key = key; v->next = g_tex[key % TEX_HASH]; g_tex[key % TEX_HASH] = v; }
     g_last = v; g_last_key = key;
     pthread_mutex_unlock(&g_tex_mu);
     return v;
@@ -299,7 +331,7 @@ static void upload(vtex *v) {
 }
 void vk_tex_upload_if_stale(vtex *v, const tex_t *t) {
     (void)t;
-    if (!v || !v->uploadable) return;
+    if (!v || !v->uploadable || !v->mirrored) return;
     if (!v->uploaded) { if (!v->gpu_owned) upload(v); return; }
     /* a rendered texture keeps its image: a CPU write near it on the same pages is not a new content (as nvn_mtl.m's owned textures) */
     if (!v->gpu_owned && nvn_dirty_since(v->gmem, v->gsize, v->stamp)) upload(v);
