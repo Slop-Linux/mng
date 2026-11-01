@@ -91,7 +91,7 @@ SPIRV_CROSS_FLAGS = ('-O3', '-DNDEBUG', '-std=c++11', '-arch', 'arm64', '-Wno-de
 # Homebrew first; then the folder of the running interpreter (the Python uv selected, or an activated virtual environment),
 # last so that a system Python's /usr/bin never shadows the Homebrew tools for the build's subprocesses.
 TOOL_PATHS = ['/opt/homebrew/bin', '/usr/local/bin', str(Path(sys.executable).parent)]
-LINUX = platform.system() == 'Linux'   # kalium/linux: aarch64 Linux, Vulkan; tools from the flake's dev shell
+LINUX = platform.system() == 'Linux'   # m4/linux: aarch64 Linux, Vulkan; tools from the flake's dev shell
 
 
 def contrib_folder():

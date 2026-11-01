@@ -17,7 +17,7 @@
 #include "audio_ramp.h"
 #endif
 #ifdef __linux__
-#include <SDL3/SDL.h>   /* output through SDL3's audio stream (PipeWire on kalium) */
+#include <SDL3/SDL.h>   /* output through SDL3's audio stream (PipeWire on Linux) */
 typedef SDL_AudioStream *AudioComponentInstance;
 #else
 #include <AudioToolbox/AudioToolbox.h>
