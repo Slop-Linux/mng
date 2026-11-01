@@ -325,7 +325,8 @@ void vk_sub_post_samples(uint64_t addr, vk_qlist *l) { vk_sub_post(3, NULL, 0, 0
 static void query_land(sub_t *s) {
     for (uint32_t done = 0; done < s->q_n;) {
         uint32_t first = (s->q_first + done) % QN, n = s->q_n - done; if (first + n > QN) n = QN - first;
-        if (vkGetQueryPoolResults(V.dev, g_qpool, first, n, n * 8, &g_qres[first], 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) memset(&g_qres[first], 0, n * 8);
+        VkResult r = vkGetQueryPoolResults(V.dev, g_qpool, first, n, n * 8, &g_qres[first], 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        if (r != VK_SUCCESS) { static int said; if (said++ < 4) VKLOG("【红】occlusion results %u+%u of submission %llu: %d", first, n, (unsigned long long)s->fence, r); memset(&g_qres[first], 0, n * 8); }
         vkResetQueryPool(V.dev, g_qpool, first, n); done += n;
     }
 }
@@ -353,6 +354,7 @@ static void *done_thread(void *arg) {
                 uint64_t sum = 0;
                 if (o->q) { for (int k = 0; k < o->q->n; k++) sum += g_qres[o->q->slot[k]];
                             if (!sum && o->q->skipped) sum = 1;   /* a counted draw was not drawn: visible, as nvn_mtl.m */
+                            { static int log = -1, n; if (log < 0) log = getenv("TOTK_VK_QUERY_LOG") != NULL; if (log && n++ < 400) VKLOG("query report %#llx: %d slots, %d draws counted, %llu samples", (unsigned long long)o->addr, o->q->n, o->q->draws, (unsigned long long)sum); }
                             static int vis = -1; if (vis < 0) vis = getenv("TOTK_VK_OCCL_VISIBLE") != NULL;
                             if (vis) sum = 1u << 20;
                             free(o->q); }
