@@ -973,8 +973,9 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
     }
     /* the draw samples attachments this pass wrote: a decal reads them at its own pixel through local read (vk_fbread.c, a
        BY_REGION barrier after the writes), as nvn_mtl.m att_fb_take; when its shader cannot, the pass splits (a run of such
-       draws shares the split). TOTK_VK_FB=split: always split */
-    static int lr = -1; if (lr < 0) { const char *e = getenv("TOTK_VK_FB"); lr = !(e && !strcmp(e, "split")); }
+       draws shares the split). TOTK_VK_FB=local / split (below) */
+    /* TOTK_VK_FB=local: decals read through local read; default split (the ICD returned zeros from the input attachments, r49f: black stairs on the Plateau) */
+    static int lr = -1; if (lr < 0) { const char *e = getenv("TOTK_VK_FB"); lr = e && !strcmp(e, "local"); }
     unsigned fbw = g_feedback & g_pass_written, fbm = 0; vshader *dfs = NULL;
     if (fbw) g_fb_why[!fs ? 0 : !lr ? 1 : (fbw & 0x100) ? 2 : (last[0].fb & fbw) ? 3 : last[1].fb_bad ? 4 : !last[1].nfbp ? 5 : 6]++;
     if (fbw && fs && lr && !last[1].fb_bad && !(fbw & 0x100) && !(last[0].fb & fbw) && last[1].nfbp) {
