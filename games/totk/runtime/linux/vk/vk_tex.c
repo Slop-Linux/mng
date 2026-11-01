@@ -353,7 +353,7 @@ void vk_tex_gpu_wrote(vtex *v) { if (v) { v->gpu_owned = 1; v->gpu_dirty = 1; v-
           g_rendered[g_nrendered++] = v; v->in_list = 1; } if (!v->uploaded) { v->uploaded = 1; v->stamp = nvn_dirty_now(); if (v->uploadable) nvn_dirty_protect(v->gmem, v->gsize); } } }
 /* write-back: an image rendered since the last one is copied out and swizzled into its guest memory (the GPU's write on the
    console), not counted as a CPU write */
-VkCommandBuffer vk_oneshot_begin(void); void vk_oneshot_end(VkCommandBuffer cb);
+VkCommandBuffer vk_oneshot_begin(void); void vk_oneshot_end(VkCommandBuffer cb); int vk_oneshot_after(VkCommandBuffer cb, uint64_t after);
 static uint64_t g_wb, g_wb_bytes, g_wb_staged;
 static VkDeviceSize wb_size(vtex *v, int bw, int bh, int bpb) {
     int one_d = v->type == VK_IMAGE_TYPE_1D, linear = nvn_tex_is_linear(&v->d); uint32_t nlev = linear ? 1 : v->levels, nlay = linear ? 1 : v->layers; VkDeviceSize total = 0;
@@ -425,12 +425,13 @@ static void writeback(vtex *v) {
         wb_swizzle(v, v->stage_cpu, sbw, sbh, sbpb);
         v->gpu_dirty = 0; g_wb++; g_wb_staged++; g_wb_bytes += v->stage_size; return;
     }
-    { int a_ = runtime_core_away(); mtl_finish(); runtime_core_back(&a_); }
     int bw = 1, bh = 1, bpb = nvn_fmt_bpb(v->d.format, &bw, &bh);
     if (!bpb || !v->gmem) return;
     VkDeviceSize total = wb_size(v, bw, bh, bpb); VkBuffer b; VkDeviceMemory m; uint8_t *src;
     host_buffer(total, &b, &m, &src);
-    VkCommandBuffer cb = vk_oneshot_begin(); wb_copies(v, cb, b, bw, bh, bpb); { int a_ = runtime_core_away(); vk_oneshot_end(cb); runtime_core_back(&a_); }
+    VkCommandBuffer cb = vk_oneshot_begin(); wb_copies(v, cb, b, bw, bh, bpb);
+    { int a_ = runtime_core_away();   /* after the image's last rendering only (second queue), else after everything */
+      if (!vk_oneshot_after(cb, v->render_fence)) { mtl_finish(); vk_oneshot_end(cb); } runtime_core_back(&a_); }
     wb_swizzle(v, src, bw, bh, bpb);
     vkUnmapMemory(V.dev, m); vkDestroyBuffer(V.dev, b, NULL); vkFreeMemory(V.dev, m, NULL);
     v->gpu_dirty = 0; g_wb++; g_wb_bytes += total;
@@ -635,7 +636,8 @@ static vtex *tex_find(const tex_t *t) {
 static void texels_image(vtex *v, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *lin, size_t wb, size_t hb, int nz, int to_image) {
     int is3d = v->type == VK_IMAGE_TYPE_3D; VkDeviceSize n = (VkDeviceSize)wb * hb * nz; VkBuffer b; VkDeviceMemory m; uint8_t *cpu;
     if (!to_image) vk_tex_mark_read(v);
-    { int a_ = runtime_core_away(); mtl_finish(); runtime_core_back(&a_); } host_buffer(n, &b, &m, &cpu);
+    if (to_image) { int a_ = runtime_core_away(); mtl_finish(); runtime_core_back(&a_); }
+    host_buffer(n, &b, &m, &cpu);
     if (to_image) memcpy(cpu, lin, n);
     VkCommandBuffer cb = vk_oneshot_begin();
     VkImageAspectFlags asp = (VkImageAspectFlags)vk_tex_aspect(v); if (asp & VK_IMAGE_ASPECT_DEPTH_BIT) asp = VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -644,7 +646,7 @@ static void texels_image(vtex *v, unsigned level, unsigned layer0, const NVNcopy
             .imageOffset = {r->xoffset, r->yoffset, is3d ? r->zoffset + z : 0}, .imageExtent = {(uint32_t)r->width, (uint32_t)(r->height ? r->height : 1), 1}};
         if (to_image) vkCmdCopyBufferToImage(cb, b, v->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c); else vkCmdCopyImageToBuffer(cb, v->img, VK_IMAGE_LAYOUT_GENERAL, b, 1, &c);
     }
-    { int a_ = runtime_core_away(); vk_oneshot_end(cb); runtime_core_back(&a_); }
+    { int a_ = runtime_core_away(); if (to_image || !vk_oneshot_after(cb, v->render_fence)) { if (!to_image) mtl_finish(); vk_oneshot_end(cb); } runtime_core_back(&a_); }
     if (!to_image) memcpy(lin, cpu, n);
     vkUnmapMemory(V.dev, m); vkDestroyBuffer(V.dev, b, NULL); vkFreeMemory(V.dev, m, NULL);
 }

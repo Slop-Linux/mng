@@ -46,8 +46,8 @@ void vk_init(void) {
     V.qfam = UINT32_MAX;
     for (uint32_t i = 0; i < nq; i++) if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { VkBool32 ok = 1; if (g_surface) vkGetPhysicalDeviceSurfaceSupportKHR(V.phys, i, g_surface, &ok); if (ok) { V.qfam = i; break; } }
     if (V.qfam == UINT32_MAX) VKDIE("no graphics queue");
-    float prio = 1;
-    VkDeviceQueueCreateInfo qci = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = V.qfam, .queueCount = 1, .pQueuePriorities = &prio};
+    float prio[2] = {1, 1}; uint32_t nqueue = 1; for (uint32_t i = 0; i < nq; i++) if (i == V.qfam && qf[i].queueCount > 1) nqueue = 2;   /* the second queue: read-backs that wait only for their image (vk_oneshot_after) */
+    VkDeviceQueueCreateInfo qci = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = V.qfam, .queueCount = nqueue, .pQueuePriorities = prio};
     const char *dext[] = {VK_EXT_SHADER_OBJECT_EXTENSION_NAME, VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME,
         VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
         VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME, VK_KHR_SWAPCHAIN_EXTENSION_NAME};
@@ -72,7 +72,7 @@ void vk_init(void) {
     if (!so.shaderObject || !rb2.nullDescriptor || !vid.vertexInputDynamicState || !f13.dynamicRendering || !f12.timelineSemaphore) VKDIE("the device lacks shader objects, null descriptors, dynamic vertex input, dynamic rendering or timeline semaphores");
     VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f2, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .enabledExtensionCount = ndext, .ppEnabledExtensionNames = dext};
     VKCHECK(vkCreateDevice(V.phys, &dci, NULL, &V.dev));
-    vkGetDeviceQueue(V.dev, V.qfam, 0, &V.queue);
+    vkGetDeviceQueue(V.dev, V.qfam, 0, &V.queue); if (nqueue > 1) vkGetDeviceQueue(V.dev, V.qfam, 1, &V.queue2);
 #define P(n) V.n = (PFN_vk##n)dev_proc("vk" #n)
     P(CmdSetVertexInputEXT); P(CreateShadersEXT); P(DestroyShaderEXT); P(CmdBindShadersEXT); P(CmdSetColorBlendEnableEXT); P(CmdSetColorBlendEquationEXT);
     P(CmdSetColorWriteMaskEXT); P(CmdSetPolygonModeEXT); P(CmdSetRasterizationSamplesEXT); P(CmdSetSampleMaskEXT); P(CmdSetAlphaToCoverageEnableEXT);
@@ -215,7 +215,7 @@ struct sub {
     /* command buffers (prologue for uploads, main), each pair with its own pool: recorded on the game thread, ended and
        submitted on the submit thread; a long submission is cut into several (vk_sub_cut) so the GPU starts on the first while
        the next is recorded and encoded */
-    struct { VkCommandPool pool; VkCommandBuffer up, main; int up_used; } cb[64]; int ncb;
+    struct { VkCommandPool pool; VkCommandBuffer up, main; int up_used; _Atomic int ended; } cb[64]; int ncb;   /* ended: vkEndCommandBuffer done by an end worker */
     uint32_t q_first, q_n;   /* occlusion query slots taken while it was recorded */
     chunk_t *chunks; int nchunks;
     post_t *posts; int nposts, capposts;
@@ -226,6 +226,7 @@ static sub_t *g_open, *g_inflight_head, *g_inflight_tail, *g_free_subs;
 static chunk_t *g_free_chunks; static int g_nfree_chunks;
 static pthread_mutex_t g_sub_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_sub_cv = PTHREAD_COND_INITIALIZER;
 static _Atomic uint64_t g_fence_next = 1, g_applied, g_submitted;
+static uint64_t g_oneshot2;   /* read-backs on the second queue (vk_oneshot_after) */
 static pthread_t g_done_thread;
 /* game-thread time (ns) waiting for room in the job queue, in mtl_wait, in one-shot command buffers, and replaying (vk_wait_stats) */
 static _Atomic uint64_t g_wt[4];
@@ -397,9 +398,42 @@ static pthread_mutex_t g_job_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond
 static pthread_mutex_t g_queue_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t g_submit_thread;
 static VkCommandPool g_pool2;   /* command buffers recorded on the submit thread (present, screenshots) */
-static void submit_now(sub_t *s, int i, int last) {
-    uint64_t e0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);   /* the ICD may encode at the end of the command buffer: here, off the game thread */
+/* TOTK_VK_END_THREADS=<n> (default 3; 0 or 1: on the submit thread): the ICD encodes in vkEndCommandBuffer, so the pairs of a
+   submission are ended by n workers in parallel as soon as they are cut; the submit thread still submits them in order,
+   each once its end is done */
+static int end_threads(void) { static int n = -1; if (n < 0) { const char *e = getenv("TOTK_VK_END_THREADS"); n = e ? atoi(e) : 3; if (n > 8) n = 8; } return n; }
+typedef struct { sub_t *s; int i; } end_job;
+#define ENDQ 256
+static end_job g_endq[ENDQ]; static uint64_t g_endq_head, g_endq_tail; static pthread_mutex_t g_end_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_end_cv = PTHREAD_COND_INITIALIZER, g_ended_cv = PTHREAD_COND_INITIALIZER;
+static void end_pair(sub_t *s, int i) {
+    uint64_t e0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     VKCHECK(vkEndCommandBuffer(s->cb[i].up)); VKCHECK(vkEndCommandBuffer(s->cb[i].main)); atomic_fetch_add(&g_end_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - e0);
+}
+static void *end_worker(void *arg) {
+    (void)arg; pthread_setname_np("vk-end");
+    for (;;) {
+        pthread_mutex_lock(&g_end_mu); while (g_endq_head == g_endq_tail) pthread_cond_wait(&g_end_cv, &g_end_mu);
+        end_job j = g_endq[g_endq_tail++ % ENDQ]; pthread_mutex_unlock(&g_end_mu);
+        end_pair(j.s, j.i);
+        pthread_mutex_lock(&g_end_mu); atomic_store(&j.s->cb[j.i].ended, 1); pthread_cond_broadcast(&g_ended_cv); pthread_mutex_unlock(&g_end_mu);
+    }
+    return NULL;
+}
+static void end_dispatch(sub_t *s, int i) {   /* the pair is closed: a worker ends it */
+    atomic_store(&s->cb[i].ended, 0);
+    if (end_threads() <= 1) return;
+    static int started; pthread_mutex_lock(&g_end_mu);
+    if (!started) { started = 1; for (int k = 0; k < end_threads(); k++) { pthread_t t; pthread_create(&t, NULL, end_worker, NULL); pthread_detach(t); } }
+    while (g_endq_head - g_endq_tail >= ENDQ) pthread_cond_wait(&g_ended_cv, &g_end_mu);
+    g_endq[g_endq_head++ % ENDQ] = (end_job){s, i}; pthread_cond_signal(&g_end_cv); pthread_mutex_unlock(&g_end_mu);
+}
+static void end_wait(sub_t *s, int i) {   /* the submit thread: the pair's end is done (or it does it itself) */
+    if (end_threads() <= 1) { end_pair(s, i); return; }
+    if (atomic_load(&s->cb[i].ended)) return;
+    pthread_mutex_lock(&g_end_mu); while (!atomic_load(&s->cb[i].ended)) pthread_cond_wait(&g_ended_cv, &g_end_mu); pthread_mutex_unlock(&g_end_mu);
+}
+static void submit_now(sub_t *s, int i, int last) {
+    end_wait(s, i);   /* the ICD encodes at the end of the command buffer: off the game thread (end workers) */
     atomic_fetch_add(&g_ncb_sub, 1);
     VkCommandBufferSubmitInfo cbs[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cb[i].up}, {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cb[i].main}};
     VkSemaphoreSubmitInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = V.timeline, .value = s->fence, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
@@ -442,7 +476,7 @@ static void jobs_drain(void) {   /* every queued submission and present has reac
    goes on in the next pair; the last part signals the submission's fence */
 void vk_sub_cut(void) {
     sub_t *s = g_open; if (!s || s->ncb == 64) return;
-    cb_pair_close(s, s->ncb - 1, 0); job_push((job_t){.kind = 1, .s = s, .cb = s->ncb - 1, .last = 0});
+    cb_pair_close(s, s->ncb - 1, 0); end_dispatch(s, s->ncb - 1); job_push((job_t){.kind = 1, .s = s, .cb = s->ncb - 1, .last = 0});
     cb_pair_begin(s, s->ncb++);
 }
 uint64_t vk_sub_submit(void) {
@@ -450,7 +484,7 @@ uint64_t vk_sub_submit(void) {
     vk_replay_end_pass();
     { void vk_tex_stage_rendered(VkCommandBuffer cb, uint64_t fence); vk_tex_stage_rendered(vk_cb(), g_open->fence); }
     sub_t *s = g_open; g_open = NULL;
-    int i = s->ncb - 1; cb_pair_close(s, i, 1);
+    int i = s->ncb - 1; cb_pair_close(s, i, 1); end_dispatch(s, i);
     atomic_store(&g_submitted, s->fence);
     job_push((job_t){.kind = 1, .s = s, .cb = i, .last = 1});
     return s->fence;
@@ -466,6 +500,24 @@ void vk_oneshot_end(VkCommandBuffer cb) {
     pthread_mutex_lock(&g_queue_mu); VKCHECK(vkQueueSubmit(V.queue, 1, &si, f)); pthread_mutex_unlock(&g_queue_mu);
     VKCHECK(vkWaitForFences(V.dev, 1, &f, 1, UINT64_MAX)); vkDestroyFence(V.dev, f, NULL); g_wt[2] += clock_gettime_nsec_np(CLOCK_MONOTONIC) - o0;
     pthread_mutex_lock(&g_cmdpool_mu); vkFreeCommandBuffers(V.dev, V.cmdpool, 1, &cb); pthread_mutex_unlock(&g_cmdpool_mu);
+}
+/* a read-back that needs only the submission with fence value `after` (the last one that rendered its image): on the second
+   queue it waits for that value of the timeline, not for the submit thread's backlog and the GPU work queued behind it
+   (nvn_mtl.m wb_wait_gpu waits for the image's own command buffer). 0 when it cannot (one queue, or the submission is not
+   committed yet): the caller takes the full path */
+int vk_oneshot_after(VkCommandBuffer cb, uint64_t after) {
+    if (!V.queue2 || !after || after > atomic_load(&g_submitted)) return 0;   /* never rendered (uploads go in order on the main queue) or not committed */
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    uint64_t o0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    VKCHECK(vkEndCommandBuffer(cb));
+    VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence f; VKCHECK(vkCreateFence(V.dev, &fi, NULL, &f));
+    VkSemaphoreSubmitInfo w = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = V.timeline, .value = after, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    VkCommandBufferSubmitInfo c = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = 1, .pWaitSemaphoreInfos = &w, .commandBufferInfoCount = 1, .pCommandBufferInfos = &c};
+    pthread_mutex_lock(&mu); VKCHECK(vkQueueSubmit2(V.queue2, 1, &si, f)); pthread_mutex_unlock(&mu);
+    VKCHECK(vkWaitForFences(V.dev, 1, &f, 1, UINT64_MAX)); vkDestroyFence(V.dev, f, NULL); g_wt[2] += clock_gettime_nsec_np(CLOCK_MONOTONIC) - o0; g_oneshot2++;
+    pthread_mutex_lock(&g_cmdpool_mu); vkFreeCommandBuffers(V.dev, V.cmdpool, 1, &cb); pthread_mutex_unlock(&g_cmdpool_mu);
+    return 1;
 }
 uint64_t mtl_last_fence(void) { return atomic_load(&g_submitted); }
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
