@@ -184,6 +184,52 @@ static partial class ShaderService
         return result;
     }
 
+    /// Vertex input locations whose loaded values are only ever bitcast to an integer or converted to one (InferAttributeTypes
+    /// on SPIR-V): components taken with OpCompositeExtract / OpVectorShuffle are followed; any other use is a float use.
+    static List<int> SpirvIntegerInputs(byte[] bytes)
+    {
+        uint[] w = MemoryMarshal.Cast<byte, uint>(bytes).ToArray();
+        var loc = new Dictionary<uint, int>(); var inputs = new HashSet<uint>(); var intTypes = new HashSet<uint>();
+        var from = new Dictionary<uint, uint>();   // pointer or value id -> the input variable it comes from
+        var values = new HashSet<uint>(); var stored = new Dictionary<uint, uint>();   // function variable -> the input whose value it holds
+        var intUse = new HashSet<uint>(); var floatUse = new HashSet<uint>();
+        for (int i = 5; i < w.Length;)
+        {
+            uint op = w[i] & 0xffff, len = w[i] >> 16;
+            if (len == 0) break;
+            if (op == 71 && len >= 4 && w[i + 2] == 30) loc[w[i + 1]] = (int)w[i + 3];   // OpDecorate Location
+            else if (op == 21) intTypes.Add(w[i + 1]);   // OpTypeInt
+            else if (op == 23 && intTypes.Contains(w[i + 2])) intTypes.Add(w[i + 1]);   // OpTypeVector of an integer
+            else if (op == 59 && w[i + 3] == 1) { inputs.Add(w[i + 2]); from[w[i + 2]] = w[i + 2]; }   // OpVariable Input
+            else if ((op == 65 || op == 66) && from.TryGetValue(w[i + 3], out uint v) && !values.Contains(w[i + 3])) from[w[i + 2]] = v;   // OpAccessChain
+            else if (op == 61 && from.TryGetValue(w[i + 3], out uint lv) && !values.Contains(w[i + 3])) { from[w[i + 2]] = lv; values.Add(w[i + 2]); }   // OpLoad
+            else if (op == 62)   // OpStore: an input's value kept in a function variable (the DebugMode translation's
+            {                    // temporaries) is followed through that variable's loads; a variable that also holds
+                uint ptr = w[i + 1], obj = w[i + 2];   // anything else makes the input's value a float use
+                if (values.Contains(obj))
+                {
+                    if (stored.TryGetValue(ptr, out uint had) && had != from[obj]) { floatUse.Add(had); floatUse.Add(from[obj]); }
+                    else { stored[ptr] = from[obj]; from[ptr] = from[obj]; }
+                }
+                else if (stored.TryGetValue(ptr, out uint other)) floatUse.Add(other);
+            }
+            else if (op is not (5 or 6 or 43 or 71 or 72))   // names, constants and decorations hold literals
+            {
+                int last = op == 81 ? i + 4 : op == 79 ? i + 5 : i + (int)len;   // OpCompositeExtract / OpVectorShuffle: literals after the operands
+                for (int k = i + 1; k < last; k++)
+                {
+                    if (!values.Contains(w[k]) || k == i + 2) continue;   // i + 2: the result id
+                    uint src = from[w[k]];
+                    if (op == 81 || op == 79) { from[w[i + 2]] = src; values.Add(w[i + 2]); }
+                    else if ((op == 124 && intTypes.Contains(w[i + 1])) || op == 109 || op == 110) intUse.Add(src);   // OpBitcast to an integer, OpConvertFToU / FToS
+                    else floatUse.Add(src);
+                }
+            }
+            i += (int)len;
+        }
+        return inputs.Where(v => loc.ContainsKey(v) && intUse.Contains(v) && !floatUse.Contains(v)).Select(v => loc[v]).OrderBy(l => l).ToList();
+    }
+
     static int CloseParen(string src, int i)   // index just past the ')' closing a call whose '(' ends at i (or src.Length)
     {
         int depth = 1;
@@ -471,6 +517,15 @@ static partial class ShaderService
             job["set"] = stage == "ps" ? 1 : 0;
             job["softfloat64"] = true;
             Translate(job);
+            // "infer_attr" (prepare_vk_seed.py): vertex inputs the request leaves unanswered are typed by their use, as
+            // InferAttributeTypes does on the MSL, and the translation is redone with those answers
+            if (stage == "vs" && Truthy(Get(rq, "infer_attr")))
+            {
+                JsonObject asked = GetObj(rq, "attr"); bool again = false;
+                foreach (int loc in SpirvIntegerInputs(File.ReadAllBytes(Path.Combine(outDir, variant + ".spv"))))
+                    if (!asked.ContainsKey(loc.ToString(CultureInfo.InvariantCulture))) { job["attr"][loc.ToString(CultureInfo.InvariantCulture)] = "uint"; again = true; }
+                if (again) Translate(job);
+            }
             return;
         }
         Translate(job);
