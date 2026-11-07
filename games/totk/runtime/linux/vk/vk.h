@@ -116,6 +116,8 @@ typedef struct vshader {
     VkBuffer c1buf; VkDeviceMemory c1mem;
     VkDescriptorSetLayout layout;
     struct vshader *fb_next; uint32_t fb_key; int fb_none;   /* decal variants of a fragment shader by binding / attachment pairs (vk_shader_fbread) */
+    char fout[8];              /* fragment: each output's class as translated ('f' / 'u' / 's', 0 none) */
+    struct vshader *rt_next; uint32_t rt_key;   /* its outputs retyped to other render targets (vk_retype.c), by their classes */
 } vshader;
 /* the bound state's answers, as the translation request names them (NULL: not answered) */
 typedef struct { const char *tex[128], *img_type[32], *img_fmt[32], *attr[16], *fout[8]; } vk_answers;
@@ -125,6 +127,9 @@ vshader *vk_shader_get(const uint8_t *control, const uint8_t *code, int stage, c
 #define VK_FB_BINDING 120
 uint32_t *vk_fbread_spv(const uint32_t *w, size_t n, const int bind[], const int att[], int k, size_t *out_n);
 vshader *vk_shader_fbread(vshader *fs, const int bind[], const int att[], int k);
+/* the fragment SPIR-V with the outputs want[loc] names ('f' / 'u' / 's') retyped (vk_retype.c); NULL, vk_retype_why */
+uint32_t *vk_retype_spv(const uint32_t *w, size_t n, const char want[8], size_t *out_n);
+extern const char *vk_retype_why;
 void vk_shader_stats(uint64_t s[4]);   /* variants loaded, ns, translated, ns */
 void vk_shader_report(void);   /* variant lookups: hits by source, misses by reason */
 
