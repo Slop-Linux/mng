@@ -63,8 +63,9 @@ def vk_serves(deps, answers):
         return v if v in ('sint', 'uint') else 'float'
 
     got = dict(tex=tex_type, img=lambda slot: (img.get(slot) or {}).get('fmt') or 'R8G8B8A8Unorm',
-               attr=lambda slot: cls('attr', slot), fout=lambda slot: cls('fout', slot))
-    return deps.get('dmw', 1) == 1 and all(got[kind](slot) == want for kind in ('tex', 'img', 'attr', 'fout')
+               attr=lambda slot: cls('attr', slot))
+    # colour output classes are not compared: the runtime retypes the outputs to the bound targets (vk_retype.c)
+    return deps.get('dmw', 1) == 1 and all(got[kind](slot) == want for kind in ('tex', 'img', 'attr')
                                            for slot, want in deps[kind].items())
 
 

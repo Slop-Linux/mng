@@ -4,7 +4,8 @@
    one name a line, in the prepared seed (TOTK_SHADER_SEED_DIR, prepare_shader_seed.py --target vulkan, made from the
    shared shader list) and in the cache; each variant's "dep" lines are the answers its translation read (Program.cs).
    The bound state uses the first variant whose deps it answers the same way (nvn_mtl.m deps_match), and only a state no
-   variant serves is translated: with the whole bound state as the key, 729 shaders had made 8,635 variants. */
+   variant serves is translated. Colour output classes are matched last: a variant made for other render target types
+   serves with its outputs retyped (vk_retype.c, as nvn_mtl.m fn_retype_outputs makes any variant serve any target): with the whole bound state as the key, 729 shaders had made 8,635 variants. */
 #include "vk.h"
 #include <CommonCrypto/CommonDigest.h>
 #include <errno.h>
@@ -60,7 +61,7 @@ static uint64_t g_seed_used;
 /* lookups (a program stage under a bind state the replay had not met): served by a variant already loaded, by one first
    loaded from the seed / the cache, or missed (translated); the misses with the shader in the seed, and the dep each
    missed the shader's first variant on */
-static uint64_t g_look, g_hit_mem, g_hit_seed, g_hit_cache, g_miss, g_miss_seeded, g_miss_kind[5];
+static uint64_t g_look, g_hit_mem, g_hit_seed, g_hit_cache, g_miss, g_miss_seeded, g_miss_kind[5], g_hit_retyped, g_retyped;
 static uint64_t g_seed_shaders;   /* shaders met that the seed lists */
 
 static int read_deps(cand *c) {
@@ -81,9 +82,10 @@ static int read_deps(cand *c) {
 /* the answer the translator would read for a dep (Program.cs Accessor: an unanswered texture slot is 2D or the image
    slot's type, an unanswered image format R8G8B8A8Unorm, an unanswered input or output float) */
 static const vdep *g_missed_on; static char g_missed_got[24];   /* serves: the dep the last refused variant missed on */
-static int serves(const cand *c, const vk_answers *A) {
+static int serves(const cand *c, const vk_answers *A, int fout) {   /* fout 0: colour output classes not compared */
     for (int i = 0; i < c->nd; i++) {
         const vdep *d = &c->d[i]; const char *got;
+        if (d->kind == 'f' && !fout) continue;
         switch (d->kind) {
             case 't': got = d->slot < 128 && A->tex[d->slot] ? A->tex[d->slot] : d->slot < 32 && A->img_type[d->slot] ? A->img_type[d->slot] : "2d"; break;
             case 'i': got = d->slot < 32 && A->img_fmt[d->slot] ? A->img_fmt[d->slot] : "R8G8B8A8Unorm"; break;
@@ -94,6 +96,29 @@ static int serves(const cand *c, const vk_answers *A) {
         if (strcmp(got, d->val)) { g_missed_on = d; snprintf(g_missed_got, sizeof g_missed_got, "%s", got); return 0; }
     }
     return 1;
+}
+static void fout_of(cand *c) {   /* the classes a fragment variant's outputs were translated with */
+    for (int i = 0; i < c->nd; i++) if (c->d[i].kind == 'f' && c->d[i].slot < 8) c->s->fout[c->d[i].slot] = c->d[i].val[0];
+}
+/* a variant with its colour outputs retyped to the bound targets' classes; NULL when the SPIR-V cannot be (vk_retype_why) */
+static vshader *retyped(vshader *b, const vk_answers *A) {
+    char want[8] = {0}; uint32_t key = 0; int any = 0;
+    for (int i = 0; i < 8; i++) if (b->fout[i] && A->fout[i]) {
+        char c = A->fout[i][0]; key |= (uint32_t)(c == 'u' ? 1 : c == 's' ? 2 : 3) << (2 * i);
+        if (c != b->fout[i]) { want[i] = c; any = 1; }
+    }
+    if (!any) return b;
+    for (vshader *r = b->rt_next; r; r = r->rt_next) if (r->rt_key == key) return r;
+    size_t n; uint32_t *spv = vk_retype_spv(b->spv, b->nwords, want, &n);
+    if (!spv) { VKLOG("shader %s: outputs not retyped (%s)", b->key, vk_retype_why); return NULL; }
+    vshader *r = malloc(sizeof *r); *r = *b;
+    r->spv = spv; r->nwords = n; r->fb_next = NULL; r->fb_key = 0; r->fb_none = 0; r->rt_key = key;
+    for (int i = 0; i < 8; i++) if (want[i]) r->fout[i] = want[i];
+    snprintf(r->key, sizeof r->key, "%.80s+rt%04x", b->key, key);
+    r->rt_next = b->rt_next; b->rt_next = r; g_retyped++;
+    const char *dump = getenv("TOTK_VK_RT_DUMP");   /* diagnostic: <dir>/<key>.spv of each retyped variant */
+    if (dump && *dump) { char p[4400]; snprintf(p, sizeof p, "%s/%s.spv", dump, r->key); FILE *f = fopen(p, "wb"); if (f) { fwrite(spv, 4, n, f); fclose(f); } }
+    return r;
 }
 static void add_cand(shv *v, const char *dir, const char *name) {
     for (cand *c = v->c; c; c = c->next) if (c->dir == dir && !strcmp(c->name, name)) return;
@@ -220,22 +245,26 @@ vshader *vk_shader_get(const uint8_t *control, const uint8_t *code, int stage, c
     shv *v = shader_of(key);
     uint32_t local[3] = {0, 0, 0}; if (stage == 5) memcpy(local, control + 0x748, 12);
     g_look++;
-    for (cand *c = v->c; c; c = c->next) if (serves(c, A)) {
-        if (c->s) g_hit_mem++; else if (c->dir == g_seed) g_hit_seed++; else g_hit_cache++;
+    for (int fout = 1; fout >= 0; fout--) for (cand *c = v->c; c; c = c->next) if (serves(c, A, fout)) {
+        int was = !!c->s;
         if (!c->s) {
             uint64_t l0_ = clock_gettime_nsec_np(CLOCK_MONOTONIC);
             c->s = load(c->dir, c->name, stage, code + c1o, c1t - c1o, stage == 5 ? local : NULL);
             if (!c->s) VKDIE("shader variant %s/%s: no SPIR-V", c->dir, c->name);
             g_load_ns += clock_gettime_nsec_np(CLOCK_MONOTONIC) - l0_;
             if (c->dir == g_seed) g_seed_used++;
+            fout_of(c);
         }
-        pthread_mutex_unlock(&g_sh_mu); return c->s;
+        vshader *s = fout ? c->s : retyped(c->s, A);
+        if (!s) continue;
+        if (!fout) g_hit_retyped++; else if (was) g_hit_mem++; else if (c->dir == g_seed) g_hit_seed++; else g_hit_cache++;
+        pthread_mutex_unlock(&g_sh_mu); return s;
     }
     /* no variant serves this state: translate it (or take a translation an index append missed) and list it */
     g_miss++;
     if (!v->c) VKLOG("shader miss %.64s (stage %d): no variant of it in the seed or the cache", key, stage);
     else {
-        serves(v->c, A);   /* the first variant's refusal, for the reason */
+        if (serves(v->c, A, 0)) serves(v->c, A, 1);   /* the first variant's refusal, for the reason */
         if (v->c->dir == g_seed) g_miss_seeded++;
         const char *kinds = "tiafw"; int k = (int)(strchr(kinds, g_missed_on->kind) - kinds); g_miss_kind[k]++;
         VKLOG("shader miss %.64s (stage %d): %d variant(s), the first (%s) has %c %u = %s, the state %s", key, stage,
@@ -266,8 +295,8 @@ vshader *vk_shader_get(const uint8_t *control, const uint8_t *code, int stage, c
     }
     cand *nc = calloc(1, sizeof *nc); snprintf(nc->name, sizeof nc->name, "%s", key); nc->dir = g_dir;
     if (!read_deps(nc)) VKDIE("shader %s: no vk.txt", key);
-    nc->s = s; *v->tail = nc; v->tail = &nc->next;
-    if (!serves(nc, A)) VKLOG("【红】%s: its deps do not answer the state it was translated for", key);
+    nc->s = s; *v->tail = nc; v->tail = &nc->next; fout_of(nc);
+    if (!serves(nc, A, 1)) VKLOG("【红】%s: its deps do not answer the state it was translated for", key);
     char path[4400]; snprintf(path, sizeof path, "%s/%.64s.variants", g_dir, key);
     FILE *f = fopen(path, "a"); if (!f || fprintf(f, "%s\n", key) < 0 || fclose(f)) VKDIE("append %s", path);
     pthread_mutex_unlock(&g_sh_mu);
@@ -299,11 +328,11 @@ vshader *vk_shader_fbread(vshader *fs, const int bind[], const int att[], int k)
 }
 void vk_shader_report(void) {   /* unlocked: statistics */
     double n = g_look ? (double)g_look : 1;
-    VKLOG("shader variant lookups %llu: hits %llu (%.1f%%: loaded %llu, first from the seed %llu, first from the cache %llu), "
+    VKLOG("shader variant lookups %llu: hits %llu (%.1f%%: loaded %llu, first from the seed %llu, first from the cache %llu, outputs retyped %llu; %llu retyped variants), "
           "misses %llu (%.1f%%; %llu of shaders the seed has: on texture %llu, image %llu, vertex input %llu, colour output %llu, depth mode %llu); "
           "shaders met %llu, %llu of them in the seed",
           (unsigned long long)g_look, (unsigned long long)(g_look - g_miss), 100.0 * (g_look - g_miss) / n, (unsigned long long)g_hit_mem,
-          (unsigned long long)g_hit_seed, (unsigned long long)g_hit_cache, (unsigned long long)g_miss, 100.0 * g_miss / n,
+          (unsigned long long)g_hit_seed, (unsigned long long)g_hit_cache, (unsigned long long)g_hit_retyped, (unsigned long long)g_retyped, (unsigned long long)g_miss, 100.0 * g_miss / n,
           (unsigned long long)g_miss_seeded, (unsigned long long)g_miss_kind[0], (unsigned long long)g_miss_kind[1], (unsigned long long)g_miss_kind[2],
           (unsigned long long)g_miss_kind[3], (unsigned long long)g_miss_kind[4], ({ unsigned long long n_ = 0; for (int i = 0; i < 4096; i++) for (shv *v = g_shv[i]; v; v = v->next) n_++; n_; }),
           (unsigned long long)g_seed_shaders);
