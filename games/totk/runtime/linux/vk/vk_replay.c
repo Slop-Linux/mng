@@ -709,23 +709,25 @@ static const char *image_format(int f) {
         default: return NULL;
     }
 }
-static void answers(int st, char *out, size_t cap) {
-    size_t o = 0; int first;
+static void answers(int st, char *out, size_t cap, vk_answers *A) {
+    size_t o = 0; int first; memset(A, 0, sizeof *A);
 #define PUT(...) do { int k_ = snprintf(out + o, o < cap ? cap - o : 0, __VA_ARGS__); if (k_ > 0) o += (size_t)k_; } while (0)
     tex_t t; view_t v; int hv;
     PUT("\"tex\": {"); first = 1;
     for (int r = 0; r < 128; r++) if (S.tex[st][r] && vk_tex_registry_get((int)(S.tex[st][r] & 0xfffff), &t, &v, &hv)) {
-        int tg = hv && v.set_target ? v.target : t.d.target; PUT("%s\"%d\": \"%s\"", first ? "" : ", ", r, target_name(tg)); first = 0; }
+        int tg = hv && v.set_target ? v.target : t.d.target; PUT("%s\"%d\": \"%s\"", first ? "" : ", ", r, target_name(tg)); A->tex[r] = target_name(tg); first = 0; }
     PUT("}, \"img\": {"); first = 1;
     for (int r = 0; r < 32; r++) if (S.img[st][r] && vk_tex_registry_get((int)(S.img[st][r] & 0xfffff), &t, &v, &hv)) {
         int tg = hv && v.set_target ? v.target : t.d.target, f = hv && v.set_format ? v.format : t.d.format; const char *fn = image_format(f);
         if (fn) PUT("%s\"%d\": {\"type\": \"%s\", \"fmt\": \"%s\"}", first ? "" : ", ", r, target_name(tg), fn); else PUT("%s\"%d\": {\"type\": \"%s\"}", first ? "" : ", ", r, target_name(tg));
+        A->img_type[r] = target_name(tg); A->img_fmt[r] = fn;
         first = 0; }
     PUT("}, \"attr\": {"); first = 1;
-    if (st == 0) for (int i = 0; i < S.nattr && i < 16; i++) { PUT("%s\"%d\": \"%s\"", first ? "" : ", ", i, fmt_class(((va_st *)&S.attr[i])->fmt)); first = 0; }
+    if (st == 0) for (int i = 0; i < S.nattr && i < 16; i++) { A->attr[i] = fmt_class(((va_st *)&S.attr[i])->fmt); PUT("%s\"%d\": \"%s\"", first ? "" : ", ", i, A->attr[i]); first = 0; }
     PUT("}, \"fout\": {"); first = 1;
     if (st == 1 && S.has_rt) for (int i = 0; i < S.rt.n && i < 8; i++) if (S.rt.color[i]) {
-        PUT("%s\"%d\": \"%s\"", first ? "" : ", ", i, fmt_class(S.rt.has_cview[i] && S.rt.cview[i].set_format ? S.rt.cview[i].format : S.rt.color[i]->d.format)); first = 0; }
+        A->fout[i] = fmt_class(S.rt.has_cview[i] && S.rt.cview[i].set_format ? S.rt.cview[i].format : S.rt.color[i]->d.format);
+        PUT("%s\"%d\": \"%s\"", first ? "" : ", ", i, A->fout[i]); first = 0; }
     PUT("}");
 #undef PUT
 }
@@ -772,8 +774,8 @@ static vshader *stage_shader_slow(int want) {
         const uint8_t *control = p->sd[i].control; if (!control || !p->sd[i].data) continue;
         uint32_t st; memcpy(&st, control + 0x714, 4);
         if ((int)st != want) continue;
-        char a[8192]; answers(want, a, sizeof a);
-        return vk_shader_get(control, (const uint8_t *)(uintptr_t)p->sd[i].data, want, a);
+        char a[8192]; vk_answers A; answers(want, a, sizeof a, &A);
+        return vk_shader_get(control, (const uint8_t *)(uintptr_t)p->sd[i].data, want, a, &A);
     }
     return NULL;
 }
