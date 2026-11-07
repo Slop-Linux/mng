@@ -38,6 +38,9 @@ static class SwshXlate
     sealed class Accessor : IGpuAccessor
     {
         readonly byte[] _code; readonly JsonObject _job; int _binding = 1; public readonly List<string> Notes = new(); public readonly SortedSet<int> TexQueried = new(), ImgQueried = new();
+        // Vulkan target: the answer each queried slot was translated with (sampler type name, image format name), the
+        // variant's deps (vk.txt "dep" lines, runtime/linux/vk/vk_shader.c picks variants by them)
+        public readonly SortedDictionary<int, string> TexDep = new(), ImgDep = new();
         readonly byte[] _c1;
         public Accessor(byte[] code, JsonObject job) { _code = code; _job = job; _c1 = job["c1"] is JsonNode h ? Convert.FromHexString((string)h) : Array.Empty<byte>(); }
         // c1 常数段（着色器包控制段前 0x100 字节）：间接跳转 BRX 的跳转表在这里（LDC c[1]）；不提供时翻译器解不出跳转目标、控制流出错（粒子着色器死循环）
@@ -69,8 +72,9 @@ static class SwshXlate
             int slot = TexSlot(handle, cbufSlot);
             if (slot >= 0) TexQueried.Add(slot);
             string t = slot >= 0 ? Get("tex", slot) ?? Get("img", slot) : null;
-            if (t == null) { Notes.Add($"贴图句柄 {handle:X}（常量段 {cbufSlot}，槽 {slot}）无 PC 类型，按 2D"); return SamplerType.Texture2D; }
+            if (t == null) { Notes.Add($"贴图句柄 {handle:X}（常量段 {cbufSlot}，槽 {slot}）无 PC 类型，按 2D"); if (slot >= 0) TexDep[slot] = "2d"; return SamplerType.Texture2D; }
             if (t.EndsWith("_depth")) t = t.Substring(0, t.Length - 6);   // depth-format texture: same sampler type here; the MSL declaration is rewritten to depth2d by shader_service.py
+            if (slot >= 0) TexDep[slot] = t is "1d" or "1darray" or "buffer" or "2darray" or "2dms" or "2dmsarray" or "3d" or "cube" or "cubearray" ? t : "2d";
             return t switch
             {
                 "1d" => SamplerType.Texture1D, "1darray" => SamplerType.Texture1D | SamplerType.Array,
@@ -85,8 +89,11 @@ static class SwshXlate
             int slot = TexSlot(handle, cbufSlot);
             if (slot >= 0) ImgQueried.Add(slot);
             string f = _job["img"] is JsonObject t && slot >= 0 && t[slot.ToString()] is JsonObject o ? (string)o["fmt"] : null;
-            if (f == null) { Notes.Add($"图像句柄 {handle:X} 槽 {slot} 无 PC 格式，按 R8G8B8A8Unorm"); return TextureFormat.R8G8B8A8Unorm; }
-            return Enum.TryParse(f, true, out TextureFormat tf) ? tf : TextureFormat.R8G8B8A8Unorm;
+            TextureFormat tf = TextureFormat.R8G8B8A8Unorm;
+            if (f == null) Notes.Add($"图像句柄 {handle:X} 槽 {slot} 无 PC 格式，按 R8G8B8A8Unorm");
+            else if (!Enum.TryParse(f, true, out tf)) tf = TextureFormat.R8G8B8A8Unorm;
+            if (slot >= 0) ImgDep[slot] = tf.ToString();
+            return tf;
         }
         int Local(int i) => _job["local"] is JsonArray a && a.Count > i ? (int)a[i] : 1;
         public int QueryComputeLocalSizeX() => Local(0);
@@ -142,8 +149,8 @@ static class SwshXlate
                 var flags = (job["debug"] is JsonNode dbg && !(bool)dbg ? 0 : TranslationFlags.DebugMode) | ((string)job["stage"] == "cs" ? TranslationFlags.Compute : 0);
                 var ctx = Translator.CreateContext(0, acc, new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags));
                 ShaderProgram p = ctx.Translate();
-                File.WriteAllBytes(Path.Combine(outDir, key + ".spv"),
-                    VertexCounterLowering.Apply(code, (string)job["stage"], p.BinaryCode, acc.Notes));
+                byte[] spv = VertexCounterLowering.Apply(code, (string)job["stage"], p.BinaryCode, acc.Notes);
+                File.WriteAllBytes(Path.Combine(outDir, key + ".spv"), spv);
                 var res = new JsonObject
                 {
                     ["key"] = key, ["stage"] = (string)job["stage"], ["notes"] = new JsonArray(acc.Notes.ConvertAll(n => (JsonNode)n).ToArray()),
@@ -164,11 +171,41 @@ static class SwshXlate
                     foreach (var b in p.Info.Textures) t.Append($"tex {b.Set} {b.Binding} {(int)b.Type} {b.CbufSlot} {b.HandleIndex} {b.ArrayLength} {(b.Separate ? 1 : 0)} {(int)b.Flags} {(int)b.Format}\n");
                     foreach (var b in p.Info.Images) t.Append($"img {b.Set} {b.Binding} {(int)b.Type} {b.CbufSlot} {b.HandleIndex} {b.ArrayLength} {(b.Separate ? 1 : 0)} {(int)b.Flags} {(int)b.Format}\n");
                     t.Append($"info {(p.Info.UsesFragCoord ? 1 : 0)} {p.Info.FragmentOutputMap}\n");
+                    // deps: every answer the translation read. A bind state whose answers agree on these lines gets the same
+                    // SPIR-V, so the runtime and the prepared seed reuse the variant (vk_shader.c vk_shader_get)
+                    foreach (var kv in acc.TexDep) t.Append($"dep tex {kv.Key} {kv.Value}\n");
+                    foreach (var kv in acc.ImgDep) t.Append($"dep img {kv.Key} {kv.Value}\n");
+                    string stage = (string)job["stage"];
+                    static string Cls(JsonNode n) => n is JsonValue v && v.TryGetValue(out string s) && (s == "sint" || s == "uint") ? s : "float";
+                    if (stage == "vs")
+                    {
+                        foreach (int loc in SpvLocations(spv, 1)) t.Append($"dep attr {loc} {Cls(job["attr"]?[loc.ToString()])}\n");
+                        bool dmw = job["depth_minus_w"] is JsonValue dv && dv.TryGetValue(out bool db) && db;
+                        t.Append($"dep dmw {(dmw ? 1 : 0)}\n");
+                    }
+                    if (stage == "ps")
+                        foreach (int loc in SpvLocations(spv, 3)) t.Append($"dep fout {loc} {Cls(job["fout"]?[loc.ToString()])}\n");
                     File.WriteAllText(Path.Combine(outDir, key + ".vk.txt"), t.ToString());
                 }
                 return null;
             }
             catch (Exception e) { if (Environment.GetEnvironmentVariable("DMSH_STACK") != null) Console.Error.WriteLine(e.StackTrace); return $"{e.GetType().Name}: {e.Message.Split('\n')[0]}"; }
+    }
+
+    // Location decorations of the module's variables in one storage class (Input 1: vertex inputs, Output 3: colour outputs)
+    static SortedSet<int> SpvLocations(byte[] bytes, uint storageClass)
+    {
+        ReadOnlySpan<uint> w = MemoryMarshal.Cast<byte, uint>(bytes);
+        var loc = new Dictionary<uint, int>(); var vars = new HashSet<uint>();
+        for (int i = 5; i < w.Length;)
+        {
+            uint op = w[i] & 0xffff, len = w[i] >> 16;
+            if (len == 0) break;
+            if (op == 71 && len >= 4 && w[i + 2] == 30) loc[w[i + 1]] = (int)w[i + 3];   // OpDecorate Location
+            if (op == 59 && len >= 4 && w[i + 3] == storageClass) vars.Add(w[i + 2]);   // OpVariable
+            i += (int)len;
+        }
+        return new SortedSet<int>(vars.Where(loc.ContainsKey).Select(v => loc[v]));
     }
 
     // --disasm <code.bin> [vs|ps|cs]: print the decoded Maxwell instruction stream (address, name, raw opcode) with the

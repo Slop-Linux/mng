@@ -117,7 +117,9 @@ typedef struct vshader {
     VkDescriptorSetLayout layout;
     struct vshader *fb_next; uint32_t fb_key; int fb_none;   /* decal variants of a fragment shader by binding / attachment pairs (vk_shader_fbread) */
 } vshader;
-vshader *vk_shader_get(const uint8_t *control, const uint8_t *code, int stage, const char *answers);
+/* the bound state's answers, as the translation request names them (NULL: not answered) */
+typedef struct { const char *tex[128], *img_type[32], *img_fmt[32], *attr[16], *fout[8]; } vk_answers;
+vshader *vk_shader_get(const uint8_t *control, const uint8_t *code, int stage, const char *answers, const vk_answers *ans);
 /* the decal variant of a fragment shader: texture bindings bind[i] read colour attachment att[i] at the fragment's own pixel
    through input attachments (vk_fbread.c); NULL when the shader uses them otherwise */
 #define VK_FB_BINDING 120

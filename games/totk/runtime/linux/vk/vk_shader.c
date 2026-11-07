@@ -1,7 +1,10 @@
 /* Shader variants: Maxwell code -> totk_xlate --service --target vulkan (Ryujinx's translator) -> SPIR-V and its resource
-   list (<variant>.spv, <variant>.vk.txt) in the shader cache, then a descriptor set layout per variant. A variant is the
-   shader (SHA-256 of its control section and code, as nvn_mtl.m shader_key_of) plus the translator's answers from the
-   bound state (texture types, image formats, vertex input and colour output classes). */
+   list (<variant>.spv, <variant>.vk.txt) in the shader cache, then a descriptor set layout per variant. A shader is the
+   SHA-256 of its control section and code (nvn_mtl.m shader_key_of). Its variants are listed in <dir>/<shader>.variants,
+   one name a line, in the prepared seed (TOTK_SHADER_SEED_DIR, prepare_shader_seed.py --target vulkan, made from the
+   shared shader list) and in the cache; each variant's "dep" lines are the answers its translation read (Program.cs).
+   The bound state uses the first variant whose deps it answers the same way (nvn_mtl.m deps_match), and only a state no
+   variant serves is translated: with the whole bound state as the key, 729 shaders had made 8,635 variants. */
 #include "vk.h"
 #include <CommonCrypto/CommonDigest.h>
 #include <errno.h>
@@ -11,16 +14,21 @@
 #include <unistd.h>
 
 int totk_depth_near_minus_w(void);   /* hle_nvn.c: nvnDeviceSetDepthMode(NEAR_IS_MINUS_W) */
-#define CHAIN "botw-vk-v1"
+#define CHAIN "botw-vk-v2"
 
-static FILE *g_in, *g_out; static char g_dir[4096];
+static FILE *g_in, *g_out; static char g_dir[4096], g_seed[4096];
 static pthread_mutex_t g_sh_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_translated, g_translate_ns, g_loaded, g_load_ns;   /* g_load_ns: variants met in frames, read from the cache (files, set layout, c1 buffer) */
 
-static void service_start(void) {
-    if (g_in) return;
+static void dirs(void) {
+    if (g_dir[0]) return;
     const char *base = getenv("TOTK_SHADER_CACHE"); if (!base || !*base) base = "build/shader-cache";
     snprintf(g_dir, sizeof g_dir, "%s/%s", base, CHAIN); mkdir(base, 0755); mkdir(g_dir, 0755);
+    const char *seed = getenv("TOTK_SHADER_SEED_DIR"); if (seed && *seed) snprintf(g_seed, sizeof g_seed, "%s", seed);
+    VKLOG("shader variants: cache %s, seed %s", g_dir, g_seed[0] ? g_seed : "none");
+}
+static void service_start(void) {
+    if (g_in) return;
     const char *xl = getenv("TOTK_XLATE"); if (!xl || !*xl) xl = "prebuilt/linux-arm64/totk_xlate";
     int to[2], from[2]; if (pipe(to) || pipe(from)) VKDIE("pipe");
     pid_t pid = fork();
@@ -42,8 +50,65 @@ static int read_file(const char *path, uint8_t **data, size_t *n) {
     *data = malloc(s > 0 ? s : 1); *n = fread(*data, 1, s, f); fclose(f); return *n == (size_t)s;
 }
 
-typedef struct sh_ent { char key[96]; vshader *s; struct sh_ent *next; } sh_ent;
-static sh_ent *g_tab[4096];
+/* a variant's deps: kind t (texture slot type), i (image slot format), a (vertex input class), f (colour output class),
+   w (depth mode NEAR_IS_MINUS_W, vertex) */
+typedef struct { char kind; uint8_t slot; char val[24]; } vdep;
+typedef struct cand { char name[96]; const char *dir; vdep *d; int nd; vshader *s; struct cand *next; } cand;
+typedef struct shv { char key[65]; cand *c, **tail; struct shv *next; } shv;
+static shv *g_shv[4096];
+static uint64_t g_seed_used;
+
+static int read_deps(cand *c) {
+    char path[4400], line[256]; snprintf(path, sizeof path, "%s/%s.vk.txt", c->dir, c->name);
+    FILE *f = fopen(path, "r"); if (!f) return 0;
+    while (fgets(line, sizeof line, f)) {
+        char kind[8], val[24]; int slot;
+        if (strncmp(line, "dep ", 4)) continue;
+        int n = sscanf(line + 4, "%7s %d %23s", kind, &slot, val);
+        if (n < 2 || slot < 0 || slot > 255) continue;
+        vdep d = {.kind = !strcmp(kind, "tex") ? 't' : !strcmp(kind, "img") ? 'i' : !strcmp(kind, "attr") ? 'a' : !strcmp(kind, "fout") ? 'f' : !strcmp(kind, "dmw") ? 'w' : 0, .slot = (uint8_t)slot};
+        if (!d.kind || (d.kind != 'w' && n < 3)) continue;
+        if (d.kind != 'w') snprintf(d.val, sizeof d.val, "%s", val);
+        c->d = realloc(c->d, (c->nd + 1) * sizeof *c->d); c->d[c->nd++] = d;
+    }
+    fclose(f); return 1;
+}
+/* the answer the translator would read for a dep (Program.cs Accessor: an unanswered texture slot is 2D or the image
+   slot's type, an unanswered image format R8G8B8A8Unorm, an unanswered input or output float) */
+static int serves(const cand *c, const vk_answers *A) {
+    for (int i = 0; i < c->nd; i++) {
+        const vdep *d = &c->d[i]; const char *got;
+        switch (d->kind) {
+            case 't': got = d->slot < 128 && A->tex[d->slot] ? A->tex[d->slot] : d->slot < 32 && A->img_type[d->slot] ? A->img_type[d->slot] : "2d"; break;
+            case 'i': got = d->slot < 32 && A->img_fmt[d->slot] ? A->img_fmt[d->slot] : "R8G8B8A8Unorm"; break;
+            case 'a': got = d->slot < 16 && A->attr[d->slot] ? A->attr[d->slot] : "float"; break;
+            case 'f': got = d->slot < 8 && A->fout[d->slot] ? A->fout[d->slot] : "float"; break;
+            default: if (d->slot != (totk_depth_near_minus_w() ? 1 : 0)) return 0; continue;
+        }
+        if (strcmp(got, d->val)) return 0;
+    }
+    return 1;
+}
+static void add_cand(shv *v, const char *dir, const char *name) {
+    for (cand *c = v->c; c; c = c->next) if (c->dir == dir && !strcmp(c->name, name)) return;
+    cand *c = calloc(1, sizeof *c); snprintf(c->name, sizeof c->name, "%s", name); c->dir = dir;
+    if (!read_deps(c)) { free(c); return; }
+    *v->tail = c; v->tail = &c->next;
+}
+static void read_index(shv *v, const char *dir) {
+    if (!dir[0]) return;
+    char path[4400], line[256]; snprintf(path, sizeof path, "%s/%s.variants", dir, v->key);
+    FILE *f = fopen(path, "r"); if (!f) return;
+    while (fgets(line, sizeof line, f)) { line[strcspn(line, "\r\n")] = 0; if (line[0]) add_cand(v, dir, line); }
+    fclose(f);
+}
+static shv *shader_of(const char *key) {
+    unsigned h = 0; for (int i = 0; i < 64; i++) h = h * 131 + (uint8_t)key[i]; h &= 4095;
+    for (shv *v = g_shv[h]; v; v = v->next) if (!memcmp(v->key, key, 64)) return v;
+    shv *v = calloc(1, sizeof *v); memcpy(v->key, key, 64); v->tail = &v->c;
+    read_index(v, g_seed); read_index(v, g_dir);   /* seed variants first: the shared list's states, made at build time */
+    v->next = g_shv[h]; g_shv[h] = v; return v;
+}
 
 /* vertex inputs the SPIR-V reads: Location decorations of Input variables (builtins carry BuiltIn instead) */
 static uint32_t input_locations(const uint32_t *w, size_t n) {
@@ -87,11 +152,11 @@ static VkDescriptorType desc_type(const vk_rbind *b) {
         default: return (b->stype & 0xff) == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     }
 }
-static vshader *load(const char *variant, int stage, const uint8_t *c1, size_t c1_len, const uint32_t *local) {
+static vshader *load(const char *dir, const char *variant, int stage, const uint8_t *c1, size_t c1_len, const uint32_t *local) {
     char path[4400]; uint8_t *spv; size_t n;
-    snprintf(path, sizeof path, "%s/%s.spv", g_dir, variant);
+    snprintf(path, sizeof path, "%s/%s.spv", dir, variant);
     if (!read_file(path, &spv, &n) || n < 20 || n % 4) return NULL;
-    snprintf(path, sizeof path, "%s/%s.vk.txt", g_dir, variant);
+    snprintf(path, sizeof path, "%s/%s.vk.txt", dir, variant);
     FILE *f = fopen(path, "r"); if (!f) { free(spv); return NULL; }
     vshader *s = calloc(1, sizeof *s); snprintf(s->key, sizeof s->key, "%s", variant); s->stage = stage; s->spv = (uint32_t *)spv; s->nwords = n / 4;
     char line[256];
@@ -136,22 +201,31 @@ static vshader *load(const char *variant, int stage, const uint8_t *c1, size_t c
     g_loaded++;
     return s;
 }
-vshader *vk_shader_get(const uint8_t *control, const uint8_t *code, int stage, const char *answers) {
+vshader *vk_shader_get(const uint8_t *control, const uint8_t *code, int stage, const char *answers, const vk_answers *A) {
     uint32_t c1o, c1t, klen; memcpy(&c1o, control + 0x700, 4); memcpy(&c1t, control + 0x704, 4); memcpy(&klen, control + 0x20, 4);
     if (klen < 0x7cc || klen >= 0x880) klen = 0x880;
     if (!c1t || c1t > 16u << 20 || c1o > c1t) VKDIE("shader code area %#x / c1 %#x", c1t, c1o);
     uint8_t md[32]; CC_SHA256_CTX c; CC_SHA256_Init(&c); CC_SHA256_Update(&c, control, klen); CC_SHA256_Update(&c, code, c1t); CC_SHA256_Final(md, &c);
     uint8_t ma[32]; CC_SHA256((const uint8_t *)answers, (unsigned)strlen(answers), ma);
     char key[96]; hex(md, 32, key); key[64] = '-'; hex(ma, 6, key + 65);
-    unsigned h = 0; for (const char *p = key; *p; p++) h = h * 131 + (uint8_t)*p; h &= 4095;
     pthread_mutex_lock(&g_sh_mu);
-    for (sh_ent *e = g_tab[h]; e; e = e->next) if (!strcmp(e->key, key)) { pthread_mutex_unlock(&g_sh_mu); return e->s; }
-    service_start();
+    dirs();
+    shv *v = shader_of(key);
     uint32_t local[3] = {0, 0, 0}; if (stage == 5) memcpy(local, control + 0x748, 12);
-    uint64_t l0_ = clock_gettime_nsec_np(CLOCK_MONOTONIC);
-    vshader *s = load(key, stage, code + c1o, c1t - c1o, stage == 5 ? local : NULL);
-    if (s) g_load_ns += clock_gettime_nsec_np(CLOCK_MONOTONIC) - l0_;
+    for (cand *c = v->c; c; c = c->next) if (serves(c, A)) {
+        if (!c->s) {
+            uint64_t l0_ = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+            c->s = load(c->dir, c->name, stage, code + c1o, c1t - c1o, stage == 5 ? local : NULL);
+            if (!c->s) VKDIE("shader variant %s/%s: no SPIR-V", c->dir, c->name);
+            g_load_ns += clock_gettime_nsec_np(CLOCK_MONOTONIC) - l0_;
+            if (c->dir == g_seed) g_seed_used++;
+        }
+        pthread_mutex_unlock(&g_sh_mu); return c->s;
+    }
+    /* no variant serves this state: translate it (or take a translation an index append missed) and list it */
+    vshader *s = load(g_dir, key, stage, code + c1o, c1t - c1o, stage == 5 ? local : NULL);
     if (!s) {
+        service_start();
         uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
         size_t skip = stage == 5 ? 0 : 0x30;   /* graphics code drops the 0x30-byte NVN header (totk_shader_rt.m variant_request) */
         char path[4400]; snprintf(path, sizeof path, "%s/%s.code", g_dir, key);
@@ -166,12 +240,17 @@ vshader *vk_shader_get(const uint8_t *control, const uint8_t *code, int stage, c
         if (!fgets(reply, sizeof reply, g_out)) VKDIE("shader service exited while translating %s", key);
         if (!strstr(reply, "\"ok\": true")) VKDIE("shader %s (stage %d) translation failed: %s", key, stage, reply);
         unlink(path);
-        s = load(key, stage, code + c1o, c1t - c1o, stage == 5 ? local : NULL);
+        s = load(g_dir, key, stage, code + c1o, c1t - c1o, stage == 5 ? local : NULL);
         if (!s) VKDIE("shader %s: translation produced no SPIR-V", key);
         g_translated++; g_translate_ns += clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0;
-        if (g_translated % 100 == 0) VKLOG("shaders: %llu translated (%.1f ms each), %llu loaded", (unsigned long long)g_translated, g_translate_ns / 1e6 / g_translated, (unsigned long long)g_loaded);
+        if (g_translated % 100 == 0) VKLOG("shaders: %llu translated (%.1f ms each), %llu loaded, %llu from the seed", (unsigned long long)g_translated, g_translate_ns / 1e6 / g_translated, (unsigned long long)g_loaded, (unsigned long long)g_seed_used);
     }
-    sh_ent *e = calloc(1, sizeof *e); snprintf(e->key, sizeof e->key, "%s", key); e->s = s; e->next = g_tab[h]; g_tab[h] = e;
+    cand *nc = calloc(1, sizeof *nc); snprintf(nc->name, sizeof nc->name, "%s", key); nc->dir = g_dir;
+    if (!read_deps(nc)) VKDIE("shader %s: no vk.txt", key);
+    nc->s = s; *v->tail = nc; v->tail = &nc->next;
+    if (!serves(nc, A)) VKLOG("【红】%s: its deps do not answer the state it was translated for", key);
+    char path[4400]; snprintf(path, sizeof path, "%s/%.64s.variants", g_dir, key);
+    FILE *f = fopen(path, "a"); if (!f || fprintf(f, "%s\n", key) < 0 || fclose(f)) VKDIE("append %s", path);
     pthread_mutex_unlock(&g_sh_mu);
     return s;
 }
