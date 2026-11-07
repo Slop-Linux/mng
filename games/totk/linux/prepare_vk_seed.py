@@ -8,9 +8,8 @@ A variant is <variant>.spv and <variant>.vk.txt; the "dep" lines of vk.txt are t
 (tools/totk_xlate/Program.cs). <shader>.variants names a shader's variants, one a line. The runtime uses the first
 variant whose deps the bound state answers the same way and translates only a state none serves
 (runtime/linux/vk/vk_shader.c). A listed state an earlier variant of the shader already serves is not translated, and a
-translation with the deps of an earlier variant is dropped. The default job types unanswered vertex inputs by their use
-(totk_xlate "infer_attr", as the Metal seed's InferAttributeTypes); for a vertex shader it made integer inputs for,
-every other float / integer choice of those inputs is made as well. Vulkan samples a depth texture as any other, so the Metal
+translation with the deps of an earlier variant is dropped. Vertex input and colour output classes do not make variants:
+the runtime retypes a variant to the bound formats (runtime/linux/vk/vk_retype.c). Vulkan samples a depth texture as any other, so the Metal
 seed's depth-bound compare variants are not made. The output is game-derived data: it never goes into the repo.
 
 usage: prepare_vk_seed.py --romfs <RomFS folder> --modules rewritten/<version> --translator <totk_xlate>
@@ -18,7 +17,6 @@ usage: prepare_vk_seed.py --romfs <RomFS folder> --modules rewritten/<version> -
 """
 import argparse
 import concurrent.futures
-import itertools
 import json
 import os
 from pathlib import Path
@@ -49,8 +47,8 @@ def vk_deps(path):
 
 def vk_serves(deps, answers):
     """Whether a variant serves a bind state: the state answers every dep as the translator reads an answer (Program.cs
-    Accessor: an unanswered texture slot is 2D or the image slot's type, an unanswered image format R8G8B8A8Unorm, an
-    unanswered input or output float; vk_shader.c serves). translation_request asks with depth_minus_w."""
+    Accessor: an unanswered texture slot is 2D or the image slot's type, an unanswered image format R8G8B8A8Unorm;
+    vk_shader.c serves). translation_request asks with depth_minus_w."""
     tex, img = answers.get('tex', {}), answers.get('img', {})
 
     def tex_type(slot):
@@ -58,14 +56,9 @@ def vk_serves(deps, answers):
         t = t.removesuffix('_depth')
         return t if t in VK_TEX else '2d'
 
-    def cls(kind, slot):
-        v = answers.get(kind, {}).get(slot)
-        return v if v in ('sint', 'uint') else 'float'
-
-    got = dict(tex=tex_type, img=lambda slot: (img.get(slot) or {}).get('fmt') or 'R8G8B8A8Unorm',
-               attr=lambda slot: cls('attr', slot))
-    # colour output classes are not compared: the runtime retypes the outputs to the bound targets (vk_retype.c)
-    return deps.get('dmw', 1) == 1 and all(got[kind](slot) == want for kind in ('tex', 'img', 'attr')
+    got = dict(tex=tex_type, img=lambda slot: (img.get(slot) or {}).get('fmt') or 'R8G8B8A8Unorm')
+    # vertex input and colour output classes are not compared: the runtime retypes them to what is bound (vk_retype.c)
+    return deps.get('dmw', 1) == 1 and all(got[kind](slot) == want for kind in ('tex', 'img')
                                            for slot, want in deps[kind].items())
 
 
@@ -92,7 +85,7 @@ def prepare(romfs, modules, translator, output, game, shader_list):
     pending = iter(sorted(by_key.items()))
     lock = threading.Lock()
     produced, failed = {}, []
-    done = [0, 0, 0]   # variants kept, jobs a variant already served, of the kept ones inferred inputs answered float
+    done = [0, 0]   # variants kept, jobs a variant already served
     started = time.monotonic()
 
     def worker():
@@ -107,7 +100,6 @@ def prepare(romfs, modules, translator, output, game, shader_list):
                 key, todo = item
                 stage, control, code, source = shaders[key]
                 mine = {}   # canonical deps -> variant
-                todo = list(todo)
                 for answers, variant, why in todo:
                     if why != 'default' and any(vk_serves(json.loads(d), answers) for d in mine):
                         with lock:
@@ -115,7 +107,6 @@ def prepare(romfs, modules, translator, output, game, shader_list):
                         continue
                     code_path = output/(variant+'.code')
                     request = seed.translation_request(variant, stage, control, code, answers, code_path)
-                    request['infer_attr'] = True   # unanswered vertex inputs typed by their use (Service.cs), as the Metal seed
                     process.stdin.write(json.dumps(request)+'\n'); process.stdin.flush()
                     reply = json.loads(process.stdout.readline())
                     code_path.unlink()
@@ -131,18 +122,8 @@ def prepare(romfs, modules, translator, output, game, shader_list):
                             (output/(variant+end)).unlink()
                         continue
                     mine[deps] = variant
-                    if why == 'default' and stage == 'vs':
-                        # The game binds a float format to some inputs the code only bitcasts to integers (attr 7 next to
-                        # an integer attr 6 on the Great Plateau): every other float / integer choice of the inferred
-                        # inputs (at most two in Breath of the Wild) is made too, next, before the listed states.
-                        inferred = sorted(k for k, t in json.loads(deps)['attr'].items() if t == 'uint')
-                        combos = [off for n in range(1, len(inferred)+1) for off in itertools.combinations(inferred, n)]
-                        for i, off in enumerate(combos):
-                            alt = dict(answers, attr={**answers['attr'], **{k: 'float' for k in off}})
-                            todo.insert(todo.index((answers, variant, why))+1+i, (alt, key+'-'+seed.suffix(alt), 'inferred-float'))
                     with lock:
                         done[0] += 1
-                        done[2] += why == 'inferred-float'
                         if done[0] % 500 == 0:
                             print(f'prepared {done[0]} variants of {len(jobs)} jobs; {time.monotonic()-started:.0f}s',
                                   flush=True)
@@ -164,7 +145,6 @@ def prepare(romfs, modules, translator, output, game, shader_list):
                   served_by_another=sum(1 for first in served.values() if first in produced),
                   shaders=len(produced), variants=done[0], served_by_earlier_variant=done[1],
                   listed_jobs=sum(1 for *_, why in jobs if why == 'listed'),
-                  inferred_float_variants=done[2],
                   failed=failed, archives=archives,
                   seconds=round(time.monotonic()-started, 1))
     (output/'seed-manifest.json').write_text(json.dumps(report, indent=2)+'\n')
