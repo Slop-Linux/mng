@@ -57,6 +57,11 @@ typedef struct cand { char name[96]; const char *dir; vdep *d; int nd; vshader *
 typedef struct shv { char key[65]; cand *c, **tail; struct shv *next; } shv;
 static shv *g_shv[4096];
 static uint64_t g_seed_used;
+/* lookups (a program stage under a bind state the replay had not met): served by a variant already loaded, by one first
+   loaded from the seed / the cache, or missed (translated); the misses with the shader in the seed, and the dep each
+   missed the shader's first variant on */
+static uint64_t g_look, g_hit_mem, g_hit_seed, g_hit_cache, g_miss, g_miss_seeded, g_miss_kind[5];
+static uint64_t g_seed_shaders;   /* shaders met that the seed lists */
 
 static int read_deps(cand *c) {
     char path[4400], line[256]; snprintf(path, sizeof path, "%s/%s.vk.txt", c->dir, c->name);
@@ -75,6 +80,7 @@ static int read_deps(cand *c) {
 }
 /* the answer the translator would read for a dep (Program.cs Accessor: an unanswered texture slot is 2D or the image
    slot's type, an unanswered image format R8G8B8A8Unorm, an unanswered input or output float) */
+static const vdep *g_missed_on; static char g_missed_got[24];   /* serves: the dep the last refused variant missed on */
 static int serves(const cand *c, const vk_answers *A) {
     for (int i = 0; i < c->nd; i++) {
         const vdep *d = &c->d[i]; const char *got;
@@ -83,9 +89,9 @@ static int serves(const cand *c, const vk_answers *A) {
             case 'i': got = d->slot < 32 && A->img_fmt[d->slot] ? A->img_fmt[d->slot] : "R8G8B8A8Unorm"; break;
             case 'a': got = d->slot < 16 && A->attr[d->slot] ? A->attr[d->slot] : "float"; break;
             case 'f': got = d->slot < 8 && A->fout[d->slot] ? A->fout[d->slot] : "float"; break;
-            default: if (d->slot != (totk_depth_near_minus_w() ? 1 : 0)) return 0; continue;
+            default: if (d->slot != (totk_depth_near_minus_w() ? 1 : 0)) { g_missed_on = d; snprintf(g_missed_got, sizeof g_missed_got, "%d", totk_depth_near_minus_w()); return 0; } continue;
         }
-        if (strcmp(got, d->val)) return 0;
+        if (strcmp(got, d->val)) { g_missed_on = d; snprintf(g_missed_got, sizeof g_missed_got, "%s", got); return 0; }
     }
     return 1;
 }
@@ -106,7 +112,8 @@ static shv *shader_of(const char *key) {
     unsigned h = 0; for (int i = 0; i < 64; i++) h = h * 131 + (uint8_t)key[i]; h &= 4095;
     for (shv *v = g_shv[h]; v; v = v->next) if (!memcmp(v->key, key, 64)) return v;
     shv *v = calloc(1, sizeof *v); memcpy(v->key, key, 64); v->tail = &v->c;
-    read_index(v, g_seed); read_index(v, g_dir);   /* seed variants first: the shared list's states, made at build time */
+    read_index(v, g_seed); if (v->c) g_seed_shaders++;
+    read_index(v, g_dir);   /* seed variants first: the shared list's states, made at build time */
     v->next = g_shv[h]; g_shv[h] = v; return v;
 }
 
@@ -212,7 +219,9 @@ vshader *vk_shader_get(const uint8_t *control, const uint8_t *code, int stage, c
     dirs();
     shv *v = shader_of(key);
     uint32_t local[3] = {0, 0, 0}; if (stage == 5) memcpy(local, control + 0x748, 12);
+    g_look++;
     for (cand *c = v->c; c; c = c->next) if (serves(c, A)) {
+        if (c->s) g_hit_mem++; else if (c->dir == g_seed) g_hit_seed++; else g_hit_cache++;
         if (!c->s) {
             uint64_t l0_ = clock_gettime_nsec_np(CLOCK_MONOTONIC);
             c->s = load(c->dir, c->name, stage, code + c1o, c1t - c1o, stage == 5 ? local : NULL);
@@ -223,6 +232,16 @@ vshader *vk_shader_get(const uint8_t *control, const uint8_t *code, int stage, c
         pthread_mutex_unlock(&g_sh_mu); return c->s;
     }
     /* no variant serves this state: translate it (or take a translation an index append missed) and list it */
+    g_miss++;
+    if (!v->c) VKLOG("shader miss %.64s (stage %d): no variant of it in the seed or the cache", key, stage);
+    else {
+        serves(v->c, A);   /* the first variant's refusal, for the reason */
+        if (v->c->dir == g_seed) g_miss_seeded++;
+        const char *kinds = "tiafw"; int k = (int)(strchr(kinds, g_missed_on->kind) - kinds); g_miss_kind[k]++;
+        VKLOG("shader miss %.64s (stage %d): %d variant(s), the first (%s) has %c %u = %s, the state %s", key, stage,
+              ({ int n_ = 0; for (cand *c = v->c; c; c = c->next) n_++; n_; }), v->c->dir == g_seed ? "seed" : "cache",
+              g_missed_on->kind, g_missed_on->slot, g_missed_on->kind == 'w' ? (g_missed_on->slot ? "1" : "0") : g_missed_on->val, g_missed_got);
+    }
     vshader *s = load(g_dir, key, stage, code + c1o, c1t - c1o, stage == 5 ? local : NULL);
     if (!s) {
         service_start();
@@ -277,5 +296,16 @@ vshader *vk_shader_fbread(vshader *fs, const int bind[], const int att[], int k)
     }
     pthread_mutex_unlock(&g_sh_mu);
     return v->fb_none ? NULL : v;
+}
+void vk_shader_report(void) {   /* unlocked: statistics */
+    double n = g_look ? (double)g_look : 1;
+    VKLOG("shader variant lookups %llu: hits %llu (%.1f%%: loaded %llu, first from the seed %llu, first from the cache %llu), "
+          "misses %llu (%.1f%%; %llu of shaders the seed has: on texture %llu, image %llu, vertex input %llu, colour output %llu, depth mode %llu); "
+          "shaders met %llu, %llu of them in the seed",
+          (unsigned long long)g_look, (unsigned long long)(g_look - g_miss), 100.0 * (g_look - g_miss) / n, (unsigned long long)g_hit_mem,
+          (unsigned long long)g_hit_seed, (unsigned long long)g_hit_cache, (unsigned long long)g_miss, 100.0 * g_miss / n,
+          (unsigned long long)g_miss_seeded, (unsigned long long)g_miss_kind[0], (unsigned long long)g_miss_kind[1], (unsigned long long)g_miss_kind[2],
+          (unsigned long long)g_miss_kind[3], (unsigned long long)g_miss_kind[4], ({ unsigned long long n_ = 0; for (int i = 0; i < 4096; i++) for (shv *v = g_shv[i]; v; v = v->next) n_++; n_; }),
+          (unsigned long long)g_seed_shaders);
 }
 void vk_shader_stats(uint64_t s[4]) { s[0] = g_loaded; s[1] = g_load_ns; s[2] = g_translated; s[3] = g_translate_ns; }   /* unlocked: statistics */
