@@ -221,6 +221,15 @@ static class SwshXlate
                     var t = new StringBuilder();
                     foreach (var b in p.Info.CBuffers) t.Append($"cbuf {b.Set} {b.Binding} {b.Slot}\n");
                     foreach (var b in p.Info.SBuffers) t.Append($"sbuf {b.Set} {b.Binding} {b.Slot} {b.SbCbSlot} {b.SbCbOffset} {(int)b.Flags}\n");
+                    // float views (TryGetStorageBufferFloatBinding, patch 0029): a second binding <stage>_sf<slot> over the same
+                    // buffer as storage buffer <slot>, for native float atomics; the reflection lists only the first
+                    foreach (var (name, set, binding) in SpvNamedBindings(spv))
+                    {
+                        var m = System.Text.RegularExpressions.Regex.Match(name, @"^[a-z]+_sf(\d+)$");
+                        if (!m.Success) continue;
+                        int slot = int.Parse(m.Groups[1].Value);
+                        foreach (var b in p.Info.SBuffers) if (b.Slot == slot) t.Append($"sbuf {set} {binding} {b.Slot} {b.SbCbSlot} {b.SbCbOffset} {(int)b.Flags}\n");
+                    }
                     foreach (var b in p.Info.Textures) t.Append($"tex {b.Set} {b.Binding} {(int)b.Type} {b.CbufSlot} {b.HandleIndex} {b.ArrayLength} {(b.Separate ? 1 : 0)} {(int)b.Flags} {(int)b.Format}\n");
                     foreach (var b in p.Info.Images) t.Append($"img {b.Set} {b.Binding} {(int)b.Type} {b.CbufSlot} {b.HandleIndex} {b.ArrayLength} {(b.Separate ? 1 : 0)} {(int)b.Flags} {(int)b.Format}\n");
                     t.Append($"info {(p.Info.UsesFragCoord ? 1 : 0)} {p.Info.FragmentOutputMap}\n");
@@ -243,6 +252,25 @@ static class SwshXlate
                 return null;
             }
             catch (Exception e) { if (Environment.GetEnvironmentVariable("DMSH_STACK") != null) Console.Error.WriteLine(e.StackTrace); return $"{e.GetType().Name}: {e.Message.Split('\n')[0]}"; }
+    }
+
+    // The module's named variables with their descriptor set and binding (OpName, OpDecorate DescriptorSet / Binding)
+    static List<(string Name, int Set, int Binding)> SpvNamedBindings(byte[] bytes)
+    {
+        ReadOnlySpan<uint> w = MemoryMarshal.Cast<byte, uint>(bytes);
+        var names = new Dictionary<uint, string>(); var set = new Dictionary<uint, int>(); var bind = new Dictionary<uint, int>();
+        for (int i = 5; i < w.Length;)
+        {
+            uint op = w[i] & 0xffff, len = w[i] >> 16;
+            if (len == 0) break;
+            if (op == 5 && len >= 3) { var sb = new StringBuilder(); for (int k = i + 2; k < i + len; k++) for (int c = 0; c < 4; c++) { char ch = (char)((w[k] >> (8 * c)) & 0xff); if (ch == 0) goto done; sb.Append(ch); } done: names[w[i + 1]] = sb.ToString(); }   // OpName
+            if (op == 71 && len >= 4 && w[i + 2] == 34) set[w[i + 1]] = (int)w[i + 3];   // OpDecorate DescriptorSet
+            if (op == 71 && len >= 4 && w[i + 2] == 33) bind[w[i + 1]] = (int)w[i + 3];  // OpDecorate Binding
+            i += (int)len;
+        }
+        var r = new List<(string, int, int)>();
+        foreach (var kv in bind) if (names.TryGetValue(kv.Key, out string n) && set.TryGetValue(kv.Key, out int st)) r.Add((n, st, kv.Value));
+        return r;
     }
 
     // Location decorations of the module's variables in one storage class (Input 1: vertex inputs, Output 3: colour outputs)

@@ -552,7 +552,7 @@ static void support_init(void) {
     uint8_t *m; VKCHECK(vkMapMemory(V.dev, g_support_mem, 0, VK_WHOLE_SIZE, 0, (void **)&m)); memset(m, 0, 4096);
     for (int i = 0; i < 73; i++) *(float *)(m + 192 + 16 * i) = 1.0f;   /* render_scale: 1 (alpha_test 0, is_bgra 16, viewport_inverse 144, viewport_size 160, frag_scale_count 176) */
 }
-/* NVN driver constant segments: c0 storage-buffer table (vertex 0x110, fragment 0x510, compute 0x310), compute group counts 0x200
+/* NVN driver constant segments: c0 storage-buffer table (vertex 0x110, fragment 0x510, compute 0x310), compute group counts 0x200 (NVN2: 4)
    and uniform table 0x210, vertex point-size limit 0x610; c2 combined handles 0x20, texture handles 0x168, sampler handles 0x568 */
 static uint32_t g_grid[3];
 static VkBuffer g_cs_bank_buf; static VkDeviceSize g_cs_bank_off;   /* the compute dispatch's c0 bank (indirect group counts) */
@@ -561,7 +561,8 @@ static void driver_bank(uint8_t *d, int bank, int stage) {
     if (bank == 0) {
         int base = stage == 0 ? 0x110 : stage == 5 ? 0x310 : 0x510;
         for (int r = 0; r < 16; r++) { uint64_t a = S.ssbo[stage][r].addr; uint32_t n = (uint32_t)S.ssbo[stage][r].size; memcpy(d + base + 16 * r, &a, 8); memcpy(d + base + 16 * r + 8, &n, 4); }
-        if (stage == 5) { memcpy(d + 0x200, g_grid, 12); for (int r = 0; r < 16; r++) { uint64_t a = S.ubo[5][r].addr; uint32_t n = (uint32_t)S.ubo[5][r].size; memcpy(d + 0x210 + 16 * r, &a, 8); memcpy(d + 0x210 + 16 * r + 8, &n, 4); } }
+        if (stage == 5) { memcpy(d + 0x200, g_grid, 12); memcpy(d + 4, g_grid, 12);   /* the group counts: NVN at 0x200, NVN2 at 4 (nvn_mtl.m driver_bank_fill) */
+            for (int r = 0; r < 16; r++) { uint64_t a = S.ubo[5][r].addr; uint32_t n = (uint32_t)S.ubo[5][r].size; memcpy(d + 0x210 + 16 * r, &a, 8); memcpy(d + 0x210 + 16 * r + 8, &n, 4); } }
         else if (stage == 0) { const float ps = 2047.9375f; memcpy(d + 0x610, &ps, 4); }
     } else {
         for (int r = 0; r < 128; r++) { uint32_t th = (uint32_t)S.tex[stage][r], sh = (uint32_t)S.samp[stage][r]; memcpy(d + 0x168 + 8 * r, &th, 4); memcpy(d + 0x568 + 8 * r, &sh, 4); }
@@ -1196,7 +1197,7 @@ static void dispatch(const p_dispatch *d) {
     if (d->indirect) {   /* nvnCommandBufferDispatchComputeIndirect: the group counts, read by the GPU, also into c0 +0x200 */
         VkBuffer ib; VkDeviceSize io;
         if (!vk_pool_find(d->indirect, 12, &ib, &io)) VKDIE("indirect dispatch arguments %#llx are not in a pool", (unsigned long long)d->indirect);
-        VkBufferCopy c = {io, g_cs_bank_off + 0x200, 12}; vkCmdCopyBuffer(cb, ib, g_cs_bank_buf, 1, &c); full_barrier();
+        VkBufferCopy c[2] = {{io, g_cs_bank_off + 0x200, 12}, {io, g_cs_bank_off + 4, 12}}; vkCmdCopyBuffer(cb, ib, g_cs_bank_buf, 2, c); full_barrier();
         vkCmdDispatchIndirect(cb, ib, io);
     } else
 #endif

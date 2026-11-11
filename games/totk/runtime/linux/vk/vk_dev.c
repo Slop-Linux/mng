@@ -50,11 +50,14 @@ void vk_init(void) {
     VkDeviceQueueCreateInfo qci = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = V.qfam, .queueCount = nqueue, .pQueuePriorities = prio};
     const char *dext[] = {VK_EXT_SHADER_OBJECT_EXTENSION_NAME, VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME,
         VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
-        VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME, VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+        VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME,
+        VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,   /* float atomic add: NVN2 shaders (the translator's float views, patch 0029) */
+        VK_KHR_SWAPCHAIN_EXTENSION_NAME};   /* last: left out without a window */
     uint32_t ndext = sizeof dext / sizeof *dext - (g_surface ? 0 : 1);
     /* every feature the device has in these structures (the queried chain is the enabled one), minus robust buffer / image
        access (a cost the game does not need; null descriptors stay) */
-    VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT af = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
+    VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, .pNext = &af};
     VkPhysicalDeviceProvokingVertexFeaturesEXT pv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT, .pNext = &lr};
     VkPhysicalDeviceDepthClipEnableFeaturesEXT dce = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT, .pNext = &pv};
     VkPhysicalDeviceIndexTypeUint8FeaturesEXT iu8 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT, .pNext = &dce};
