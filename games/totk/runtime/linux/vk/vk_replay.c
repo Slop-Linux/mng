@@ -101,6 +101,7 @@ typedef struct { vtex *v; int level, layer; VkImageAspectFlags aspect; VkClearVa
 #define PCLR 64
 static pclr_t g_pclr[PCLR]; static int g_npclr, g_pclr_hit; static uint64_t g_pclr_loads, g_pclr_run, g_pass_dropped;
 static uint64_t g_presents;
+uint64_t vk_presents(void) { return g_presents; }
 /* TOTK_VK_FMT_LOG=N (diagnostic): the first N distinct (kind, memory, NVN format, view format, size) of render targets,
    sampled textures and texture copies, with the Vulkan image and its format */
 static void fmt_log(const char *kind, const tex_t *t, int vfmt, const vtex *v, const char *extra) {
@@ -482,7 +483,7 @@ static int range_copy(uint64_t addr, uint64_t size, int direct, VkBuffer *buf, V
 }
 
 /* ---------- shader pairs and descriptors ---------- */
-typedef struct pair_t { vshader *vs, *fs; VkShaderEXT sh[2]; VkPipelineLayout pl; struct pair_t *next; } pair_t;
+typedef struct pair_t { vshader *vs, *fs; VkShaderEXT sh[2]; VkPipelineLayout pl; int pool; struct pair_t *next; } pair_t;
 static pair_t *g_pairs[1024];
 typedef struct comp_t { vshader *cs; VkShaderEXT sh; VkPipelineLayout pl; struct comp_t *next; } comp_t;
 static uint64_t g_mk[2];   /* shader objects created, ns (long-frame log) */
@@ -498,20 +499,23 @@ static pair_t *pair_get(vshader *vs, vshader *fs) {
     unsigned h = (unsigned)(((uintptr_t)vs >> 4) ^ ((uintptr_t)fs >> 2)) & 1023;
     for (pair_t *p = g_pairs[h]; p; p = p->next) if (p->vs == vs && p->fs == fs) return p;
     pair_t *p = calloc(1, sizeof *p); p->vs = vs; p->fs = fs;
-    VkDescriptorSetLayout l[2] = {vs->layout, fs ? fs->layout : V.empty_layout};
-    VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 2, .pSetLayouts = l};
-    VKCHECK(vkCreatePipelineLayout(V.dev, &pli, NULL, &p->pl));
-    p->sh[0] = make_shader(vs, VK_SHADER_STAGE_VERTEX_BIT, fs ? VK_SHADER_STAGE_FRAGMENT_BIT : 0, l, 2);
-    if (fs) p->sh[1] = make_shader(fs, VK_SHADER_STAGE_FRAGMENT_BIT, 0, l, 2);
+    /* set VK_POOL_SET: the NVN2 descriptor pools (vk_pool.c), when either stage reads them */
+    int nl = vs->pool || (fs && fs->pool) ? 3 : 2;
+    VkDescriptorSetLayout l[3] = {vs->layout, fs ? fs->layout : V.empty_layout, nl == 3 ? vk_pool_layout() : VK_NULL_HANDLE};
+    VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = (uint32_t)nl, .pSetLayouts = l};
+    VKCHECK(vkCreatePipelineLayout(V.dev, &pli, NULL, &p->pl)); p->pool = nl == 3;
+    p->sh[0] = make_shader(vs, VK_SHADER_STAGE_VERTEX_BIT, fs ? VK_SHADER_STAGE_FRAGMENT_BIT : 0, l, nl);
+    if (fs) p->sh[1] = make_shader(fs, VK_SHADER_STAGE_FRAGMENT_BIT, 0, l, nl);
     p->next = g_pairs[h]; g_pairs[h] = p; return p;
 }
 static comp_t *comp_get(vshader *cs) {
     unsigned h = (unsigned)((uintptr_t)cs >> 4) & 255;
     for (comp_t *c = g_comps[h]; c; c = c->next) if (c->cs == cs) return c;
     comp_t *c = calloc(1, sizeof *c); c->cs = cs;
-    VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &cs->layout};
+    VkDescriptorSetLayout l[3] = {cs->layout, V.empty_layout, cs->pool ? vk_pool_layout() : VK_NULL_HANDLE}; int nl = cs->pool ? 3 : 1;
+    VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = (uint32_t)nl, .pSetLayouts = l};
     VKCHECK(vkCreatePipelineLayout(V.dev, &pli, NULL, &c->pl));
-    c->sh = make_shader(cs, VK_SHADER_STAGE_COMPUTE_BIT, 0, &cs->layout, 1);
+    c->sh = make_shader(cs, VK_SHADER_STAGE_COMPUTE_BIT, 0, l, nl);
     c->next = g_comps[h]; g_comps[h] = c; return c;
 }
 /* descriptor pools: taken by a submission, reset when it completes */
@@ -964,11 +968,17 @@ static void pp_note(vshader *vs, vshader *fs) {
             char s[512]; int o = 0; for (int k = 0; k < 32; k++) o += snprintf(s + o, sizeof s - o, " %08x", v[k]);
             VKLOG("    pass #%d binding %u: uniform c%d (%llu bytes, shader reads %u):%s", g_pt_n, b->binding, b->slot - 3, (unsigned long long)u->size, b->used, s); } }
 }
+#ifdef GAME_OOT
+static void nb_note_draw(void);
+#endif
 static void draw(const p_draw *d, const p_draw_idx *di) {
     if (S.render_disabled) { g_skips[1]++; return; }
     vshader *vs = stage_shader(0), *fs = stage_shader(1);
     if (!vs) { g_skips[2]++; g_q_skipped |= g_q_counting; return; }
     if (!pass_begin()) return;
+#ifdef GAME_OOT
+    nb_note_draw();
+#endif
     g_feedback = 0;
     /* a stage's set is reused while its shader, its bindings, the registry, the targets and the submission are the same */
     static struct { vshader *s; uint64_t gen, reg, sub, rt; VkDescriptorSet set; unsigned fb; int fbp_bind[8], fbp_att[8], nfbp, fb_bad; } last[2];
@@ -1018,6 +1028,7 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
     if (!(has_tess() & 1) && (has_tess() & 2)) { stages[2] = VK_SHADER_STAGE_GEOMETRY_BIT; }
     if (dyn_changed(D_SHADERS, sh, sizeof sh)) V.CmdBindShadersEXT(cb, (uint32_t)ns, stages, sh);
     { uint64_t k_[3] = {(uint64_t)p->pl, (uint64_t)sets[0], (uint64_t)sets[1]}; if (dyn_changed(D_SETS, k_, sizeof k_)) vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pl, 0, 2, sets, 0, NULL); }
+    if (p->pool) { vk_pool_sync(); VkDescriptorSet ps = vk_pool_set(); vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pl, VK_POOL_SET, 1, &ps, 0, NULL); }
     static uint64_t dyn_gen, dyn_sub, vtx_gen, vtx_sub; static vshader *vtx_vs;
     if (dyn_gen != g_gen_state || dyn_sub != g_cb_gen) { set_dynamic(cb); dyn_gen = g_gen_state; dyn_sub = g_cb_gen; }
     if (vtx_gen != g_gen_vtx || vtx_sub != g_cb_gen || vtx_vs != vs) { vertex_input(cb, vs); vtx_gen = g_gen_vtx; vtx_sub = g_cb_gen; vtx_vs = vs; }
@@ -1121,11 +1132,56 @@ static int mv_dispatch(const vshader *cs) {
     g_mv.skipped++;
     return 1;   /* the network */
 }
+
+/* ---------- Ocarina of Time's end-of-frame network (oot_net_bypass.inc) ----------
+   The frame's fragment passes write T, the tonemapped picture, inside a 1536x864 texture (the viewport is the rendered
+   region the game's resolution chose); compute d17eefaf and a335c1db prepare the network's input C from it, and the next
+   dispatch that samples C, the network, writes O, the canvas. Here d17eefaf and a335c1db are skipped and the network is
+   replaced by a linear blit of T's rendered region into O, as the Mac replaces it with a MetalFX upscale. */
+#define NB_PREP_KEY "d17eefaff4f0bc23"
+#define NB_MIX_KEY "a335c1db6270c355"
+enum { NB_T_SLOT = 3, NB_C_SLOT = 2, NB_VP = 8 };
+static struct { const void *mem; float w, h; uint64_t frame; } g_nb_vp[NB_VP]; static int g_nb_vp_next;
+static struct { uint64_t frame, c_serial, done; tex_t t; int have_t; } g_nb = {.frame = ~0ull};
+static void nb_note_draw(void) {   /* every draw: the viewport of the target it draws into */
+    if (!S.has_rt || !S.rt.n || !S.rt.color[0] || S.nvp < 1) return;
+    const void *mem = S.rt.color[0]->mem;
+    for (int i = 0; i < NB_VP; i++) if (g_nb_vp[i].mem == mem) { g_nb_vp[i].w = S.vp[0][2]; g_nb_vp[i].h = S.vp[0][3]; g_nb_vp[i].frame = g_presents; return; }
+    int i = g_nb_vp_next++ % NB_VP; g_nb_vp[i].mem = mem; g_nb_vp[i].w = S.vp[0][2]; g_nb_vp[i].h = S.vp[0][3]; g_nb_vp[i].frame = g_presents;
+}
+static int nb_reg(uint64_t h, tex_t *t) { view_t vw; int hv, tid = (int)(h & 0xfffff); return tid && vk_tex_registry_get(tid, t, &vw, &hv); }
+/* 1: the dispatch is skipped or replaced */
+static int nb_dispatch(const vshader *cs) {
+    if (!strncmp(cs->key, NB_PREP_KEY, 16)) return 1;
+    if (!strncmp(cs->key, NB_MIX_KEY, 16)) {
+        tex_t c; g_nb.have_t = nb_reg(S.tex[5][NB_T_SLOT], &g_nb.t);
+        g_nb.c_serial = nb_reg(S.img[5][NB_C_SLOT], &c) ? c.serial : 0; g_nb.frame = g_presents;
+        return 1;
+    }
+    if (g_nb.frame != g_presents || !g_nb.c_serial || !g_nb.have_t) return 0;
+    int reads_c = 0; tex_t o; int have_o = 0;
+    for (int i = 0; i < cs->nb; i++) { const vk_rbind *b = &cs->b[i]; tex_t t;
+        if (b->kind == RB_TEX && nb_reg(packed_handle(5, b->handle), &t) && t.serial == g_nb.c_serial) reads_c = 1;
+        else if (b->kind == RB_IMG && !have_o) have_o = nb_reg(img_handle(5, b->handle), &o); }
+    if (!reads_c || !have_o) return 0;
+    g_nb.frame = ~0ull;   /* one network a frame */
+    float cw = 0, ch = 0; for (int i = 0; i < NB_VP; i++) if (g_nb_vp[i].mem == g_nb.t.mem && g_nb_vp[i].frame == g_presents) { cw = g_nb_vp[i].w; ch = g_nb_vp[i].h; }
+    if (cw < 1 || ch < 1) { cw = (float)g_nb.t.d.width; ch = (float)g_nb.t.d.height; }
+    vtex *tv = vk_tex_get(&g_nb.t), *ov = vk_tex_get(&o);
+    end_pass(4); pclr_flush();
+    vk_tex_upload_if_stale(ov, &o); vk_tex_mark_read(tv);
+    VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int32_t)lrintf(cw), (int32_t)lrintf(ch), 1}},
+                      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {(int32_t)o.d.width, (int32_t)o.d.height, 1}}};
+    vkCmdBlitImage(vk_cb(), vk_tex_image(tv), VK_IMAGE_LAYOUT_GENERAL, vk_tex_image(ov), VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
+    vk_tex_gpu_wrote(ov); full_barrier();
+    if (!g_nb.done++) VKLOG("[net-bypass] the end-of-frame network %.16s is replaced: T %ux%u region %.0fx%.0f -> O %ux%u by a linear blit", cs->key, g_nb.t.d.width, g_nb.t.d.height, cw, ch, o.d.width, o.d.height);
+    return 1;
+}
 #endif
 static void dispatch(const p_dispatch *d) {
     vshader *cs = stage_shader(5); if (!cs) { g_skips[5]++; return; }
 #ifdef GAME_OOT
-    if (mv_dispatch(cs)) return;
+    if (mv_dispatch(cs) || nb_dispatch(cs)) return;
 #endif
     end_pass(4); pclr_flush();
     comp_t *c = comp_get(cs); if (!c->sh) return;
@@ -1134,6 +1190,7 @@ static void dispatch(const p_dispatch *d) {
     VkCommandBuffer cb = vk_cb();
     VkShaderStageFlagBits st = VK_SHADER_STAGE_COMPUTE_BIT; V.CmdBindShadersEXT(cb, 1, &st, &c->sh);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, c->pl, 0, 1, &set, 0, NULL);
+    if (cs->pool) { vk_pool_sync(); VkDescriptorSet ps = vk_pool_set(); vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, c->pl, VK_POOL_SET, 1, &ps, 0, NULL); }
     if (g_pt_on && g_pt_n < PT_MAX) { g_pt[g_pt_n] = (pt_info){(uint32_t)d->x, (uint32_t)d->y, -1, 0, 0, 0, 0, 0}; pt_mark(0); }
 #ifdef GAME_OOT
     if (d->indirect) {   /* nvnCommandBufferDispatchComputeIndirect: the group counts, read by the GPU, also into c0 +0x200 */

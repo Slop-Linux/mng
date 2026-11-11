@@ -206,10 +206,17 @@ static vshader *load(const char *dir, const char *variant, int stage, const uint
         else if ((!strncmp(line, "tex ", 4) || !strncmp(line, "img ", 4)) &&
                  sscanf(line + 4, "%d %d %d %d %d %d %d %d %d", &set, &binding, &b.stype, &b.cbuf_slot, &b.handle, &b.array, &b.separate, &b.flags, &b.format) == 9) b.kind = line[0] == 't' ? RB_TEX : RB_IMG;
         else continue;
-        b.set = (uint8_t)set; b.binding = (uint16_t)binding; if (b.array < 1) b.array = 1;
+        b.set = (uint8_t)set; b.binding = (uint32_t)binding; if (b.array < 1) b.array = 1;
         s->b = realloc(s->b, (s->nb + 1) * sizeof *s->b); s->b[s->nb++] = b;
     }
     fclose(f);
+    /* NVN2 descriptor pools: their arrays move to the shared set (vk_pool.c) and leave this stage's set */
+    for (int i = 0; i < s->nb; i++) if (vk_pool_class(&s->b[i]) >= 0) s->pool = 1;
+    if (s->pool) {
+        vk_pool_spv(&s->spv, &s->nwords, s->b, s->nb);
+        int k = 0; for (int i = 0; i < s->nb; i++) if (vk_pool_class(&s->b[i]) < 0) s->b[k++] = s->b[i];
+        s->nb = k;
+    }
     for (int i = 0; i < s->nb; i++) if (s->b[i].kind == RB_CBUF) s->b[i].used = cbuf_used(s->spv, s->nwords, s->b[i].set, s->b[i].binding);
     if (stage == 0) s->in_mask = input_locations(s->spv, s->nwords);
     if (local) memcpy(s->local, local, sizeof s->local);
@@ -341,7 +348,7 @@ vshader *vk_shader_fbread(vshader *fs, const int bind[], const int att[], int k)
         snprintf(v->key, sizeof v->key, "%.80s+fb%08x", fs->key, key);
         if (spv) {
             v->spv = spv; v->nwords = n; v->b = malloc((fs->nb + 8) * sizeof *v->b); memcpy(v->b, fs->b, fs->nb * sizeof *v->b);
-            unsigned have = 0; for (int i = 0; i < k; i++) if (!(have >> att[i] & 1)) { have |= 1u << att[i]; v->b[v->nb++] = (vk_rbind){.kind = RB_IA, .set = 1, .binding = (uint16_t)(VK_FB_BINDING + att[i]), .slot = att[i], .array = 1}; }
+            unsigned have = 0; for (int i = 0; i < k; i++) if (!(have >> att[i] & 1)) { have |= 1u << att[i]; v->b[v->nb++] = (vk_rbind){.kind = RB_IA, .set = 1, .binding = (uint32_t)(VK_FB_BINDING + att[i]), .slot = att[i], .array = 1}; }
             VkDescriptorSetLayoutBinding lb[136]; int nl = 0;
             for (int i = 0; i < v->nb && nl < 136; i++) lb[nl++] = (VkDescriptorSetLayoutBinding){v->b[i].binding, v->b[i].kind == RB_IA ? VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT : desc_type(&v->b[i]), (uint32_t)v->b[i].array,
                 v->b[i].kind == RB_IA ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_ALL, NULL};

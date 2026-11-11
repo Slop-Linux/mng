@@ -18,7 +18,7 @@ RUNTIME_ASM := gate hle_stack thread_enter
 GFX ?= vk
 LINUX := darwin_shim frontend gamepad gfx_null
 ifeq ($(GFX),vk)
-LINUX += vk/vk_dev vk/vk_tex vk/vk_shader vk/vk_replay vk/vk_fbread vk/vk_retype
+LINUX += vk/vk_dev vk/vk_tex vk/vk_shader vk/vk_replay vk/vk_fbread vk/vk_retype vk/vk_pool
 BACKEND := -DVK_BACKEND=1
 endif
 NVN_SRC := hle_nvn nvn_dirty nvn_tex totk_lifelog totk_nvn_ext totk_sysload totk_timeline totk_vpool

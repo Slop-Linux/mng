@@ -97,6 +97,7 @@ VkSampler vk_sampler(const samp_par *p);
 VkSampler vk_sampler_id(int id);   /* by sampler pool id, cached */
 void vk_tex_registry_set(int id, const tex_t *t, const view_t *v);
 int vk_tex_registry_get(int id, tex_t *t, view_t *v, int *has_view);
+uint64_t vk_tex_registry_gen(void);   /* changes with every texture / sampler registration */
 void vk_samp_registry_set(int id, const samp_par *p);
 int vk_samp_registry_get(int id, samp_par *p);
 void vk_tex_release_serial(uint64_t serial);
@@ -106,7 +107,7 @@ void vk_tex_mark_read(vtex *v); int vk_tex_store_needed(vtex *v); void vk_tex_fr
 
 /* ---------- vk_shader.c ---------- */
 enum { RB_CBUF, RB_SBUF, RB_TEX, RB_IMG, RB_IA };   /* RB_IA: an input attachment of a decal variant (vk_fbread.c), slot = colour attachment */
-typedef struct { uint8_t kind, set, type_buffer; uint16_t binding; int32_t slot, cb_slot, cb_off, flags, stype, handle, cbuf_slot, array, separate, format; uint32_t used; } vk_rbind;   /* used: bytes of a uniform buffer the shader reads (cbuf_used), 0 = all */
+typedef struct { uint8_t kind, set, type_buffer; uint32_t binding; int32_t slot, cb_slot, cb_off, flags, stype, handle, cbuf_slot, array, separate, format; uint32_t used; } vk_rbind;   /* used: bytes of a uniform buffer the shader reads (cbuf_used), 0 = all */
 typedef struct vshader {
     char key[96]; int stage;   /* 0 vertex, 1 fragment, 5 compute */
     uint32_t *spv; size_t nwords;
@@ -119,6 +120,7 @@ typedef struct vshader {
     struct vshader *fb_next; uint32_t fb_key; int fb_none;   /* decal variants of a fragment shader by binding / attachment pairs (vk_shader_fbread) */
     char fout[8], attr[16];    /* each fragment output's / vertex input's class as translated ('f' / 'u' / 's', 0 none) */
     struct vshader *rt_next; uint32_t rt_key;   /* the variant retyped to other targets / vertex formats (vk_retype.c), by their classes */
+    int pool;                  /* reads the NVN2 descriptor pools (vk_pool.c): its pipeline layouts have set VK_POOL_SET */
 } vshader;
 /* the bound state's answers, as the translation request names them (NULL: not answered) */
 typedef struct { const char *tex[128], *img_type[32], *img_fmt[32], *attr[16], *fout[8]; } vk_answers;
@@ -134,4 +136,15 @@ uint32_t *vk_retype_inputs_spv(const uint32_t *w, size_t n, const char want[16],
 extern const char *vk_retype_why;
 void vk_shader_stats(uint64_t s[4]);   /* variants loaded, ns, translated, ns */
 void vk_shader_report(void);   /* variant lookups: hits by source, misses by reason */
+
+/* ---------- vk_pool.c: NVN2 descriptor pools as descriptor arrays ---------- */
+#define VK_POOL_SET 2
+#define VK_POOL_DIMS 4   /* 2D, 2D array, cube, 3D */
+int vk_pool_class(const vk_rbind *b);   /* 0 the sampler pool, 1.. an image array, -1 not a pool binding */
+void vk_pool_spv(uint32_t **w, size_t *n, const vk_rbind *b, int nb);
+VkDescriptorSetLayout vk_pool_layout(void);
+void vk_pool_sync(void);
+VkDescriptorSet vk_pool_set(void);
+uint64_t vk_presents(void);
+int vk_tex_view_fits(vtex *v, VkImageViewType type);   /* the image can be viewed in that dimension */
 

@@ -502,6 +502,14 @@ static void tex_mutable(vtex *v) {
     v->img = img; v->mem = mem; v->views = NULL; v->nviews = 0; v->ci = ci; v->mutable_all = 1; g_mutable_upgrades++;
     static int said; if (said++ < 16) VKLOG("image %ux%u format %d made mutable (a view in another format)", v->w, v->h, v->fmt);
 }
+int vk_tex_view_fits(vtex *v, VkImageViewType type) {
+    switch (type) {
+        case VK_IMAGE_VIEW_TYPE_CUBE: return v->cube && v->layers >= 6;
+        case VK_IMAGE_VIEW_TYPE_CUBE_ARRAY: return v->cube && v->layers % 6 == 0;
+        case VK_IMAGE_VIEW_TYPE_3D: return v->type == VK_IMAGE_TYPE_3D;
+        default: return v->type != VK_IMAGE_TYPE_3D;
+    }
+}
 VkImageView vk_tex_view(vtex *v, const tex_t *t, const view_t *vw, int has_view, VkImageViewType type, int attach) {
     vview k = {0};
     int fmt = has_view && vw->set_format ? vw->format : t->d.format;
