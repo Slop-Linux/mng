@@ -618,7 +618,7 @@ static void abort_report(int num) {
  (void)num;void *frames[64];int n=backtrace(frames,64);write(2,"[totk] host abort, call stack:\n",31);backtrace_symbols_fd(frames,n,2);
  signal(SIGABRT,SIG_DFL);raise(SIGABRT);
 }
-#if !TARGET_OS_IPHONE
+#if !TARGET_OS_IPHONE && !defined(__linux__)
 #include <limits.h>
 #include <mach-o/dyld.h>
 /* The packaged Mac app runs this binary as its own executable (build_app.py: Contents/MacOS/<name>). Started that way it
@@ -634,7 +634,7 @@ int runtime_app_mode(void){
 int runtime_app_mode(void){return 0;}
 #endif
 int main(int argc,char **argv) {
-#if !TARGET_OS_IPHONE
+#if !TARGET_OS_IPHONE && !defined(__linux__)
  if(runtime_app_mode()){char **boot=NULL;int r=runtime_app_launch(argc,argv,&boot);if(r>=0)return r;argc=3;argv=boot;runtime_input_file_start();}
 #endif
  need(argc==3||(argc>3&&!strcmp(argv[2],"pipeline-archive"))||((argc==4||argc==5)&&!strcmp(argv[2],"seed-shaders")),"usage: totk-native rewritten-dir probe|boot (pipeline-archive <list>... | seed-shaders <corpus> [<shader list>])");
@@ -654,7 +654,7 @@ int main(int argc,char **argv) {
  for(unsigned i=0;i<NM;i++)map_module(&modules[i],argv[1]);
  for(unsigned i=0;i<NM;i++)relocate(&modules[i]);
  for(unsigned i=0;i<NM;i++)if(!strcmp(modules[i].name,"main"))runtime_game_patches(&modules[i]);
-#if !TARGET_OS_IPHONE
+#if !TARGET_OS_IPHONE && !defined(__linux__)
  if(!strcmp(argv[2],"export-ios")){const char *out=getenv("TOTK_EXPORT_IOS");need(out!=NULL,"export-ios needs TOTK_EXPORT_IOS=<dir>");export_ios_text(argv[1],out);return 0;}
  if(!strcmp(argv[2],"pipeline-archive"))return mtl_pipeline_archive_tool(argc-3,argv+3);   // packaging: the device's pipelines made on the Mac (ios/tools/build_ipa.py)
 #endif

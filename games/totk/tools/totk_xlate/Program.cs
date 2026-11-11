@@ -176,7 +176,8 @@ static class SwshXlate
                 bool geometry = (string)job["stage"] == "gs";   // a geometry shader, translated as a compute kernel (needs "geometry_topology")
                 if (geometry && job["geometry_topology"] is not JsonValue) throw new ArgumentException("geometry shader without geometry_topology");
                 // Image atomics as Metal texture atomics (guarded per coordinate, 3D images and compare-and-swap admitted; Service.cs MslVersion)
-                flags |= TranslationFlags.MetalImageAtomics;
+                // (Metal only: the Vulkan target, job "set", keeps SPIR-V image atomics as they are)
+                if (job["set"] is not JsonNode) flags |= TranslationFlags.MetalImageAtomics;
                 if ((string)job["arch"] == "sm86") flags |= TranslationFlags.Ampere;   // NVN2 (Switch 2): a 0x80-byte SPH and 128-bit instructions
                 var ctx = Translator.CreateContext(0, acc, new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags));
                 ShaderProgram p = geometry ? ctx.Translate(asCompute: true) : ctx.Translate();

@@ -1298,6 +1298,18 @@ void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { vk_sub_p
 void mtl_sub_counter(uint64_t addr, uint32_t type) { cpend_push(addr, type != NVN_COUNTER_TYPE_SAMPLES_PASSED); vk_sub_post(2, NULL, 0, 0, addr); }
 void *mtl_sub_capture_ubos(const uint64_t *h, int n) { (void)h; (void)n; return NULL; }
 void mtl_sub_snapshot_ubos_cap(const uint64_t *h, int n, void *cap) { (void)h; (void)n; free(cap); }
+/* Stereo by replay (nvn_mtl.m g_eye_pass) needs the uniform captures above, which this backend does not take: one replay
+   per submission, so the eye functions are never reached. */
+int mtl_stereo_replay(void) { return 0; }
+int mtl_stereo_project(void) { return 0; }
+void mtl_eye_pass(int e) { (void)e; }
+void *mtl_ucap_dup(const void *base) { (void)base; return NULL; }
+int mtl_ucap_eye(void *cap, int eye) { (void)cap; (void)eye; return 0; }
+void mtl_ucap_free(void *c) { free(c); }
+void mtl_eye_capture(int eye) { (void)eye; }
+/* nvn_mtl.m binds its upload batch to the replaying thread here; vk-submit owns the queue and the replay records into the
+   calling thread's own command buffers, so there is nothing to bind. */
+void mtl_take_submit_thread(void) {}
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
 
 /* ---------- present ---------- */

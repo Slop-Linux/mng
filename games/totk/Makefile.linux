@@ -27,9 +27,11 @@ endif
 NVN_SRC := hle_nvn nvn_dirty nvn_tex totk_lifelog totk_nvn_ext totk_sysload totk_timeline totk_vpool
 GFX_ASM := nvn_entry nvn_thunks
 TEX := nvn_bcdec nvn_deswizzle
+# zeldaVR: the portable VR modules (off unless TOTK_VR_CONTROL is set), as the Mac Makefile links them
+VR := vr_labo totk_vr_link vr_defaults
 OBJS := $(RUNTIME:%=$(OUT)/runtime/%.o) $(RUNTIME_ASM:%=$(OUT)/runtime/%.S.o) $(LINUX:%=$(OUT)/linux/%.o) \
-  $(NVN_SRC:%=$(OUT)/gfx/%.o) $(GFX_ASM:%=$(OUT)/gfx/%.S.o) $(TEX:%=$(OUT)/tex/%.o)
-HEADERS := $(wildcard runtime/*.h runtime/linux/*.h runtime/linux/vk/*.h runtime/linux/include/*.h runtime/linux/include/*/*.h third_party/d2r_gfx/gfx/nvn/*.h third_party/d2r_gfx/gfx/nvn/include/*.h third_party/d2r_gfx/host/*.h)
+  $(NVN_SRC:%=$(OUT)/gfx/%.o) $(GFX_ASM:%=$(OUT)/gfx/%.S.o) $(TEX:%=$(OUT)/tex/%.o) $(VR:%=$(OUT)/vr/%.o)
+HEADERS := $(wildcard zeldaVR/gfx/*.h zeldaVR/runtime/*.h runtime/*.h runtime/linux/*.h runtime/linux/vk/*.h runtime/linux/include/*.h runtime/linux/include/*/*.h third_party/d2r_gfx/gfx/nvn/*.h third_party/d2r_gfx/gfx/nvn/include/*.h third_party/d2r_gfx/host/*.h)
 
 $(OUT)/botw-native: $(OBJS)
 	$(CC) $(OBJS) $(LIBS) -o $@
@@ -48,6 +50,9 @@ $(OUT)/gfx/%.o: third_party/d2r_gfx/gfx/nvn/%.c $(HEADERS) Makefile.linux
 $(OUT)/gfx/%.S.o: third_party/d2r_gfx/gfx/nvn/%.S third_party/d2r_gfx/gfx/nvn/include/asm_sym.h
 	@mkdir -p $(dir $@)
 	$(CC) -Ithird_party/d2r_gfx/gfx/nvn/include -c $< -o $@
+$(OUT)/vr/%.o: zeldaVR/gfx/%.c $(HEADERS) Makefile.linux
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
 $(OUT)/tex/%.o: third_party/d2r_gfx/gfx/tex/%.c $(HEADERS) Makefile.linux
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@

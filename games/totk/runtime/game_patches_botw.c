@@ -720,6 +720,15 @@ static int native_k_parse(const char *e) {   /* -1 = not a size this mode takes 
 }
 #if TARGET_OS_IPHONE
 static void native_screen_pixels(unsigned *w, unsigned *h) { *w = *h = 0; }   /* the phone never asks: output_parse stops first */
+#elif defined(__linux__)
+#include <SDL3/SDL.h>
+static void native_screen_pixels(unsigned *w, unsigned *h) {   /* the primary display's desktop mode in pixels (SDL3) */
+    *w = *h = 0;
+    if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) return;
+    const SDL_DisplayMode *m = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay());
+    if (m) { *w = (unsigned)(m->w * m->pixel_density); *h = (unsigned)(m->h * m->pixel_density); }
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+}
 #else
 #include <CoreGraphics/CoreGraphics.h>
 static void native_screen_pixels(unsigned *w, unsigned *h) {   /* the main display's native mode, else its current mode */

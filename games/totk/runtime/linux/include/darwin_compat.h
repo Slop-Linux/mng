@@ -49,3 +49,4 @@ static inline uint64_t clock_gettime_nsec_np(clockid_t c) { struct timespec t; c
 #endif
 /* Darwin names the calling thread only */
 #define pthread_setname_np(name) pthread_setname_np(pthread_self(), name)
+#define PTHREAD_RECURSIVE_MUTEX_INITIALIZER PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP

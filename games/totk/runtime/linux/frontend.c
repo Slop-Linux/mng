@@ -26,6 +26,7 @@ int runtime_front_focus(void) { return 1; }
 void runtime_front_request_close(void) { fprintf(stderr, "[totk] close requested\n"); exit(0); }
 void runtime_front_text_test(const char *op, const char *text) { (void)op; (void)text; }
 void runtime_settings_toggle(void) {}
+void runtime_settings_page(int page) { (void)page; }   /* the settings panel is the Mac app's (settings_panel.h) */
 void runtime_boot_progress(const char *stage, uint64_t done, uint64_t total) {
     static const char *last; (void)done; (void)total;
     if (stage != last) { fprintf(stderr, "[totk-boot] %.3f %s\n", boot_ns ? (runtime_now_ns() - boot_ns) / 1e9 : 0, stage ? stage : "startup"); last = stage; }
@@ -125,4 +126,13 @@ void runtime_front_run(void (*callback)(void)) {
     callback();
 }
 void runtime_gpu_path_probe(const char *which) { fprintf(stderr, "[totk] %s: GPU path probes are Metal-only\n", which); exit(2); }
+void runtime_shader_seed(const char *corpus, const char *list) { (void)corpus; (void)list; fprintf(stderr, "[totk] seed-shaders: Metal libraries; the Vulkan seed is games/totk/linux/prepare_vk_seed.py\n"); exit(2); }
+void runtime_vr_resolution_probe(void) { fprintf(stderr, "[totk] probe-vr-resolution: the headset streamer is Mac-only\n"); exit(2); }
+/* The prompt icon atlases (totk_prompt_icons.m) are Metal textures this backend never registers. */
+void totk_prompt_remove_pool(const void *memory, size_t size) { (void)memory; (void)size; }
+/* zeldaVR/gfx/totk_vr.m without a headset streamer (its !TARGET_OS_OSX branch): the camera hook's state and the eye distance. */
+#include "../../zeldaVR/runtime/vr_camera.h"
+vr_cam_state *g_vr_headlook;
+void vr_camera_control_read(vr_cam_state *out) { memset(out, 0, sizeof *out); }
+int vr_ipd_pct(void) { return 100; }
 void runtime_vpool_probe(void) { fprintf(stderr, "[totk] probe-vpool: Metal-only\n"); exit(2); }
