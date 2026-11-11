@@ -27,6 +27,7 @@ using Ryujinx.Common.Memory;
 using Ryujinx.Graphics.Shader;
 using Ryujinx.Graphics.Shader.Translation;
 using System;
+using System.Text;
 using System.Collections.Generic;
 using System.Linq;
 using System.IO;
@@ -46,6 +47,9 @@ static class SwshXlate
     sealed class Accessor : IGpuAccessor
     {
         readonly byte[] _code; readonly JsonObject _job; int _binding = 1; public readonly List<string> Notes = new(); public readonly SortedSet<int> TexQueried = new(), ImgQueried = new();
+        // Vulkan target: the answer each queried slot was translated with (sampler type name, image format name), the
+        // variant's deps (vk.txt "dep" lines, runtime/linux/vk/vk_shader.c picks variants by them)
+        public readonly SortedDictionary<int, string> TexDep = new(), ImgDep = new();
         readonly byte[] _c1;
         public Accessor(byte[] code, JsonObject job) { _code = code; _job = job; _c1 = job["c1"] is JsonNode h ? Convert.FromHexString((string)h) : Array.Empty<byte>(); if (Geometry) _binding = 40; }
         // 翻译器丢弃一条指令时只打这一行日志（如 "Invalid reduction type"）；记进 notes，种子里能查到哪些着色器少了什么
@@ -64,10 +68,13 @@ static class SwshXlate
         public uint ConstantBuffer1Read(int offset) { if (offset >= 0 && offset + 4 <= _c1.Length) return BitConverter.ToUInt32(_c1, offset); Notes.Add($"c1 读越界 +{offset:X}（c1 长 {_c1.Length}）"); return 0; }
         // 全部资源放进第 0 组，各占不同绑定号（spirv-cross 出成一个参数缓冲）；常量段号 index 的缓冲由翻译器给 binding = index+1 的惯例不依赖
         // All resources go into set 0, each with a distinct binding number (spirv-cross emits them as one argument buffer); the translator's convention of giving the buffer of constant segment number index binding = index+1 is not relied on
-        public SetBindingPair CreateConstantBufferBinding(int index) => new(0, _binding++);
-        public SetBindingPair CreateImageBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(0, b); }
-        public SetBindingPair CreateStorageBufferBinding(int index) => new(0, _binding++);
-        public SetBindingPair CreateTextureBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(0, b); }
+        // Vulkan target (Service.cs --target vulkan): the job's "set" puts a stage's resources in its own descriptor set
+        // (vertex / compute 0, fragment 1); Ryujinx's support buffer stays at set 0 binding 0
+        int Set => _job["set"] is JsonNode n ? (int)n : 0;
+        public SetBindingPair CreateConstantBufferBinding(int index) => new(Set, _binding++);
+        public SetBindingPair CreateImageBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(Set, b); }
+        public SetBindingPair CreateStorageBufferBinding(int index) => new(Set, _binding++);
+        public SetBindingPair CreateTextureBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(Set, b); }
         public ReadOnlySpan<ulong> GetCode(ulong address, int minimumSize) => MemoryMarshal.Cast<byte, ulong>(new ReadOnlySpan<byte>(_code)[(int)address..]);
         public int QuerySamplerArrayLengthFromPool() => 1 << 12;
         public int QueryTextureArrayLengthFromBuffer(int slot) => 32;
@@ -88,8 +95,9 @@ static class SwshXlate
             int slot = TexSlot(handle, cbufSlot);
             if (slot >= 0) TexQueried.Add(slot);
             string t = slot >= 0 ? Get("tex", slot) ?? Get("img", slot) : null;
-            if (t == null) { Notes.Add($"贴图句柄 {handle:X}（常量段 {cbufSlot}，槽 {slot}）无 PC 类型，按 2D"); return SamplerType.Texture2D; }
+            if (t == null) { Notes.Add($"贴图句柄 {handle:X}（常量段 {cbufSlot}，槽 {slot}）无 PC 类型，按 2D"); if (slot >= 0) TexDep[slot] = "2d"; return SamplerType.Texture2D; }
             if (t.EndsWith("_depth")) t = t.Substring(0, t.Length - 6);   // a shared-list row made when depth textures had their own variants
+            if (slot >= 0) TexDep[slot] = t is "1d" or "1darray" or "buffer" or "2darray" or "2dms" or "2dmsarray" or "3d" or "cube" or "cubearray" ? t : "2d";
             return t switch
             {
                 "1d" => SamplerType.Texture1D, "1darray" => SamplerType.Texture1D | SamplerType.Array,
@@ -104,8 +112,11 @@ static class SwshXlate
             int slot = TexSlot(handle, cbufSlot);
             if (slot >= 0) ImgQueried.Add(slot);
             string f = _job["img"] is JsonObject t && slot >= 0 && t[slot.ToString()] is JsonObject o ? (string)o["fmt"] : null;
-            if (f == null) { Notes.Add($"图像句柄 {handle:X} 槽 {slot} 无 PC 格式，按 R8G8B8A8Unorm"); return TextureFormat.R8G8B8A8Unorm; }
-            return Enum.TryParse(f, true, out TextureFormat tf) ? tf : TextureFormat.R8G8B8A8Unorm;
+            TextureFormat tf = TextureFormat.R8G8B8A8Unorm;
+            if (f == null) Notes.Add($"图像句柄 {handle:X} 槽 {slot} 无 PC 格式，按 R8G8B8A8Unorm");
+            else if (!Enum.TryParse(f, true, out tf)) tf = TextureFormat.R8G8B8A8Unorm;
+            if (slot >= 0) ImgDep[slot] = tf.ToString();
+            return tf;
         }
         int Local(int i) => _job["local"] is JsonArray a && a.Count > i ? (int)a[i] : 1;
         public int QueryComputeLocalSizeX() => Local(0);
@@ -140,6 +151,10 @@ static class SwshXlate
         // a retry for shaders that actually emit FP64 in the first pass.
         public bool QueryHostSupportsShaderFloat64() => _job["softfloat64"] is not JsonValue v || !(v.TryGetValue<bool>(out bool b) && b);
         public bool QueryHostSupportsTextureShadowLod() => true;
+        // Vulkan target: storage buffers are bound at their base address rounded down to the device's 256-byte offset
+        // alignment, and the shader adds the remainder (Ryujinx GlobalToStorage)
+        public int QueryHostStorageBufferOffsetAlignment() => _job["set"] is JsonNode ? 256 : 16;
+        public bool QueryHasUnalignedStorageBuffer() => _job["set"] is JsonNode;
         // 作业 reduced = true：放宽精度——翻译器只给强制精确的运算打 NoContraction（缺省全部打：保持 Maxwell 分开舍入的逐位结果，代价是 MSL 里大量禁优化的 spvFMul 等）
         // Job reduced = true: relaxed precision - the translator marks NoContraction only on operations that must be exact (the default marks all: keeps the bit-exact results of Maxwell's separate rounding, at the cost of many optimization-disabled spvFMul etc. in the MSL)
         public bool QueryHostReducedPrecision() => _job["reduced"] is JsonNode n && (bool)n;
@@ -167,7 +182,8 @@ static class SwshXlate
                 bool geometry = (string)job["stage"] == "gs";   // a geometry shader, translated as a compute kernel (needs "geometry_topology")
                 if (geometry && job["geometry_topology"] is not JsonValue) throw new ArgumentException("geometry shader without geometry_topology");
                 // Image atomics as Metal texture atomics (guarded per coordinate, 3D images and compare-and-swap admitted; Service.cs MslVersion)
-                flags |= TranslationFlags.MetalImageAtomics;
+                // (Metal only: the Vulkan target, job "set", keeps SPIR-V image atomics as they are)
+                if (job["set"] is not JsonNode) flags |= TranslationFlags.MetalImageAtomics;
                 if ((string)job["arch"] == "sm86") flags |= TranslationFlags.Ampere;   // NVN2 (Switch 2): a 0x80-byte SPH and 128-bit instructions
                 var ctx = Translator.CreateContext(0, acc, new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags));
                 ShaderProgram p = geometry ? ctx.Translate(asCompute: true) : ctx.Translate();
@@ -178,8 +194,8 @@ static class SwshXlate
                     var reader = Translator.CreateContext(0, new Accessor(code, job), new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags));
                     File.WriteAllBytes(Path.Combine(outDir, key + ".reader.spv"), reader.GenerateVertexPassthroughForCompute().BinaryCode);
                 }
-                File.WriteAllBytes(Path.Combine(outDir, key + ".spv"),
-                    VertexCounterLowering.Apply(code, (string)job["stage"], p.BinaryCode, acc.Notes));
+                byte[] spv = VertexCounterLowering.Apply(code, (string)job["stage"], p.BinaryCode, acc.Notes);
+                File.WriteAllBytes(Path.Combine(outDir, key + ".spv"), spv);
                 var res = new JsonObject
                 {
                     ["key"] = key, ["stage"] = (string)job["stage"], ["notes"] = new JsonArray(acc.Notes.ConvertAll(n => (JsonNode)n).ToArray()),
@@ -200,9 +216,49 @@ static class SwshXlate
                 foreach (var (list, name) in new[] { (p.Info.Textures, "textures"), (p.Info.Images, "images") })
                     foreach (var t in list) res[name].AsArray().Add((JsonNode)new JsonObject { ["binding"] = t.Binding, ["type"] = (int)t.Type, ["format"] = t.Format.ToString(), ["cbuf_slot"] = t.CbufSlot, ["handle"] = t.HandleIndex, ["array"] = t.ArrayLength, ["separate"] = t.Separate, ["flags"] = (int)t.Flags });
                 File.WriteAllText(Path.Combine(outDir, key + ".res.json"), res.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+                if (job["set"] is JsonNode)   // Vulkan target: the same list as lines for the C runtime (runtime/linux/vk_shader.c)
+                {
+                    var t = new StringBuilder();
+                    foreach (var b in p.Info.CBuffers) t.Append($"cbuf {b.Set} {b.Binding} {b.Slot}\n");
+                    foreach (var b in p.Info.SBuffers) t.Append($"sbuf {b.Set} {b.Binding} {b.Slot} {b.SbCbSlot} {b.SbCbOffset} {(int)b.Flags}\n");
+                    foreach (var b in p.Info.Textures) t.Append($"tex {b.Set} {b.Binding} {(int)b.Type} {b.CbufSlot} {b.HandleIndex} {b.ArrayLength} {(b.Separate ? 1 : 0)} {(int)b.Flags} {(int)b.Format}\n");
+                    foreach (var b in p.Info.Images) t.Append($"img {b.Set} {b.Binding} {(int)b.Type} {b.CbufSlot} {b.HandleIndex} {b.ArrayLength} {(b.Separate ? 1 : 0)} {(int)b.Flags} {(int)b.Format}\n");
+                    t.Append($"info {(p.Info.UsesFragCoord ? 1 : 0)} {p.Info.FragmentOutputMap}\n");
+                    // deps: every answer the translation read. A bind state whose answers agree on these lines gets the same
+                    // SPIR-V, so the runtime and the prepared seed reuse the variant (vk_shader.c vk_shader_get)
+                    foreach (var kv in acc.TexDep) t.Append($"dep tex {kv.Key} {kv.Value}\n");
+                    foreach (var kv in acc.ImgDep) t.Append($"dep img {kv.Key} {kv.Value}\n");
+                    string stage = (string)job["stage"];
+                    static string Cls(JsonNode n) => n is JsonValue v && v.TryGetValue(out string s) && (s == "sint" || s == "uint") ? s : "float";
+                    if (stage == "vs")
+                    {
+                        foreach (int loc in SpvLocations(spv, 1)) t.Append($"dep attr {loc} {Cls(job["attr"]?[loc.ToString()])}\n");
+                        bool dmw = job["depth_minus_w"] is JsonValue dv && dv.TryGetValue(out bool db) && db;
+                        t.Append($"dep dmw {(dmw ? 1 : 0)}\n");
+                    }
+                    if (stage == "ps")
+                        foreach (int loc in SpvLocations(spv, 3)) t.Append($"dep fout {loc} {Cls(job["fout"]?[loc.ToString()])}\n");
+                    File.WriteAllText(Path.Combine(outDir, key + ".vk.txt"), t.ToString());
+                }
                 return null;
             }
             catch (Exception e) { if (Environment.GetEnvironmentVariable("DMSH_STACK") != null) Console.Error.WriteLine(e.StackTrace); return $"{e.GetType().Name}: {e.Message.Split('\n')[0]}"; }
+    }
+
+    // Location decorations of the module's variables in one storage class (Input 1: vertex inputs, Output 3: colour outputs)
+    static SortedSet<int> SpvLocations(byte[] bytes, uint storageClass)
+    {
+        ReadOnlySpan<uint> w = MemoryMarshal.Cast<byte, uint>(bytes);
+        var loc = new Dictionary<uint, int>(); var vars = new HashSet<uint>();
+        for (int i = 5; i < w.Length;)
+        {
+            uint op = w[i] & 0xffff, len = w[i] >> 16;
+            if (len == 0) break;
+            if (op == 71 && len >= 4 && w[i + 2] == 30) loc[w[i + 1]] = (int)w[i + 3];   // OpDecorate Location
+            if (op == 59 && len >= 4 && w[i + 3] == storageClass) vars.Add(w[i + 2]);   // OpVariable
+            i += (int)len;
+        }
+        return new SortedSet<int>(vars.Where(loc.ContainsKey).Select(v => loc[v]));
     }
 
     // --disasm <code.bin> [vs|ps|cs]: print the decoded Maxwell instruction stream (address, name, raw opcode) with the
