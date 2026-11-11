@@ -21,6 +21,9 @@ typedef struct {
     p_bind_buf ubo[6][16], ssbo[6][16]; uint64_t tex[6][128], samp[6][128], img[6][32];
     int st_vmask[2], st_wmask[2], st_ref[2]; p_poly_offset po; float blend_color[4];
     int depth_clamp, render_disabled, raster_discard; int64_t copy_stride;
+#ifdef GAME_NS2
+    uint8_t push[2][NVN_PUSH_SIZE];   /* NVN2 push constants: the graphics (0) and compute (1) blocks, read as c[NVN_PUSH_BANK] */
+#endif
 } state_t;
 static state_t S;
 /* generations: what a draw derives from the state is rebuilt only when its inputs changed (per stage bindings, fixed-function
@@ -617,6 +620,10 @@ static VkDescriptorSet stage_set(vshader *s, int stage, int set, VkDescriptorSet
                     vk_span sp = vk_ring(0xA00, 256); driver_bank(sp.cpu, b->slot, stage); bc[stage][k].gen = g_gen_bind[stage]; bc[stage][k].sub = g_sub_gen; bc[stage][k].buf = sp.buf; bc[stage][k].off = sp.off; }
                 buf = bc[stage][k].buf; off = bc[stage][k].off; range = 0xA00;
                 if (stage == 5 && k == 0) { g_cs_bank_buf = buf; g_cs_bank_off = off; } }
+#ifdef GAME_NS2
+            else if (b->slot == NVN_PUSH_BANK) {   /* this draw's or dispatch's copy of the push-constant block (nvn_mtl.m) */
+                vk_span sp = vk_ring(NVN_PUSH_SIZE, 256); memcpy(sp.cpu, S.push[stage == 5], NVN_PUSH_SIZE); buf = sp.buf; off = sp.off; range = NVN_PUSH_SIZE; }
+#endif
             else if (b->slot >= 3 && b->slot <= 18) { const p_bind_buf *u = &S.ubo[stage][b->slot - 3];
                 uint64_t sz = u->size && u->size <= 65536 ? u->size : 65536; if (b->used && b->used < sz) sz = b->used;   /* what the shader reads (cbuf_used) */
                 if (!ubo_range(u->addr, sz, &buf, &off, &range)) buf = VK_NULL_HANDLE; }
@@ -1399,6 +1406,12 @@ void mtl_exec(const uint8_t *p) {
                 if (g_qo_armed && g_qo_signal_releases && g_qo_signal_releases(val)) { qo_push(p + h.size); g_qo_stopped = 1; return; }   /* a parked queue goes on first */
                 break; }
             case OP_CLEAR_BUF: clear_buf(a); break;
+            case OP_PUSH_CONST: { const p_push_const *b = a;   /* into the graphics (0) or compute (1) block */
+                if (b->compute < 2 && (uint32_t)b->offset + b->size <= NVN_PUSH_SIZE) {
+                    memcpy(S.push[b->compute] + b->offset, b->data, b->size);
+                    if (b->compute) g_gen_bind[5]++; else for (int i = 0; i < 5; i++) g_gen_bind[i]++;
+                }
+                break; }
 #else
             case OP_CALL: { const uint8_t *t; memcpy(&t, a, 8); mtl_exec(t); break; }
             case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, (const uint8_t *)a + 8, 4); memcpy(&v, (const uint8_t *)a + 12, 4); vk_sub_post(1, val, m, v, 0); break; }
