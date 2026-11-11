@@ -76,7 +76,7 @@ void vk_query_stats(uint64_t r[2]);   /* samples-passed reports of 0 / not 0 so 
 
 /* window and present */
 void vk_window_open(void);
-void vk_present_image(VkImage img, uint32_t w, uint32_t h, VkFormat fmt);
+void vk_present_image(VkImage img, int32_t x, int32_t y, uint32_t w, uint32_t h, VkFormat fmt);   /* the (x, y, w, h) part of the image */
 
 /* ---------- vk_tex.c ---------- */
 typedef struct {

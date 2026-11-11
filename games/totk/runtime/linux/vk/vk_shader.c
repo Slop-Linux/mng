@@ -8,6 +8,7 @@
    formats / render target types serves retyped (vk_retype.c, as nvn_mtl.m vs_vin and fn_retype_outputs make any variant
    serve any format), so an exact variant still wins. With the whole bound state as the key, 729 shaders had made 8,635 variants. */
 #include "vk.h"
+#include "d2r_gfx/gfx/nvn/nvn_ctl.h"
 #include <CommonCrypto/CommonDigest.h>
 #include <errno.h>
 #include <signal.h>
@@ -240,22 +241,29 @@ static vshader *load(const char *dir, const char *variant, int stage, const uint
     return s;
 }
 vshader *vk_shader_get(const uint8_t *control, const uint8_t *code, int stage, const char *answers, const vk_answers *A) {
-    uint32_t c1o, c1t, klen; memcpy(&c1o, control + 0x700, 4); memcpy(&c1t, control + 0x704, 4); memcpy(&klen, control + 0x20, 4);
+    /* NVN or NVN2 (Switch 2) control section (nvn_ctl.h): NVN2 code has no 0x30-byte header, its instructions are control +0x38
+       long (SPH included) and c1 lies between +0x40 and +0x44 (totk_shader_rt.m variant_request) */
+    const int nvn2 = nvn2_ctl(control);
+    uint32_t c1o, c1t, klen, ninst; memcpy(&c1o, control + (nvn2 ? 0x40 : 0x700), 4); memcpy(&c1t, control + (nvn2 ? 0x44 : 0x704), 4); memcpy(&klen, control + 0x20, 4);
+    ninst = c1t; if (nvn2) memcpy(&ninst, control + 0x38, 4);
     if (klen < 0x7cc || klen >= 0x880) klen = 0x880;
-    if (!c1t || c1t > 16u << 20 || c1o > c1t) VKDIE("shader code area %#x / c1 %#x", c1t, c1o);
-    uint8_t md[32]; CC_SHA256_CTX c; CC_SHA256_Init(&c); CC_SHA256_Update(&c, control, klen); CC_SHA256_Update(&c, code, c1t); CC_SHA256_Final(md, &c);
+    if (!c1t || c1t > 16u << 20 || c1o > c1t || (nvn2 && ninst > c1o)) VKDIE("shader code area %#x / c1 %#x / instructions %#x", c1t, c1o, ninst);
+    uint8_t md[32]; CC_SHA256_CTX c; CC_SHA256_Init(&c); ctl_key_update(&c, control); CC_SHA256_Update(&c, code, c1t); CC_SHA256_Final(md, &c);
     uint8_t ma[32]; CC_SHA256((const uint8_t *)answers, (unsigned)strlen(answers), ma);
     char key[96]; hex(md, 32, key); key[64] = '-'; hex(ma, 6, key + 65);
     pthread_mutex_lock(&g_sh_mu);
     dirs();
     shv *v = shader_of(key);
-    uint32_t local[3] = {0, 0, 0}; if (stage == 5) memcpy(local, control + 0x748, 12);
+    /* thread group: NVN compute +0x748, NVN2 compute +0x58 (3 x u32), NVN2 task / mesh +0x58 (u16) */
+    uint32_t local[3] = {0, 0, 0}; const int grouped = stage == 5 || (nvn2 && (stage == 3 || stage == 4));
+    if (stage == 5) memcpy(local, control + (nvn2 ? 0x58 : 0x748), 12);
+    else if (grouped) { uint16_t t; memcpy(&t, control + 0x58, 2); local[0] = t; local[1] = local[2] = 1; }
     g_look++;
     for (int fout = 1; fout >= 0; fout--) for (cand *c = v->c; c; c = c->next) if (serves(c, A, fout)) {
         int was = !!c->s;
         if (!c->s) {
             uint64_t l0_ = clock_gettime_nsec_np(CLOCK_MONOTONIC);
-            c->s = load(c->dir, c->name, stage, code + c1o, c1t - c1o, stage == 5 ? local : NULL);
+            c->s = load(c->dir, c->name, stage, code + c1o, c1t - c1o, grouped ? local : NULL);
             if (!c->s) VKDIE("shader variant %s/%s: no SPIR-V", c->dir, c->name);
             g_load_ns += clock_gettime_nsec_np(CLOCK_MONOTONIC) - l0_;
             if (c->dir == g_seed) g_seed_used++;
@@ -277,24 +285,37 @@ vshader *vk_shader_get(const uint8_t *control, const uint8_t *code, int stage, c
               ({ int n_ = 0; for (cand *c = v->c; c; c = c->next) n_++; n_; }), v->c->dir == g_seed ? "seed" : "cache",
               g_missed_on->kind, g_missed_on->slot, g_missed_on->kind == 'w' ? (g_missed_on->slot ? "1" : "0") : g_missed_on->val, g_missed_got);
     }
-    vshader *s = load(g_dir, key, stage, code + c1o, c1t - c1o, stage == 5 ? local : NULL);
+    vshader *s = load(g_dir, key, stage, code + c1o, c1t - c1o, grouped ? local : NULL);
     if (!s) {
         service_start();
         uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
-        size_t skip = stage == 5 ? 0 : 0x30;   /* graphics code drops the 0x30-byte NVN header (totk_shader_rt.m variant_request) */
+        size_t skip = stage == 5 || nvn2 ? 0 : 0x30, end = nvn2 ? ninst : c1t;   /* graphics code drops the 0x30-byte NVN header (totk_shader_rt.m variant_request) */
         char path[4400]; snprintf(path, sizeof path, "%s/%s.code", g_dir, key);
-        FILE *f = fopen(path, "wb"); if (!f || fwrite(code + skip, 1, c1t - skip, f) != c1t - skip) VKDIE("write %s", path); fclose(f);
+        FILE *f = fopen(path, "wb"); if (!f || fwrite(code + skip, 1, end - skip, f) != end - skip) VKDIE("write %s", path); fclose(f);
         size_t c1n = c1t - c1o; char *c1hex = malloc(2 * c1n + 1); hex(code + c1o, c1n, c1hex); c1hex[2 * c1n] = 0;
-        int efr = 0; if (stage == 1 && !(klen >= 0x7cc && klen < 0x880) && (control[0x718] & 1)) efr = 1;
+        int efr = 0; if (!nvn2 && stage == 1 && !(klen >= 0x7cc && klen < 0x880) && (control[0x718] & 1)) efr = 1;
+        /* NVN2: the flag at control +0x5b, unless the shader's header writes depth (word 19 bit 1, code +0x4c) */
+        if (nvn2 && stage == 1 && control[0x5b] && ninst >= 0x50) { uint32_t omap; memcpy(&omap, code + 0x4c, 4); if (!(omap & 2)) efr = 1; }
         fprintf(g_in, "{\"variant\": \"%s\", \"stage\": \"%s\", \"code\": \"%s\", \"c1\": \"%s\", %s, \"depth_minus_w\": %s%s", key,
-                stage == 0 ? "vs" : stage == 1 ? "ps" : "cs", path, c1hex, answers, totk_depth_near_minus_w() ? "true" : "false", efr ? ", \"early_fragment_tests\": true" : "");
+                stage == 0 ? "vs" : stage == 1 ? "ps" : stage == 3 ? "ts" : stage == 4 ? "ms" : "cs", path, c1hex, answers, totk_depth_near_minus_w() ? "true" : "false", efr ? ", \"early_fragment_tests\": true" : "");
         if (stage == 5) fprintf(g_in, ", \"local\": [%u, %u, %u]", local[0], local[1], local[2]);
+        if (nvn2) {
+            fprintf(g_in, ", \"arch\": \"sm86\"");
+            if (stage == 3 || stage == 4) { char ctl[0xe0 * 2 + 1]; hex(control, 0xe0, ctl); ctl[0xe0 * 2] = 0; fprintf(g_in, ", \"mesh_ctl\": \"%s\"", ctl); }
+            /* compute's c[0] layout: push-constant words (+0xa9), uniform / storage buffer / texture entry counts (+0xb1..+0xb3),
+               c[0] size (+0xba); shared memory at +0x64 */
+            if (stage == 5) {
+                uint16_t c0; memcpy(&c0, control + 0xba, 2); uint32_t shared; memcpy(&shared, control + 0x64, 4);
+                fprintf(g_in, ", \"nvn2_cs\": [%u, %u, %u, %u, %u]", control[0xb1], control[0xb2], control[0xb3], c0, control[0xa9] * 4u);
+                if (shared) fprintf(g_in, ", \"shared\": %u", (shared + 15) / 16 * 16);
+            }
+        }
         fprintf(g_in, "}\n"); fflush(g_in); free(c1hex);
         char reply[4096];
         if (!fgets(reply, sizeof reply, g_out)) VKDIE("shader service exited while translating %s", key);
         if (!strstr(reply, "\"ok\": true")) VKDIE("shader %s (stage %d) translation failed: %s", key, stage, reply);
         unlink(path);
-        s = load(g_dir, key, stage, code + c1o, c1t - c1o, stage == 5 ? local : NULL);
+        s = load(g_dir, key, stage, code + c1o, c1t - c1o, grouped ? local : NULL);
         if (!s) VKDIE("shader %s: translation produced no SPIR-V", key);
         g_translated++; g_translate_ns += clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0;
         if (g_translated % 100 == 0) VKLOG("shaders: %llu translated (%.1f ms each), %llu loaded, %llu from the seed", (unsigned long long)g_translated, g_translate_ns / 1e6 / g_translated, (unsigned long long)g_loaded, (unsigned long long)g_seed_used);

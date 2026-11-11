@@ -3,6 +3,7 @@
    until the targets change or a copy, dispatch, texture clear, texture-invalidating barrier or the end of the submission
    needs it closed. Draws use shader objects with all state dynamic; descriptors come from per-submission pools. */
 #include "vk.h"
+#include "d2r_gfx/gfx/nvn/nvn_ctl.h"
 #include <math.h>
 #include <unistd.h>
 #include "d2r_gfx/host/front.h"
@@ -774,8 +775,7 @@ static vshader *stage_shader_slow(int want) {
     const prog_t *p = S.prog; if (!p) return NULL;
     for (unsigned i = 0; i < p->nstage && i < 6; i++) {
         const uint8_t *control = p->sd[i].control; if (!control || !p->sd[i].data) continue;
-        uint32_t st; memcpy(&st, control + 0x714, 4);
-        if ((int)st != want) continue;
+        if (ctl_stage(control, (const uint8_t *)(uintptr_t)p->sd[i].data) != want) continue;   /* nvn_ctl.h: NVN or NVN2 */
         char a[8192]; vk_answers A; answers(want, a, sizeof a, &A);
         return vk_shader_get(control, (const uint8_t *)(uintptr_t)p->sd[i].data, want, a, &A);
     }
@@ -1068,8 +1068,58 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
         if (g_pdepth.v && ((S.ds.dt && S.ds.dw) || (S.ds.st && (S.st_wmask[0] || S.st_wmask[1])))) { g_pass_written |= 1u << 8; g_lr_dirty |= 1u << 8; }
     }
 }
+
+#ifdef GAME_OOT
+/* ---------- Ocarina of Time's movie network (oot_movie_bypass.h, recognised by data flow, never by keys) ----------
+   A movie frame: buffer -> texture copies fill the decoded planes; a dispatch samples them and writes T, the picture at the
+   movie's size; a convolutional network runs on F16 feature buffers; a last dispatch writes O, the canvas, larger than T in
+   both sizes. On the Mac the network is replaced by a MetalFX upscale of T. Here every dispatch between the conversion and
+   the upscale is skipped and the upscale becomes a linear blit of T into O: the network's shaders (tensor-core MMA, about
+   500 inlined calls each) are not translated or compiled at all. */
+static struct { uint64_t up_frame, frame; vtex *up[8]; int nup; vtex *t; tex_t tt; uint64_t skipped, frames; } g_mv = {.up_frame = ~0ull, .frame = ~0ull};
+static void mv_note_upload(vtex *v) {
+    if (g_mv.up_frame != g_presents) { g_mv.up_frame = g_presents; g_mv.nup = 0; }
+    if (g_mv.nup < 8) g_mv.up[g_mv.nup++] = v;
+}
+/* the first storage image of the dispatch (its texture and the texture state), and whether it samples a texture a copy filled this frame */
+static vtex *mv_image(const vshader *cs, tex_t *out, int *reads_upload) {
+    vtex *img = NULL; *reads_upload = 0;
+    for (int i = 0; i < cs->nb; i++) {
+        const vk_rbind *b = &cs->b[i];
+        if ((b->kind != RB_TEX && b->kind != RB_IMG) || (b->stype & 0xff) == 2) continue;
+        uint32_t h = b->kind == RB_IMG ? img_handle(5, b->handle) : packed_handle(5, b->handle);
+        tex_t t; view_t vw; int hv, tid = (int)(h & 0xfffff); vtex *v;
+        if (!tid || !vk_tex_registry_get(tid, &t, &vw, &hv) || !(v = vk_tex_get(&t))) continue;
+        if (b->kind == RB_IMG) { if (!img) { img = v; *out = t; } }
+        else if (g_mv.up_frame == g_presents) for (int k = 0; k < g_mv.nup; k++) if (g_mv.up[k] == v) *reads_upload = 1;
+    }
+    return img;
+}
+/* 1: the dispatch is the movie's and has been handled (skipped, or the upscale done as a blit) */
+static int mv_dispatch(const vshader *cs) {
+    tex_t t; int up; vtex *img = mv_image(cs, &t, &up);
+    if (up && img) { g_mv.frame = g_presents; g_mv.t = img; g_mv.tt = t; return 0; }   /* the conversion: it runs */
+    if (g_mv.frame != g_presents) return 0;
+    if (img && img != g_mv.t && t.d.width > g_mv.tt.d.width && t.d.height > g_mv.tt.d.height) {   /* the upscale: T -> O */
+        g_mv.frame = ~0ull;
+        end_pass(4); pclr_flush();
+        VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int32_t)g_mv.tt.d.width, (int32_t)g_mv.tt.d.height, 1}},
+                          .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {(int32_t)t.d.width, (int32_t)t.d.height, 1}}};
+        vk_tex_upload_if_stale(img, &t); vk_tex_mark_read(g_mv.t);
+        vkCmdBlitImage(vk_cb(), vk_tex_image(g_mv.t), VK_IMAGE_LAYOUT_GENERAL, vk_tex_image(img), VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
+        vk_tex_gpu_wrote(img); full_barrier();
+        if (!g_mv.frames++) VKLOG("[movie] the movie network is skipped; T %ux%u -> O %ux%u by a linear blit", g_mv.tt.d.width, g_mv.tt.d.height, t.d.width, t.d.height);
+        return 1;
+    }
+    g_mv.skipped++;
+    return 1;   /* the network */
+}
+#endif
 static void dispatch(const p_dispatch *d) {
     vshader *cs = stage_shader(5); if (!cs) { g_skips[5]++; return; }
+#ifdef GAME_OOT
+    if (mv_dispatch(cs)) return;
+#endif
     end_pass(4); pclr_flush();
     comp_t *c = comp_get(cs); if (!c->sh) return;
     g_grid[0] = (uint32_t)d->x; g_grid[1] = (uint32_t)d->y; g_grid[2] = (uint32_t)d->z;
@@ -1151,7 +1201,11 @@ static void copy_b2t(const p_copy_b2t *c, int to_buffer) {
     if (r.bufferOffset & 3) { static int said; if (!said++) VKLOG("【红】buffer/texture copy at an unaligned buffer offset"); g_skips[6]++; return; }
     if (to_buffer) { vk_tex_mark_read(v); vkCmdCopyImageToBuffer(vk_cb(), vk_tex_image(v), VK_IMAGE_LAYOUT_GENERAL, b, 1, &r);
         uint64_t pitch = S.copy_stride ? S.copy_stride : (uint64_t)((r.imageExtent.width + bw - 1) / bw) * (bpb ? bpb : 16); gw_note(c->src, c->src + pitch * ((r.imageExtent.height + bh - 1) / bh) * r.imageExtent.depth); }
-    else { vk_tex_upload_if_stale(v, t); vkCmdCopyBufferToImage(vk_cb(), b, vk_tex_image(v), VK_IMAGE_LAYOUT_GENERAL, 1, &r); vk_tex_gpu_wrote(v); }
+    else { vk_tex_upload_if_stale(v, t); vkCmdCopyBufferToImage(vk_cb(), b, vk_tex_image(v), VK_IMAGE_LAYOUT_GENERAL, 1, &r); vk_tex_gpu_wrote(v);
+#ifdef GAME_OOT
+        mv_note_upload(v);
+#endif
+    }
     full_barrier(); g_copies++;
 }
 static void copy_t2t(const p_copy_t2t *c) {
@@ -1449,7 +1503,7 @@ static void pt_frame(uint64_t present) {
     g_npp = 0;
 }
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
-    (void)period_s; (void)crop; g_presents++; vk_tex_frame();
+    (void)period_s; g_presents++; vk_tex_frame();
     { /* a frame over 60 ms: where the time went (vk_wait_stats; mtl_wait counts every thread) */
       static uint64_t pt, pw[4]; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC), w[4]; void vk_wait_stats(uint64_t[4]); vk_wait_stats(w);
       static uint64_t lim; if (!lim) { const char *e = getenv("TOTK_VK_LONG_MS"); lim = (e ? atol(e) : 60) * 1000000ull; }   /* TOTK_VK_LONG_MS: the threshold */
@@ -1466,7 +1520,11 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
       if (ahead > 0) { uint64_t f = fence[(g_presents + 16 - (uint64_t)ahead) % 16]; if (f && !mtl_wait(f, 0)) { int a_ = runtime_core_away(); mtl_wait(f, UINT64_MAX); runtime_core_back(&a_); } fence[g_presents % 16] = mtl_last_fence(); } }
     if (t) {
         vtex *v = vk_tex_get(t);
-        if (v) { vk_tex_mark_read(v); uint32_t w, h; VkFormat f; vk_tex_dims(v, &w, &h, &f); vk_present_image(vk_tex_image(v), w, h, f); }
+        if (v) { vk_tex_mark_read(v); uint32_t w, h; VkFormat f; vk_tex_dims(v, &w, &h, &f);
+            /* nvnWindowSetCrop: the shown part of the texture (Ocarina of Time draws a 2048x1152 canvas into 2560x1440 textures) */
+            int32_t x = 0, y = 0;
+            if (crop[2] > 0 && crop[3] > 0) {   /* no crop set: the whole texture */ x = crop[0]; y = crop[1]; w = (uint32_t)crop[2]; h = (uint32_t)crop[3]; }
+            vk_present_image(vk_tex_image(v), x, y, w, h, f); }
         front_frame_presented();
     }
     if (g_presents % 600 == 0) {

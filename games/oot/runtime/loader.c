@@ -485,8 +485,12 @@ static void crash(int num,siginfo_t *info,void *context) {
  signal_hex("[totk] signal=",num);signal_hex("fault=",(uintptr_t)info->si_addr);signal_hex("esr=",UC_ESR(u));
  {mach_vm_address_t ra=(uintptr_t)info->si_addr;mach_vm_size_t rs=0;vm_region_basic_info_data_64_t ri;mach_msg_type_number_t rc=VM_REGION_BASIC_INFO_COUNT_64;mach_port_t ro=0;
   if(mach_vm_region(mach_task_self(),&ra,&rs,VM_REGION_BASIC_INFO_64,(vm_region_info_t)&ri,&rc,&ro)==KERN_SUCCESS){signal_hex("region=",ra);signal_hex("region size=",rs);signal_hex("region prot=",(uint64_t)ri.protection|((uint64_t)ri.max_protection<<8));}}signal_hex("pc=",pc);signal_hex("lr=",u->UC_LR);signal_hex("fp=",fp);
+ {Dl_info di;for(int k=0;k<2;k++){uint64_t a=k?u->UC_LR:pc;if(dladdr((void *)(uintptr_t)a,&di)&&di.dli_sname){write(2,k?"lr host ":"pc host ",8);write(2,di.dli_sname,strlen(di.dli_sname));signal_hex(" +",a-(uintptr_t)di.dli_saddr);}else if(dladdr((void *)(uintptr_t)a,&di)&&di.dli_fname){write(2,k?"lr host ":"pc host ",8);write(2,di.dli_fname,strlen(di.dli_fname));signal_hex(" +",a-(uintptr_t)di.dli_fbase);}
+#ifdef __linux__
+ else{int mf=open("/proc/self/maps",O_RDONLY);static char mb[1<<20];ssize_t mn=mf>=0?read(mf,mb,sizeof mb-1):0;if(mf>=0)close(mf);for(char *l=mb;mn>0&&l<mb+mn;){char *e=memchr(l,'\n',(size_t)(mb+mn-l));if(!e)break;uint64_t lo=strtoull(l,NULL,16),hi=strtoull(strchr(l,'-')+1,NULL,16);if(a>=lo&&a<hi){write(2,k?"lr map ":"pc map ",7);write(2,l,(size_t)(e-l+1));}l=e+1;}}
+#endif
+}}   /* a fault in a host function: name it */
 #ifdef GAME_BOTW
- {Dl_info di;for(int k=0;k<2;k++){uint64_t a=k?u->UC_LR:pc;if(dladdr((void *)(uintptr_t)a,&di)&&di.dli_sname){write(2,k?"lr host ":"pc host ",8);write(2,di.dli_sname,strlen(di.dli_sname));signal_hex(" +",a-(uintptr_t)di.dli_saddr);}}}   /* a fault in a host function: name it */
  /* Diagnostics (TOTK_CRASH_THREADS=1): what every other guest thread was doing at the fault (wait states, last SVC chains,
     and the live pc of the ones running), to see a job running into data another thread is rebuilding. Once per process. */
  {static int dumped;if(getenv("TOTK_CRASH_THREADS")&&!__atomic_fetch_add(&dumped,1,__ATOMIC_SEQ_CST)){extern void runtime_dump_threads(void);runtime_dump_threads();}}

@@ -255,7 +255,7 @@ void mtl_dead_forget(const uint64_t *serials, size_t n) { (void)serials; (void)n
    into the ring, then copied into the image. Used when the bytes per block are a power of two (rows of 16-byte segments)
    and the level starts 16-byte aligned in the pool; the rest is deswizzled on the CPU. TOTK_VK_CPU_DESWIZZLE=1: CPU only */
 #include "deswizzle_spv.h"
-typedef struct { uint32_t src_off, row_bytes, rows, slices, th, td, pitch, segs; } dsw_pc;
+typedef struct { uint32_t src_off, row_bytes, rows, slices, th, td, pitch, segs, ns2; } dsw_pc;
 static VkPipeline g_dsw; static VkPipelineLayout g_dsw_pl; static uint64_t g_gpu_uploads;
 static int dsw_init(void) {
     static int state; if (state) return state > 0;
@@ -288,7 +288,12 @@ static int dsw_record(VkCommandBuffer cb, vtex *v, uint32_t l, uint32_t ly, vk_s
     VkDescriptorBufferInfo bi[2] = {{pb, bo, ((po - bo) + v->gsize + 15) & ~15ull}, {s->buf, s->off, (VkDeviceSize)p * rows * slices}};
     VkWriteDescriptorSet w[2] = {{.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[0]},
                                  {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[1]}};
-    dsw_pc pc = {(uint32_t)(po - bo + base), row_bytes, rows, slices, th, td, p, segs};
+#ifdef GAME_NS2
+    const uint32_t ns2 = 1;
+#else
+    const uint32_t ns2 = 0;
+#endif
+    dsw_pc pc = {(uint32_t)(po - bo + base), row_bytes, rows, slices, th, td, p, segs, ns2};
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dsw);
     V.CmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_dsw_pl, 0, 2, w);
     vkCmdPushConstants(cb, g_dsw_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);

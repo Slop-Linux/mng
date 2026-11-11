@@ -1,11 +1,15 @@
-// Tegra X1 block-linear -> linear, one 16-byte GOB segment per invocation (nvn_deswizzle.c nvn_bl_offset).
+// Tegra X1 / Switch 2 block-linear -> linear, one 16-byte GOB segment per invocation (nvn_deswizzle.c nvn_bl_offset).
 // vk_tex.c upload: x = segment of the block row, y = block row, z = slice; src at the level / layer start, dst rows at pitch.
 #version 450
 layout(local_size_x = 64) in;
 layout(std430, set = 0, binding = 0) readonly buffer Src { uvec4 src[]; };
 layout(std430, set = 0, binding = 1) writeonly buffer Dst { uvec4 dst[]; };
-layout(push_constant) uniform P { uint src_off, row_bytes, rows, slices, th, td, pitch, segs; } p;
-uint gob_off(uint x, uint y) { return (x % 64u / 32u) * 256u + (y % 8u / 2u) * 64u + (x % 32u / 16u) * 32u + (y % 2u) * 16u + x % 16u; }
+layout(push_constant) uniform P { uint src_off, row_bytes, rows, slices, th, td, pitch, segs, ns2; } p;
+// A GOB's 16-byte pieces: x5 y2 y1 x4 y0 on the Tegra X1, x5 y2 x4 y1 y0 on the Switch 2 (nvn_deswizzle.c GAME_NS2)
+uint gob_off(uint x, uint y) {
+    if (p.ns2 != 0u) return (x % 64u / 32u) * 256u + (y % 8u / 4u) * 128u + (x % 32u / 16u) * 64u + (y % 4u / 2u) * 32u + (y % 2u) * 16u + x % 16u;
+    return (x % 64u / 32u) * 256u + (y % 8u / 2u) * 64u + (x % 32u / 16u) * 32u + (y % 2u) * 16u + x % 16u;
+}
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= p.segs * p.rows * p.slices) return;

@@ -392,7 +392,7 @@ void vk_replay_end_pass(void);   /* vk_replay.c */
 /* the submit thread: the ICD encodes a command buffer for the hardware inside vkQueueSubmit (about 37 % of the game's CPU time
    in the world), so submissions and presents are queued to a thread of their own, in order, and the game thread goes on
    replaying the next frame. Every queue operation runs there or under g_queue_mu after the jobs before it. */
-typedef struct { int kind; sub_t *s; int cb, last; VkImage img; uint32_t w, h; VkFormat fmt; } job_t;
+typedef struct { int kind; sub_t *s; int cb, last; VkImage img; uint32_t w, h; VkFormat fmt; int32_t x0, y0; } job_t;   /* present: the source rectangle (x0, y0, w, h) */
 #define JOBS 64
 static job_t g_jobs[JOBS]; static unsigned g_job_head, g_job_tail; static int g_job_busy;
 static pthread_mutex_t g_job_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_job_cv = PTHREAD_COND_INITIALIZER;
@@ -450,7 +450,7 @@ static void submit_now(sub_t *s, int i, int last) {
     g_inflight_tail = s; pthread_cond_broadcast(&g_sub_cv);
     pthread_mutex_unlock(&g_sub_mu);
 }
-static void present_now(VkImage img, uint32_t w, uint32_t h, VkFormat fmt);
+static void present_now(VkImage img, int32_t sx, int32_t sy, uint32_t w, uint32_t h, VkFormat fmt);
 static void *submit_thread(void *arg) {
     (void)arg; pthread_setname_np("vk-submit");
     VkCommandPoolCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = V.qfam};
@@ -459,7 +459,7 @@ static void *submit_thread(void *arg) {
         pthread_mutex_lock(&g_job_mu);
         while (g_job_head == g_job_tail) { g_job_busy = 0; pthread_cond_broadcast(&g_job_cv); pthread_cond_wait(&g_job_cv, &g_job_mu); }
         job_t j = g_jobs[g_job_tail % JOBS]; g_job_busy = 1; pthread_mutex_unlock(&g_job_mu);
-        if (j.kind == 1) submit_now(j.s, j.cb, j.last); else present_now(j.img, j.w, j.h, j.fmt);
+        if (j.kind == 1) submit_now(j.s, j.cb, j.last); else present_now(j.img, j.x0, j.y0, j.w, j.h, j.fmt);
         pthread_mutex_lock(&g_job_mu); g_job_tail++; pthread_cond_broadcast(&g_job_cv); pthread_mutex_unlock(&g_job_mu);
     }
     return NULL;
@@ -675,8 +675,8 @@ static void seq_frame(VkImage img, uint32_t w, uint32_t h, uint64_t n) {
     pthread_mutex_lock(&g_queue_mu); VKCHECK(vkQueueSubmit(V.queue, 1, &si, g_seq[k].fence)); pthread_mutex_unlock(&g_queue_mu);
     g_seq[k].n = n; g_seq[k].busy = 1;
 }
-void vk_present_image(VkImage img, uint32_t w, uint32_t h, VkFormat fmt) { job_push((job_t){.kind = 2, .img = img, .w = w, .h = h, .fmt = fmt}); }
-static void present_now(VkImage img, uint32_t w, uint32_t h, VkFormat fmt) {
+void vk_present_image(VkImage img, int32_t x, int32_t y, uint32_t w, uint32_t h, VkFormat fmt) { job_push((job_t){.kind = 2, .img = img, .x0 = x, .y0 = y, .w = w, .h = h, .fmt = fmt}); }
+static void present_now(VkImage img, int32_t sx, int32_t sy, uint32_t w, uint32_t h, VkFormat fmt) {
     g_presents++;
     shot(img, w, h, fmt, g_presents); seq_frame(img, w, h, g_presents);
     if (!g_swap) return;
@@ -698,7 +698,7 @@ static void present_now(VkImage img, uint32_t w, uint32_t h, VkFormat fmt) {
         vkCmdClearColorImage(cb, g_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rr);
         barrier_img(cb, g_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     }
-    VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int)w, (int)h, 1}},
+    VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{sx, sy, 0}, {sx + (int)w, sy + (int)h, 1}},
                       .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{x0, y0, 0}, {x0 + dw, y0 + dh, 1}}};
     vkCmdBlitImage(cb, img, VK_IMAGE_LAYOUT_GENERAL, g_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
     barrier_img(cb, g_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
