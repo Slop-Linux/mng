@@ -1,3 +1,4 @@
+#include "asm_sym.h"
 /* Host-stack switch for host implementations called from guest code.
    Horizon services run on kernel/sysmodule stacks, but the host functions that replace them would otherwise run
    on the calling guest thread's stack, and TOTK creates threads with stacks as small as 4 KiB. Each guest thread
@@ -10,12 +11,12 @@
    are copied to the host stack below the frame record, so a replacement with up to 16 integer arguments reads them where
    the ABI puts them (the Switch 2's nn::codec ReadDecoderOutputImageNv12 has 12; it read host stack garbage before). While _runtime_hle_trace is set (TOTK_INPUT_FILE "hletrace", diagnostics) every call is first counted by
    _runtime_hle_note on the host stack, with the argument registers kept. */
-    .globl _runtime_hle_switch
+    .globl SYM(runtime_hle_switch)
     .p2align 2
-_runtime_hle_switch:
-    mrs x9, tpidrro_el0
-    adrp x10, _runtime_hle_tsd_off@PAGE
-    ldr x10, [x10, _runtime_hle_tsd_off@PAGEOFF]
+SYM(runtime_hle_switch):
+    mrs x9, TP_EL0
+    adrp x10, PAGE(runtime_hle_tsd_off)
+    ldr x10, [x10, PAGEOFF(runtime_hle_tsd_off)]
     ldr x11, [x9, x10]
     cbz x11, 1f
     str xzr, [x9, x10]
@@ -24,8 +25,8 @@ _runtime_hle_switch:
     stp x29, x30, [sp]          // frame record links the host frames back to the guest caller
     stp x12, x11, [sp, #16]
     mov x29, sp
-    adrp x13, _runtime_hle_trace@PAGE
-    ldr w13, [x13, _runtime_hle_trace@PAGEOFF]
+    adrp x13, PAGE(runtime_hle_trace)
+    ldr w13, [x13, PAGEOFF(runtime_hle_trace)]
     cbnz w13, 2f
 3:  ldr x12, [sp, #16]          // the guest sp at the call (hle_note_kept may have used x12)
     sub sp, sp, #64
@@ -42,13 +43,13 @@ _runtime_hle_switch:
     ldp x12, x11, [sp, #16]
     ldp x29, x30, [sp]
     mov sp, x12
-    mrs x9, tpidrro_el0
-    adrp x10, _runtime_hle_tsd_off@PAGE
-    ldr x10, [x10, _runtime_hle_tsd_off@PAGEOFF]
+    mrs x9, TP_EL0
+    adrp x10, PAGE(runtime_hle_tsd_off)
+    ldr x10, [x10, PAGEOFF(runtime_hle_tsd_off)]
     str x11, [x9, x10]
     ret
-1:  adrp x13, _runtime_hle_trace@PAGE      // already on a host stack (nested call, or a host thread)
-    ldr w13, [x13, _runtime_hle_trace@PAGEOFF]
+1:  adrp x13, PAGE(runtime_hle_trace)      // already on a host stack (nested call, or a host thread)
+    ldr w13, [x13, PAGEOFF(runtime_hle_trace)]
     cbnz w13, 4f
     br x16
 2:  bl hle_note_kept                        // x30 is in the frame record and is reloaded from it after the call
@@ -74,7 +75,7 @@ hle_note_kept:
     stp q4, q5, [sp, #160]
     stp q6, q7, [sp, #192]
     mov x0, x17
-    bl _runtime_hle_note
+    bl SYM(runtime_hle_note)
     ldp q6, q7, [sp, #192]
     ldp q4, q5, [sp, #160]
     ldp q2, q3, [sp, #128]
@@ -90,15 +91,15 @@ hle_note_kept:
 /* x17 = wrapper index: x16 = _runtime_hle_targets[x17], then the switch. */
     .p2align 2
 hle_dispatch:
-    adrp x16, _runtime_hle_targets@PAGE
-    add x16, x16, _runtime_hle_targets@PAGEOFF
+    adrp x16, PAGE(runtime_hle_targets)
+    add x16, x16, PAGEOFF(runtime_hle_targets)
     ldr x16, [x16, x17, lsl #3]
-    b _runtime_hle_switch
+    b SYM(runtime_hle_switch)
 
 /* Fixed wrapper thunks (16 bytes each): thunk i enters the dispatch with x17 = i. */
-    .globl _runtime_hle_thunks
+    .globl SYM(runtime_hle_thunks)
     .p2align 4
-_runtime_hle_thunks:
+SYM(runtime_hle_thunks):
 .set hle_i, 0
 .rept 4096
     mov x17, #hle_i

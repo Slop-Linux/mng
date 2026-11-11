@@ -10,7 +10,7 @@
         packages = with pkgs; [
           python314 clang lld llvm git rsync gnumake pkg-config
           libopus libvpx sdl3 vulkan-headers vulkan-loader spirv-tools glslang
-          dotnetCorePackages.sdk_10_0 zlib openssl
+          dotnetCorePackages.sdk_10_0 zlib openssl dav1d
         ];
         DOTNET_CLI_TELEMETRY_OPTOUT = "1";
         DOTNET_ROOT = "${pkgs.dotnetCorePackages.sdk_10_0}/share/dotnet";

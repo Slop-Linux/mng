@@ -27,10 +27,15 @@ static void leave_exit_section(void) { }
 static void display_version(char *out) { memset(out, 0, 16); strncpy(out, TOTK_GAME_VERSION, 15); }
 /* Stable for this installation and this game, like the console's per-application pseudo device id. */
 static void pseudo_device_id(uint8_t *uuid) {
-    uuid_t host; uint8_t digest[CC_SHA256_DIGEST_LENGTH]; uint64_t title = GAME_TITLE_ID;
+    uint8_t host[16]; uint8_t digest[CC_SHA256_DIGEST_LENGTH]; uint64_t title = GAME_TITLE_ID;
 #if TARGET_OS_IPHONE
     void runtime_ios_device_uuid(uint8_t out[16]);
     runtime_ios_device_uuid(host);
+#elif defined(__linux__)
+    /* the installation's /etc/machine-id (32 hex digits), as gethostuuid is the Mac's */
+    memset(host, 0, sizeof host);
+    FILE *m = fopen("/etc/machine-id", "r");
+    if (m) { for (int i = 0; i < 16; i++) { unsigned v; if (fscanf(m, "%2x", &v) != 1) break; host[i] = (uint8_t)v; } fclose(m); }
 #else
     struct timespec wait = {0, 0};
     if (gethostuuid(host, &wait)) memset(host, 0, sizeof host);

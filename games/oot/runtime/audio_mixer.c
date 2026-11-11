@@ -16,7 +16,12 @@
 #ifdef GAME_BOTW
 #include "audio_ramp.h"
 #endif
+#ifdef __linux__
+#include <SDL3/SDL.h>   /* output through SDL3's audio stream (PipeWire on Linux) */
+typedef SDL_AudioStream *AudioComponentInstance;
+#else
 #include <AudioToolbox/AudioToolbox.h>
+#endif
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -60,7 +65,7 @@ typedef struct Mixer {
 static _Atomic float device_volume = 1.0f;
 static _Atomic int g_active_channels = 0;
 
-#if !TARGET_OS_IPHONE
+#if !TARGET_OS_IPHONE && !defined(__linux__)
 /* Whether the output device's own channel layout has a centre and an LFE channel (after PR #1224): a channel count of 6
    or more alone also matches a recording interface or an 8-channel HDMI output wired to two speakers, where 5.1 would
    send the dialogue (centre) and the surrounds to channels nobody hears. A layout that cannot be read counts as stereo;
@@ -99,7 +104,7 @@ static int detect_output_channels(AudioComponentInstance unit) {
     const char *e = getenv("TOTK_AUDIO_CHANNELS");
     if (e && !strcmp(e, "6")) return 6;
     if (e && !strcmp(e, "2")) return 2;
-#if !TARGET_OS_IPHONE
+#if !TARGET_OS_IPHONE && !defined(__linux__)
     if (unit) {
         AudioStreamBasicDescription hw_fmt = {0};
         UInt32 sz = sizeof(hw_fmt);
@@ -122,7 +127,7 @@ static int detect_system_channels(void) {
     const char *e = getenv("TOTK_AUDIO_CHANNELS");
     if (e && !strcmp(e, "6")) return 6;
     if (e && !strcmp(e, "2")) return 2;
-#if !TARGET_OS_IPHONE
+#if !TARGET_OS_IPHONE && !defined(__linux__)
     AudioComponentDescription d = {kAudioUnitType_Output, kAudioUnitSubType_DefaultOutput, kAudioUnitManufacturer_Apple, 0, 0};
     AudioComponent c = AudioComponentFindNext(NULL, &d);
     if (c) {
@@ -211,22 +216,21 @@ void (*runtime_audio_tap)(float *out, unsigned frames, int rate);
    2026-10-29: water / wind in a loop under "shader cache ready" and "warming"). What it writes meanwhile is dropped. */
 static _Atomic int g_audio_hold = 1;
 void runtime_audio_hold(int on) { atomic_store_explicit(&g_audio_hold, on != 0, memory_order_release); }
-static OSStatus pull(void *ctx, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *io) {
-    (void)flags; (void)ts; (void)bus;
-    Mixer *m = ctx; float *out = io->mBuffers[0].mData;
+typedef uint32_t UInt32_;
+static void pull_frames(Mixer *m, float *out, UInt32_ frames) {
     int ch = m->channels ? m->channels : 2;
     atomic_fetch_add(&m->callback_frames,frames);
     unsigned epoch=atomic_load_explicit(&m->stop_epoch,memory_order_acquire);
     uint64_t rd = atomic_load(&m->rd), wr = atomic_load_explicit(&m->wr, memory_order_acquire), have = wr - rd;
     if(epoch!=m->callback_epoch){uint64_t until=atomic_load_explicit(&m->flush_until,memory_order_acquire);if(until>rd){rd=until<wr?until:wr;atomic_store_explicit(&m->rd,rd,memory_order_release);}have=wr-rd;m->callback_epoch=epoch;m->ready=0;}
     if(!atomic_load_explicit(&m->playing,memory_order_acquire)||atomic_load_explicit(&g_audio_hold,memory_order_acquire)){
-        memset(out,0,(size_t)frames*(size_t)ch*sizeof(float));m->ready=0;atomic_store_explicit(&m->rd,wr,memory_order_release);return noErr;
+        memset(out,0,(size_t)frames*(size_t)ch*sizeof(float));m->ready=0;atomic_store_explicit(&m->rd,wr,memory_order_release);return;
     }
     uint64_t prefill=(uint64_t)m->frame*(uint64_t)prefill_blocks();if(prefill<frames)prefill=frames;if(prefill>RING_FRAMES)prefill=RING_FRAMES;
     if(!m->ready){
         /* prefill_blocks() 5-ms blocks (default four, 20 ms) of scheduling headroom for the producer.
            A real underrun still counts and requires a fresh prefill. */
-        if(have<prefill){memset(out,0,(size_t)frames*(size_t)ch*sizeof(float));return noErr;}
+        if(have<prefill){memset(out,0,(size_t)frames*(size_t)ch*sizeof(float));return;}
         m->ready=1;
     }
     /* After a device stall (Bluetooth, CoreAudio) the producer, paced by the wall clock, keeps the backlog it built up:
@@ -237,9 +241,9 @@ static OSStatus pull(void *ctx, AudioUnitRenderActionFlags *flags, const AudioTi
         rd = wr - prefill;
         have = prefill;
     }
-    UInt32 n = frames < have ? frames : (UInt32)have;
+    UInt32_ n = frames < have ? frames : (UInt32_)have;
     uint64_t nonzero=0;
-    for (UInt32 i = 0; i < n; i++) {
+    for (UInt32_ i = 0; i < n; i++) {
         uint64_t k = (rd + i) % RING_FRAMES;
         int frame_nz = 0;
         for (int c = 0; c < ch; c++) {
@@ -254,8 +258,49 @@ static OSStatus pull(void *ctx, AudioUnitRenderActionFlags *flags, const AudioTi
     atomic_store_explicit(&m->rd, rd + n, memory_order_release);
     void (*tap)(float *, unsigned, int) = runtime_audio_tap;
     if (tap) tap(out, frames, m->rate);
+}
+#ifdef __linux__
+/* SDL asks for more bytes on its own audio thread: the ring's frames, as CoreAudio's render callback takes them. */
+static void pull(void *ctx, SDL_AudioStream *stream, int additional, int total) {
+    (void)total; Mixer *m = ctx; int ch = m->channels ? m->channels : 2; float buf[MAX_FRAME * 6];
+    for (int left = additional / (int)(sizeof(float) * ch); left > 0;) {
+        UInt32_ n = left < MAX_FRAME ? (UInt32_)left : MAX_FRAME;
+        pull_frames(m, buf, n); SDL_PutAudioStreamData(stream, buf, (int)(n * ch * sizeof(float))); left -= (int)n;
+    }
+}
+static void output_stop(Mixer *m) { SDL_DestroyAudioStream(m->unit); m->unit = NULL; }
+static void output_open(Mixer *m, int rate) {
+    int target = detect_output_channels(NULL);
+    if (getenv("TOTK_AUDIO_OFF")) {
+        m->channels = target;
+        fprintf(stderr, "[totk-audio] TOTK_AUDIO_OFF: mixing without an output device (%d channels)\n", m->channels);
+        return;
+    }
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");   /* SDL's SIGTERM handler only queues a quit event: headless, nothing reads it and the process ignored SIGTERM */
+    if (!SDL_WasInit(SDL_INIT_AUDIO) && !SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        m->channels = 2; fprintf(stderr, "[totk-audio] 【红】SDL audio: %s: mixing without sound\n", SDL_GetError()); return;
+    }
+    /* 5.1 in SDL's order FL FR FC LFE BL BR, the AudioUnit_5_1 order the mixer writes */
+    SDL_AudioSpec spec = {SDL_AUDIO_F32, target, rate};
+    m->channels = target;
+    m->unit = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, pull, m);
+    if (!m->unit && target == 6) { spec.channels = m->channels = 2; m->unit = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, pull, m); }
+    if (!m->unit || !SDL_ResumeAudioStreamDevice(m->unit)) {
+        fprintf(stderr, "[totk-audio] 【红】SDL audio output setup failed (%s): mixing without sound\n", SDL_GetError());
+        if (m->unit) output_stop(m);
+        m->channels = 2; return;
+    }
+    m->unit_ok = 1;
+    atomic_store(&g_active_channels, m->channels);
+    fprintf(stderr, "[totk-audio] SDL %s output %d Hz %s (%d channels)\n", SDL_GetCurrentAudioDriver(), rate, m->channels == 6 ? "5.1 surround" : "stereo", m->channels);
+}
+#else
+static OSStatus pull(void *ctx, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *io) {
+    (void)flags; (void)ts; (void)bus;
+    pull_frames(ctx, io->mBuffers[0].mData, frames);
     return noErr;
 }
+static void output_stop(Mixer *m) { AudioOutputUnitStop(m->unit); AudioUnitUninitialize(m->unit); AudioComponentInstanceDispose(m->unit); }
 static void output_open(Mixer *m, int rate) {
     if (getenv("TOTK_AUDIO_OFF")) {
         const char *env = getenv("TOTK_AUDIO_CHANNELS");
@@ -327,6 +372,7 @@ static void output_open(Mixer *m, int rate) {
     atomic_store(&g_active_channels, m->channels);
     fprintf(stderr, "[totk-audio] CoreAudio output %d Hz %s (%d channels)\n", rate, m->channels == 6 ? "5.1 surround" : "stereo", m->channels);
 }
+#endif
 /* iOS (from nxnative b301431): the system stops the RemoteIO unit when another app takes the audio session (a call,
    Siri, an alarm) and invalidates it when media services are reset. Nothing started it again, so the game stayed
    silent for the rest of the session. The app's session observers (ios/Sources/main.m) call this: start the open
@@ -337,8 +383,10 @@ void runtime_audio_output_restart(int recreate) {
     pthread_mutex_lock(&g_out_mu);
     for (int i = 0; i < 4; i++) {
         Mixer *m = g_out[i]; if (!m) continue;
+#ifndef __linux__
         if (m->unit_ok && !recreate && !AudioOutputUnitStart(m->unit)) { fprintf(stderr, "[totk-audio] output started again\n"); continue; }
-        if (m->unit_ok) { m->unit_ok = 0; AudioOutputUnitStop(m->unit); AudioUnitUninitialize(m->unit); AudioComponentInstanceDispose(m->unit); }
+#endif
+        if (m->unit_ok) { m->unit_ok = 0; output_stop(m); }
         m->ready = 0; output_open(m, m->rate);
         fprintf(stderr, "[totk-audio] output rebuilt (%s): %s\n", recreate ? "media services reset" : "start failed", m->unit_ok ? "playing" : "no sound");
     }
@@ -409,7 +457,7 @@ void audio_mixer_close(AudioRenderer *r) {
     Mixer *m = r->mixer; if (!m) return;
     pthread_mutex_lock(&g_out_mu);
     for (int i = 0; i < 4; i++) if (g_out[i] == m) g_out[i] = NULL;
-    if (m->unit_ok) { m->unit_ok = 0; AudioOutputUnitStop(m->unit); AudioUnitUninitialize(m->unit); AudioComponentInstanceDispose(m->unit); }
+    if (m->unit_ok) { m->unit_ok = 0; output_stop(m); }
     pthread_mutex_unlock(&g_out_mu);
     if(m->capture_worker){
         pthread_mutex_lock(&m->capture_lock);m->capture_closing=1;pthread_cond_signal(&m->capture_cond);pthread_mutex_unlock(&m->capture_lock);

@@ -5,7 +5,7 @@
 #include "vk.h"
 #include <math.h>
 #include <unistd.h>
-#include "../../../third_party/d2r_gfx/host/front.h"
+#include "d2r_gfx/host/front.h"
 
 uint64_t vk_sub_submit(void);
 void vk_sub_open(void);
@@ -547,6 +547,7 @@ static void support_init(void) {
 /* NVN driver constant segments: c0 storage-buffer table (vertex 0x110, fragment 0x510, compute 0x310), compute group counts 0x200
    and uniform table 0x210, vertex point-size limit 0x610; c2 combined handles 0x20, texture handles 0x168, sampler handles 0x568 */
 static uint32_t g_grid[3];
+static VkBuffer g_cs_bank_buf; static VkDeviceSize g_cs_bank_off;   /* the compute dispatch's c0 bank (indirect group counts) */
 static void driver_bank(uint8_t *d, int bank, int stage) {
     memset(d, 0, 0xA00);
     if (bank == 0) {
@@ -613,7 +614,8 @@ static VkDescriptorSet stage_set(vshader *s, int stage, int set, VkDescriptorSet
                 static struct { uint64_t gen, sub; VkBuffer buf; VkDeviceSize off; } bc[6][2]; int k = b->slot / 2;
                 if (stage == 5 || bc[stage][k].gen != g_gen_bind[stage] || bc[stage][k].sub != g_sub_gen) {
                     vk_span sp = vk_ring(0xA00, 256); driver_bank(sp.cpu, b->slot, stage); bc[stage][k].gen = g_gen_bind[stage]; bc[stage][k].sub = g_sub_gen; bc[stage][k].buf = sp.buf; bc[stage][k].off = sp.off; }
-                buf = bc[stage][k].buf; off = bc[stage][k].off; range = 0xA00; }
+                buf = bc[stage][k].buf; off = bc[stage][k].off; range = 0xA00;
+                if (stage == 5 && k == 0) { g_cs_bank_buf = buf; g_cs_bank_off = off; } }
             else if (b->slot >= 3 && b->slot <= 18) { const p_bind_buf *u = &S.ubo[stage][b->slot - 3];
                 uint64_t sz = u->size && u->size <= 65536 ? u->size : 65536; if (b->used && b->used < sz) sz = b->used;   /* what the shader reads (cbuf_used) */
                 if (!ubo_range(u->addr, sz, &buf, &off, &range)) buf = VK_NULL_HANDLE; }
@@ -1076,6 +1078,14 @@ static void dispatch(const p_dispatch *d) {
     VkShaderStageFlagBits st = VK_SHADER_STAGE_COMPUTE_BIT; V.CmdBindShadersEXT(cb, 1, &st, &c->sh);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, c->pl, 0, 1, &set, 0, NULL);
     if (g_pt_on && g_pt_n < PT_MAX) { g_pt[g_pt_n] = (pt_info){(uint32_t)d->x, (uint32_t)d->y, -1, 0, 0, 0, 0, 0}; pt_mark(0); }
+#ifdef GAME_OOT
+    if (d->indirect) {   /* nvnCommandBufferDispatchComputeIndirect: the group counts, read by the GPU, also into c0 +0x200 */
+        VkBuffer ib; VkDeviceSize io;
+        if (!vk_pool_find(d->indirect, 12, &ib, &io)) VKDIE("indirect dispatch arguments %#llx are not in a pool", (unsigned long long)d->indirect);
+        VkBufferCopy c = {io, g_cs_bank_off + 0x200, 12}; vkCmdCopyBuffer(cb, ib, g_cs_bank_buf, 1, &c); full_barrier();
+        vkCmdDispatchIndirect(cb, ib, io);
+    } else
+#endif
     vkCmdDispatch(cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     pt_close(9);
     full_barrier(); g_dispatches++;
@@ -1223,18 +1233,122 @@ static int same_rt(const p_set_rt *a, const p_set_rt *b) {
     if ((a->depth ? a->depth->serial : 0) != (b->depth ? b->depth->serial : 0)) return 0;
     return !a->depth || same_view(&a->dview, a->has_dview, &b->dview, b->has_dview);
 }
+#ifdef GAME_OOT
+/* ---------- guest queue ordering (Ocarina of Time; nvn_mtl.m qwait_* / mtl_qo_*, nvn_queue_order.inc) ----------
+   Every guest queue replays into the one Vulkan queue in submit order. The value each event will hold once the signals
+   replayed so far execute is projected here; a wait whose target neither the projection nor memory reaches stops the
+   replay before it (hle_nvn.c parks the rest of the submission: the cursors into the guest's command memory, outermost
+   last, and the replay state S) and the queue that produces the event replays first. */
+uint64_t g_qwait_queue;   /* guest queue (NVNqueue address) of the submission being replayed (hle_nvn.c) */
+typedef struct { volatile uint32_t *val; uint32_t projected, hist[8]; unsigned nhist; uint64_t queue, fence; } qwait_ev;
+static qwait_ev g_qwait_ev[512]; static uint64_t g_qwait_waits, g_qwait_unready, g_qwait_signals;
+static qwait_ev *qwait_find(volatile uint32_t *val, int add) {
+    unsigned h = (unsigned)(((uintptr_t)val >> 2) * 2654435761u) & 511;
+    for (unsigned k = 0; k < 512; k++) { qwait_ev *e = &g_qwait_ev[(h + k) & 511]; if (e->val == val) return e; if (!e->val) { if (!add) return NULL; e->val = val; e->projected = *val; return e; } }
+    return NULL;
+}
+static int qwait_ready(uint32_t actual, uint32_t mode, uint32_t target) { return mode == 0 ? actual == target : (uint32_t)(actual - target) < 0x80000000u; }
+static int qwait_pending(const qwait_ev *e) { return e->fence && !mtl_wait(e->fence, 0); }   /* a projection whose GPU work has not completed */
+static void qwait_signal(volatile uint32_t *val, uint32_t mode, uint32_t v) {
+    qwait_ev *e = qwait_find(val, 1); g_qwait_signals++; if (!e) return;
+    uint32_t before = qwait_pending(e) ? e->projected : *val;   /* a completed projection yields to memory */
+    e->projected = mode == 1 ? before + v : v; e->queue = g_qwait_queue; e->fence = vk_open_fence();
+    e->hist[e->nhist++ & 7] = e->projected;
+}
+/* the value a wait sees at this point of the queue's order: memory, or the projection of signals replayed and not yet
+   completed; an EQUAL wait also accepts a value the event held earlier in this order */
+int mtl_qo_event_ready(volatile uint32_t *val, uint32_t mode, uint32_t target) {
+    if (qwait_ready(*val, mode, target)) return 1;
+    qwait_ev *e = qwait_find(val, 0); if (!e || !e->fence) return 0;
+    if (qwait_ready(e->projected, mode, target)) return 1;
+    if (mode == 0) for (unsigned k = 0; k < 8 && k < e->nhist; k++) if (e->hist[k] == target) return 1;
+    return 0;
+}
+int mtl_qo_event_gpu_projected(volatile uint32_t *val) { qwait_ev *e = qwait_find(val, 0); return e && qwait_pending(e); }
+void mtl_qo_cpu_signal(volatile uint32_t *val) { qwait_ev *e = qwait_find(val, 0); if (e) { e->projected = *val; e->fence = 0; e->nhist = 0; } }   /* nvnEventSignal: memory is authoritative */
+static void qwait_check(volatile uint32_t *val, uint32_t mode, uint32_t target) {
+    g_qwait_waits++;
+    if (!mtl_qo_event_ready(val, mode, target) && ++g_qwait_unready <= 24) {
+        qwait_ev *e = qwait_find(val, 0);
+        VKLOG("[queue-wait] unready queue=%#llx event=%p mode=%u target=%u memory=%u projected=%u last-signal queue=%#llx (%llu waits, %llu signals)",
+              (unsigned long long)g_qwait_queue, (void *)val, mode, target, *val, e ? e->projected : 0, e ? (unsigned long long)e->queue : 0ull,
+              (unsigned long long)g_qwait_waits, (unsigned long long)g_qwait_signals);
+    }
+}
+static int g_qo_armed, g_qo_stopped, g_qo_ncur;
+static const uint8_t *g_qo_cur[40];
+int (*g_qo_signal_releases)(volatile uint32_t *val);   /* hle_nvn.c: a parked queue's wait is now ready */
+static void qo_push(const uint8_t *p) { if (g_qo_ncur >= 40) VKDIE("guest queue cursor deeper than 40 calls"); g_qo_cur[g_qo_ncur++] = p; }
+void mtl_qo_arm(int on) { g_qo_armed = on; g_qo_stopped = 0; g_qo_ncur = 0; }
+int mtl_qo_stopped(void) { return g_qo_stopped; }
+int mtl_qo_cursor(const uint8_t **out, int max) { int n = g_qo_ncur < max ? g_qo_ncur : max; memcpy(out, g_qo_cur, sizeof *out * (size_t)n); return n; }
+/* the callers' continuations of a resumed sub-list feed nvn_mtl.m's lookahead return stack; this replay has no lookahead */
+void mtl_qo_set_callers(const uint8_t *const *outer_first, int n) { (void)outer_first; (void)n; }
+void *mtl_qo_state_save(void) { state_t *q = malloc(sizeof *q); if (!q) VKDIE("guest queue state"); *q = S; return q; }
+void mtl_qo_state_restore(void *p) {   /* the parked queue's state; every derived state is emitted again */
+    S = *(const state_t *)p; g_gen_state++; g_gen_vtx++; g_gen_rt++; for (int i = 0; i < 6; i++) g_gen_bind[i]++;
+}
+/* nvnCommandBufferClearBuffer {address, size, value}: the words of the range, on the GPU timeline */
+static void clear_buf(const uint64_t *r) {
+    VkBuffer b; VkDeviceSize o;
+    if (!r[1] || !vk_pool_find(r[0], r[1], &b, &o)) { g_skips[6]++; return; }
+    end_pass(2);
+    vkCmdFillBuffer(vk_cb(), b, o, r[1], (uint32_t)r[2]);
+    gw_note(r[0], r[0] + r[1]);
+    full_barrier(); g_copies++;
+}
+#endif
+#ifdef GAME_OOT
+/* The uniform captures (nvn_mtl.m ucap) are not taken by this backend (mtl_sub_capture_ubos): nothing to overlay or keep. */
+void mtl_sub_snapshot_ubos_rest(const uint64_t *h, int n, int ncur, uint64_t top, void *cap) { (void)h; (void)n; (void)ncur; (void)top; free(cap); }
+void *mtl_ucap_overlay(const void *base, const void *over) { (void)base; (void)over; return NULL; }
+/* zeldaVR stereo B2 runs only with a headset streamer (runtime_b2_stereo_marks): never here. */
+int mtl_b2_right_first(void) { return 0; }
+int mtl_b2_submit_uniforms_only(void) { return 0; }
+void mtl_eye_done(int left, int last) { (void)left; (void)last; }
+/* OOT_NOREAD_PROBE protects Metal-written pages at the present (a Mac diagnostic). */
+void mtl_noread_mark_frame(void) {}
+/* nvn_mtl.m keeps an index of pools whose GPU address NVN issued, for raw shader pointers; this backend resolves every
+   address through its pool table (vk_pool_find), so issuing one changes nothing. */
+void mtl_pool_addressed(const void *owner, const void *mem, uint64_t size) { (void)owner; (void)mem; (void)size; }
+void mtl_pool_forget_address(const void *owner) { (void)owner; }
+/* nvn_mtl.m writes a finished rendering back when a new texture object reuses its storage; here images are keyed by guest
+   memory and layout, so the new object takes the same image with that rendering in it. */
+void mtl_wb_storage_reused(const uint8_t *mem, uint64_t n) { (void)mem; (void)n; }
+#endif
 void mtl_exec(const uint8_t *p) {
     if (!g_inited) { g_inited = 1; state_reset(); support_init(); }
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h); g_op = p;
         if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_) VKDIE("corrupt command record at %p: op %u size %u", (const void *)p, h.op, h.size);
         const void *a = p + 8;
+#ifdef GAME_OOT
+        /* zeldaVR stereo B2 eye marks (nvn_mtl.m g_eye_region): one replay, the right eye's and the shared ops */
+        static uint32_t eye_region = 3;
+        if (h.op == OP_EYE) { p_eye e; memcpy(&e, a, sizeof e); eye_region = e.mask; p += h.size; continue; }
+        if (eye_region != 3 && !(eye_region & 2u)) { p += h.size; continue; }
+#endif
         switch (h.op) {
             case OP_END: return;
             case OP_BEGIN: break;
             case OP_JUMP: memcpy(&p, a, 8); continue;
+#ifdef GAME_OOT
+            case OP_CALL: { const uint8_t *t; memcpy(&t, a, 8); mtl_exec(t);
+                if (g_qo_stopped) { qo_push(p + h.size); return; }   /* the caller resumes after the call */
+                break; }
+            case OP_WAIT_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, (const uint8_t *)a + 8, 4); memcpy(&v, (const uint8_t *)a + 12, 4);
+                qwait_check(val, m, v);
+                if (g_qo_armed && !mtl_qo_event_ready(val, m, v)) { qo_push(p); g_qo_stopped = 1; return; }   /* another queue's producer first */
+                break; }
+            case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, (const uint8_t *)a + 8, 4); memcpy(&v, (const uint8_t *)a + 12, 4);
+                qwait_signal(val, m, v); vk_sub_post(1, val, m, v, 0);
+                if (g_qo_armed && g_qo_signal_releases && g_qo_signal_releases(val)) { qo_push(p + h.size); g_qo_stopped = 1; return; }   /* a parked queue goes on first */
+                break; }
+            case OP_CLEAR_BUF: clear_buf(a); break;
+#else
             case OP_CALL: { const uint8_t *t; memcpy(&t, a, 8); mtl_exec(t); break; }
             case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, (const uint8_t *)a + 8, 4); memcpy(&v, (const uint8_t *)a + 12, 4); vk_sub_post(1, val, m, v, 0); break; }
+#endif
             case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8); cpend_push(ad, t != NVN_COUNTER_TYPE_SAMPLES_PASSED);
                 if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) q_report(ad, g_pass_open); else vk_sub_post(2, NULL, 0, 0, ad); break; }
             case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) q_reset(g_pass_open); break; }

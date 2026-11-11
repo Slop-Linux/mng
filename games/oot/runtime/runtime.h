@@ -12,7 +12,9 @@ typedef struct {
  const Gate *gates; unsigned ngate; unsigned *hash, hash_mask;
  uint8_t *base; unsigned relative, symbolic, cross, weak;
 } Module;
-extern pthread_key_t runtime_keys[8];
+#ifndef __linux__
+extern pthread_key_t runtime_keys[8];   /* Linux: host_tp.h slots */
+#endif
 _Noreturn void runtime_fail(const char *message);
 int runtime_app_mode(void);   /* loader.c: 1 when this binary is the Mac app's own executable (Contents/MacOS), started as the app */
 int runtime_app_launch(int argc, char **argv, char ***boot);   /* app/launcher.m: the player's folders and settings, then -1 to boot */

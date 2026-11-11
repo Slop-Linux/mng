@@ -2,9 +2,9 @@
    present), vk_tex.c (formats, textures, samplers), vk_shader.c (translation service, shader variants), vk_replay.c (the
    command stream). */
 #pragma once
-#include "../../../third_party/d2r_gfx/gfx/nvn/nvn_obj.h"
-#include "../../../third_party/d2r_gfx/gfx/nvn/nvn_mtl.h"
-#include "../../../third_party/d2r_gfx/host/dm.h"
+#include "d2r_gfx/gfx/nvn/nvn_obj.h"
+#include "d2r_gfx/gfx/nvn/nvn_mtl.h"
+#include "d2r_gfx/host/dm.h"
 #include <vulkan/vulkan.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -64,6 +64,7 @@ VkCommandBuffer vk_upload_cb(void);   /* prologue: executed before the main one 
 uint64_t vk_next_fence(void);         /* the fence value the open submission will signal */
 uint64_t vk_done(void);               /* completed fence value */
 void vk_sub_post(int kind, volatile uint32_t *val, uint32_t mode, uint32_t v, uint64_t addr);
+uint64_t vk_open_fence(void);
 void vk_defer_free(void (*fn)(void *), void *p);   /* run when the open submission completes */
 /* occlusion queries: slots of one query pool taken in recording order; a submission's slots are read and reset when it
    completes, a report (vk_sub_post_samples) sums the slots counted since the last reset */

@@ -27,6 +27,12 @@ static uint64_t host_page(void) { return (uint64_t)getpagesize(); }
 static uint64_t round_up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
 
 static uint8_t *vm_fresh(uint64_t span) {
+#ifdef __linux__
+    /* Linux aliases only shared pages (mremap with old size 0): host storage is shared anonymous memory */
+    void *p = mmap(NULL, span, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) { LOG("【红】vpool: mmap(%#llx) failed", (unsigned long long)span); return NULL; }
+    return p;
+#endif
     mach_vm_address_t a = 0;
     kern_return_t kr = mach_vm_allocate(mach_task_self(), &a, span, VM_FLAGS_ANYWHERE);
     if (kr != KERN_SUCCESS) { LOG("【红】vpool: mach_vm_allocate(%#llx) failed kr=%d", span, kr); return NULL; }

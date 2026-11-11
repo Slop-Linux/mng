@@ -14,6 +14,11 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __linux__
+#define SEND_FLAGS MSG_NOSIGNAL   // Linux has no SO_NOSIGPIPE: a closed streamer must not raise SIGPIPE
+#else
+#define SEND_FLAGS 0
+#endif
 
 enum {
     MSG_HELLO = 1, MSG_HELLO_ACK = 2, MSG_CREATE_SWAPCHAIN = 3, MSG_SWAPCHAIN_ACK = 4, MSG_DESTROY_SWAPCHAIN = 5,
@@ -45,7 +50,7 @@ static void fail(char *err, size_t n, const char *fmt, ...) {
 
 static int write_all(int fd, const void *p, size_t n) {
     const uint8_t *b = p;
-    while (n) { ssize_t w = send(fd, b, n, 0); if (w < 0 && errno == EINTR) continue; if (w <= 0) return -1; b += w; n -= (size_t)w; }
+    while (n) { ssize_t w = send(fd, b, n, SEND_FLAGS); if (w < 0 && errno == EINTR) continue; if (w <= 0) return -1; b += w; n -= (size_t)w; }
     return 0;
 }
 static int read_all(int fd, void *p, size_t n) {
@@ -172,7 +177,9 @@ int vr_link_open(const char *path, const char *renderer, char *err, size_t en) {
     struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons((uint16_t)port), .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
     if (connect(fd, (struct sockaddr *)&a, sizeof a)) { fail(err, en, "connect 127.0.0.1:%d: %s", port, strerror(errno)); close(fd); return -1; }
     int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+#ifdef __APPLE__
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
 
     uint8_t hb[256]; wbuf b = { hb, 0, sizeof hb };
     const char *r = renderer ? renderer : ""; uint16_t rl = (uint16_t)strnlen(r, 128);

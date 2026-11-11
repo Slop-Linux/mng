@@ -3,8 +3,8 @@
    (block-linear deswizzled on the CPU, nvn_deswizzle.c) on first use and again whenever the CPU wrote that memory since
    (nvn_dirty.c write tracking), and from the GPU when it is rendered or copied into. All images stay in GENERAL layout. */
 #include "vk.h"
-#include "../../../third_party/d2r_gfx/gfx/nvn/nvn_dirty.h"
-#include "../../../third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h"
+#include "d2r_gfx/gfx/nvn/nvn_dirty.h"
+#include "d2r_gfx/gfx/tex/nvn_deswizzle.h"
 
 /* ---------- formats ---------- */
 #define F(v) {v, 0, 0, 0, 1, 1, 0, 0, 0, 0}

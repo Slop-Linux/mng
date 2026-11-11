@@ -4,7 +4,9 @@
    English under the iOS app's own Chinese text (2026-10-23). TOTK_UI_LANG=zh or en overrides it (read on every call, so tests can
    switch). The game's own language is chosen separately (TOTK_LANG, services.c desired_language). */
 #pragma once
+#ifndef __linux__
 #include <CoreFoundation/CoreFoundation.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -14,10 +16,15 @@ static inline int totk_ui_zh(void) {
     static int system_zh = -1;
     if (system_zh < 0) {
         char language[16] = {0};
+#ifdef __linux__
+        const char *l = getenv("LANGUAGE"); if (!l || !*l) l = getenv("LC_ALL"); if (!l || !*l) l = getenv("LC_MESSAGES"); if (!l || !*l) l = getenv("LANG");
+        if (l) strncpy(language, l, sizeof language - 1);
+#else
         CFArrayRef preferred = CFLocaleCopyPreferredLanguages();
         if (preferred && CFArrayGetCount(preferred) > 0)
             CFStringGetCString((CFStringRef)CFArrayGetValueAtIndex(preferred, 0), language, sizeof language, kCFStringEncodingUTF8);
         if (preferred) CFRelease(preferred);
+#endif
         system_zh = !strncmp(language, "zh", 2);
     }
     return system_zh;

@@ -1,5 +1,6 @@
 /* Horizon services reached by the current TOTK startup. Unknown operations fail. */
 #include "runtime.h"
+#include "host_tp.h"
 #include <TargetConditionals.h>
 #include "ipc.h"
 #include <mach/mach.h>
@@ -119,10 +120,38 @@ static uint64_t app_pool(void){static uint64_t v;if(!v){const char *e=getenv("TO
 #else
 #define ASLR_SIZE (GUEST_ADDRESS_LIMIT-(uintptr_t)low_space)
 #endif
+#ifdef __linux__
+/* Linux: guest RAM is shared memory, one memfd per reservation, so a virtual memory pool can map its pages a second time
+   (totk_vpool.c: mremap of shared pages); a decommitted page becomes a punched hole. */
+#include <fcntl.h>
+#include <linux/falloc.h>
+typedef struct{uintptr_t base;uint64_t size;int fd;}GuestBacking;
+static GuestBacking backing[8];static unsigned nbacking;
+static uint8_t *reserve_fixed(uint64_t at,uint64_t size){
+ int fd=memfd_create("guest-ram",MFD_CLOEXEC);if(fd<0)return NULL;
+ if(ftruncate(fd,(off_t)size)){close(fd);return NULL;}
+ void *p=mmap((void *)(uintptr_t)at,size,PROT_NONE,MAP_SHARED|MAP_FIXED_NOREPLACE|MAP_NORESERVE,fd,0);
+ if(p==MAP_FAILED||p!=(void *)(uintptr_t)at){if(p!=MAP_FAILED)munmap(p,size);close(fd);return NULL;}
+ if(nbacking==sizeof backing/sizeof *backing)runtime_fail("guest memory backing table");
+ backing[nbacking++]=(GuestBacking){(uintptr_t)at,size,fd};return p;
+}
+static void release_region(uint8_t *p,uint64_t size){
+ for(unsigned i=0;i<nbacking;i++)if(backing[i].base==(uintptr_t)p){close(backing[i].fd);backing[i]=backing[--nbacking];break;}
+ munmap(p,size);
+}
+static void decommit_page(uintptr_t page,uint64_t n){
+ for(unsigned i=0;i<nbacking;i++)if(page>=backing[i].base&&page+n<=backing[i].base+backing[i].size){
+  if(fallocate(backing[i].fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,(off_t)(page-backing[i].base),(off_t)n))runtime_fail("decommit guest page");
+  if(mprotect((void *)page,n,PROT_NONE))runtime_fail("decommit guest page");return;}
+ runtime_fail("decommit outside guest memory");
+}
+#else
+static void release_region(uint8_t *p,uint64_t size){mach_vm_deallocate(mach_task_self(),(mach_vm_address_t)(uintptr_t)p,size);}
 static uint8_t *reserve_fixed(uint64_t at,uint64_t size){
  mach_vm_address_t a=at;   /* FIXED without OVERWRITE: fails instead of replacing an existing mapping */
  return mach_vm_map(mach_task_self(),&a,size,0,VM_FLAGS_FIXED,MEMORY_OBJECT_NULL,0,FALSE,VM_PROT_NONE,VM_PROT_ALL,VM_INHERIT_DEFAULT)==KERN_SUCCESS?(uint8_t *)(uintptr_t)a:NULL;
 }
+#endif
 #define GUEST_ALIGN (2ULL<<20)
 /* Reserve size bytes in a free gap (2 MiB aligned). The end of the map is
    not reported, so the last gap is only tried; FIXED fails there with KERN_NO_SPACE when it reaches past the end. */
@@ -172,6 +201,7 @@ static uint8_t *reserve_in_gap(uint64_t size,int log){
 #include <malloc/malloc.h>
 #include <pthread.h>
 void mtl_mem_classes(uint64_t *allocated, uint64_t *storage, uint64_t *storage_n);
+#ifndef __linux__
 typedef struct { uint64_t dirty, compressed, resident; } mc_bytes;
 static void mc_walk(uint64_t lo, uint64_t hi, mc_bytes *range, mc_bytes *tags) {
  mach_vm_address_t addr=lo;natural_t depth=0;uint64_t page=vm_page_size;
@@ -223,6 +253,10 @@ static void mem_classes_start(void) {
  pthread_t t;if(!pthread_create(&t,NULL,mc_thread,(void *)(uintptr_t)every))pthread_detach(t);
  fprintf(stderr,"[mem-classes] on: a line every %u s and at each 100 MB step under 600 MB left (OOT_MEM_CLASSES)\n",every);
 }
+#else
+/* OOT_MEM_CLASSES reads Mach VM regions and ledgers; Linux has /proc/self/smaps for that instead */
+static void mem_classes_start(void) { const char *e=getenv("OOT_MEM_CLASSES");if(e&&*e&&strcmp(e,"0"))fprintf(stderr,"[mem-classes] Mach VM statistics: not on Linux\n"); }
+#endif
 static void heap_file_backing(void) {
  const char *e=getenv("TOTK_FILE_HEAP");
 #if TARGET_OS_IPHONE && defined(GAME_DKB)
@@ -262,7 +296,7 @@ static void memory_init(void) {
   /* macOS 27: the shared cache fills 0x1_8000_0000..0xF_C000_0000 and the system reserves ~24 GiB at a random place in
      0x70_0000_0000..2^39, so neither fixed region fits. As on iOS, put stack+heap and the alias region side by side in one
      free hole, shrinking the alias region (the game uses < 3 GiB of it) until it fits. TOTK_ALIAS_GIB pins one size. */
-  if(alias_space)mach_vm_deallocate(mach_task_self(),(mach_vm_address_t)(uintptr_t)alias_space,ALIAS_SIZE);
+  if(alias_space)release_region(alias_space,ALIAS_SIZE);
   alias_space=NULL;
   uint64_t want=alias_requested(),least=getenv("TOTK_ALIAS_GIB")?want:(8ULL<<30);
   for(uint64_t g=want;!low_space;g-=4ULL<<30){
@@ -282,7 +316,7 @@ static void memory_init(void) {
     uint8_t *separate_low=reserve_in_gap(LOW_SIZE,0);
     if(separate_low){
      if((alias_space=reserve_in_gap_from(g,0,(uintptr_t)separate_low+LOW_SIZE))){low_space=separate_low;alias_len=g;break;}
-     mach_vm_deallocate(mach_task_self(),(mach_vm_address_t)(uintptr_t)separate_low,LOW_SIZE);
+     release_region(separate_low,LOW_SIZE);
     }
     if(g<least+(4ULL<<30))break;
    }
@@ -521,7 +555,11 @@ static uint64_t alias_map(int unmap,uint64_t addr,uint64_t size){
   uint64_t low=addr&~0x3fffULL,high=(addr+size+0x3fff)&~0x3fffULL;
   for(uint64_t page=low;page<high;page+=0x4000){unsigned p=(unsigned)((page-start)/4096);if(!alias_pages[p]&&!alias_pages[p+1]&&!alias_pages[p+2]&&!alias_pages[p+3]){
    if(gf_alias_release(page))continue;   /* iOS, the game in files: PROT_NONE, punched by the sweep */
+#ifdef __linux__
+   decommit_page(page,0x4000);
+#else
    if(mmap((void *)page,0x4000,PROT_NONE,MAP_FIXED|MAP_PRIVATE|MAP_ANON,-1,0)!=(void *)page)runtime_fail("decommit physical alias page");
+#endif
    memset(alias_stale+p,0,4);}}
  }else if(fresh){
   uint64_t low=addr&~0x3fffULL,high=(addr+size+0x3fff)&~0x3fffULL;
@@ -623,6 +661,13 @@ static uint64_t desired_language(void) {
     if(k==4&&!script[0]&&isalpha((unsigned char)p[0])&&isalpha((unsigned char)p[3])){for(size_t i=0;i<4;i++)script[i]=(char)(i?tolower((unsigned char)p[i]):toupper((unsigned char)p[i]));}
     p+=k;}
   } else {
+#ifdef __linux__
+   /* LC_ALL / LC_MESSAGES / LANG: language[_REGION][.charset][@modifier] */
+   const char *env=getenv("LC_ALL");if(!env||!*env)env=getenv("LC_MESSAGES");if(!env||!*env)env=getenv("LANG");if(!env)env="";
+   size_t n=strcspn(env,"_.@-");if(n<sizeof(language))memcpy(language,env,n);
+   if(env[n]=='_'||env[n]=='-'){const char *r=env+n+1;size_t k=strcspn(r,".@");if(k==2){region[0]=(char)toupper((unsigned char)r[0]);region[1]=(char)toupper((unsigned char)r[1]);}}
+   if(!strcmp(language,"C")||!strcmp(language,"POSIX"))strcpy(language,"en");
+#else
    CFLocaleRef locale=CFLocaleCopyCurrent();
    CFStringRef value=CFLocaleGetValue(locale,kCFLocaleLanguageCode);
    if(value)CFStringGetCString(value,language,sizeof(language),kCFStringEncodingUTF8);
@@ -630,6 +675,7 @@ static uint64_t desired_language(void) {
    if(value)CFStringGetCString(value,script,sizeof(script),kCFStringEncodingUTF8);
    value=CFLocaleGetValue(locale,kCFLocaleCountryCode);
    if(value)CFStringGetCString(value,region,sizeof(region),kCFStringEncodingUTF8);CFRelease(locale);
+#endif
   }
 #if defined(TOTK_GAME_V143) || defined(GAME_BOTW190)
   const int brazil=1;
@@ -800,7 +846,7 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
  /* SynchronizePreemptionState: the SDK calls it after clearing ThreadLocalRegion disable_count (+0x100) when interrupt_flag
     (+0x102) was set by a preemption that had to wait (threads.c totk_preempt_signal). The switch itself happened at this
     SVC's entry (runtime_core_checkpoint); here the flag is cleared, as Horizon does. */
- case 0x36:{volatile uint16_t *tlr=pthread_getspecific(runtime_keys[2]);if(tlr)tlr[0x102/2]=0;r[0]=0;return 0;}
+ case 0x36:{volatile uint16_t *tlr=runtime_slot_get(2);if(tlr)tlr[0x102/2]=0;r[0]=0;return 0;}
  case 0x26: {uint32_t result=0;if(r[1]&&r[2]>=4)memcpy(&result,(void *)(uintptr_t)r[1],4);fprintf(stderr,"[totk] guest Break reason=%llx result=%x\n",(unsigned long long)r[0],result);runtime_trace_guest(r[29],r[30]);if(r[0]&0x80000000ULL)return 0;runtime_fail("original SDK Break");}
  case 0x27: {size_t n=r[1];if(n>65536)runtime_fail("debug string too long");fwrite((void *)(uintptr_t)r[0],1,n,stderr);r[0]=0;return 0;}
  case 0x0b:{int64_t ns=(int64_t)r[0];if(ns>0){struct timespec t={ns/1000000000,ns%1000000000};nanosleep(&t,NULL);}r[0]=0;return 0;}

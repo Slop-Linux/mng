@@ -6,7 +6,9 @@
 // before use, check the write generation of the covered pages and re-upload if newer than at upload time. NVN semantics: a texture descriptor points to pool memory, and the GPU reads the current content every time
 // (measured: the game writes streamed assets into texture storage that is still being sampled, without re-registering).
 // Signal handler constraint: the page-fault path uses only atomic operations and mprotect, no allocation, no locks.
+#include "host_context.h"
 #include "nvn_dirty.h"
+#include "host_context.h"
 #include "../../host/dm.h"
 #include <stdatomic.h>
 #include <pthread.h>
@@ -211,7 +213,7 @@ static int on_fault(void *addr, int is_write, void *uc) {
     range_t *r = (is_write || g_nr_active) ? find((uintptr_t)addr) : NULL;
     if (!r) return 0;
     uintptr_t p = ((uintptr_t)addr - r->base) >> g_shift;
-    uint64_t pc = uc ? ((ucontext_t *)uc)->uc_mcontext->__ss.__pc : 0;
+    uint64_t pc = uc ? ((ucontext_t *)uc)->UC_PC : 0;
     if (r->nr && g_nr_active) {   // OOT_NOREAD_PROBE: a page the GPU wrote last frame is inaccessible until its first CPU access
         int was = atomic_exchange(&r->nr[p], 0);   // 1: this is that first access (record it); 0: another thread took it (or an ordinary write fault)
         uint8_t st = atomic_load(&r->state[p]); if (st == PG_BUSY) { busy_wait(r, p); st = atomic_load(&r->state[p]); }
@@ -224,7 +226,7 @@ static int on_fault(void *addr, int is_write, void *uc) {
     rd_check(r, p, 0, pc, 0, (uintptr_t)addr);   // OOT: a pending GPU reader of this page -> this write waits for its submission to complete
     uint8_t st = PG_PROT;
     if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) { unprotect_page(r, p); atomic_fetch_add(&g_faults, 1);
-        if (g_drec_on && uc) { _STRUCT_MCONTEXT64 *mc = ((ucontext_t *)uc)->uc_mcontext; drec_add(r->base + (p << g_shift), mc->__ss.__pc, mc->__ss.__lr, 0); }
+        if (g_drec_on && uc) { ucontext_t *u = uc; drec_add(r->base + (p << g_shift), u->UC_PC, u->UC_LR, 0); }
         return 1; }
     if (st == PG_BUSY) return busy_wait(r, p);   // 别的线程正在改这页的保护：等它改完重执行（改成了只读就再缺页一次、走上面那一支） | Another thread is changing this page's protection: wait for it to finish and re-execute (if it became read-only, it faults once more and takes the branch above)
     return atomic_load(&r->gen[p]) != 0;   // 刚被别的线程解掉（本次缺页发生在解之前）：重执行；从未保护过的页不是我们的 | Just unprotected by another thread (this fault happened before the unprotect): re-execute; pages that were never protected are not ours

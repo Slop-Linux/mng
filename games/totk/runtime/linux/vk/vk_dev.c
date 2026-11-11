@@ -525,6 +525,7 @@ int vk_oneshot_after(VkCommandBuffer cb, uint64_t after) {
     return 1;
 }
 uint64_t mtl_last_fence(void) { return atomic_load(&g_submitted); }
+uint64_t vk_open_fence(void) { vk_sub_open(); return g_open->fence; }   /* the fence the submission being recorded will signal */
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     if (atomic_load(&g_applied) >= fence) return 1;
     if (!timeout_ns) return 0;
@@ -584,6 +585,7 @@ static pthread_mutex_t g_shot_mu = PTHREAD_MUTEX_INITIALIZER; static char g_shot
 static uint64_t g_presents;
 void dm_gfx_shot_at(long frames, const char *path) { pthread_mutex_lock(&g_shot_mu); snprintf(g_shot_path, sizeof g_shot_path, "%s", path); g_shot_at = (long)g_presents + frames; pthread_mutex_unlock(&g_shot_mu); }
 void dm_gfx_ashot(const char *path) { dm_gfx_shot_at(1, path); }
+void dm_gfx_ashot_at(const char *path, long k) { dm_gfx_shot_at(k > 0 ? k : 1, path); }   /* one pending shot: "ashotn" keeps its last frame */
 void dm_gfx_window_shot(const char *path) { dm_gfx_shot_at(1, path); }
 static void shot(VkImage img, uint32_t w, uint32_t h, VkFormat fmt, uint64_t n) {
     static const char *spec; static long at = -1; static int init;

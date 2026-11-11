@@ -10,7 +10,7 @@ DEFS := $(GAME_DEFS_$(VERSION))
 OPT ?= -O2
 PKGS := opus vpx sdl3 vulkan openssl
 CFLAGS = -std=gnu11 $(OPT) -g -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-missing-field-initializers -Wno-sign-compare \
-  -fno-strict-aliasing -D_GNU_SOURCE $(DEFS) $(BACKEND) -Iruntime/linux/include -include darwin_compat.h -Ithird_party/d2r_gfx/gfx/nvn/include -Ibuild \
+  -fno-strict-aliasing -D_GNU_SOURCE $(DEFS) $(BACKEND) -Iruntime/linux/include -include darwin_compat.h -Ithird_party/d2r_gfx/gfx/nvn/include -Ithird_party -I. -Ibuild \
   $(shell pkg-config --cflags $(PKGS)) -I$(shell pkg-config --variable=includedir opus)/opus
 LIBS := $(shell pkg-config --libs $(PKGS)) -lpthread -lm -ldl
 RUNTIME := loader game_data game_patches_botw aoc_romfs settings_service world_survey game_slot services romfs threads hle_stack \

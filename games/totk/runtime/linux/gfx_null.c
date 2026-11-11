@@ -2,9 +2,9 @@
    counter records, buffer copies, inline uniform updates) are applied in command order when it is committed, so the game's
    waits on syncs, events and queries complete; draws, dispatches and texture work are recorded and dropped. Counted with
    TOTK_NULL_STATS=1 (per op, logged every 600 presents). */
-#include "../../third_party/d2r_gfx/gfx/nvn/nvn_obj.h"
-#include "../../third_party/d2r_gfx/gfx/nvn/nvn_mtl.h"
-#include "../../third_party/d2r_gfx/host/dm.h"
+#include "d2r_gfx/gfx/nvn/nvn_obj.h"
+#include "d2r_gfx/gfx/nvn/nvn_mtl.h"
+#include "d2r_gfx/host/dm.h"
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdatomic.h>

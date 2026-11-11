@@ -2,7 +2,7 @@
    graphics backend's (SDL3 + Vulkan); without one (null backend, TOTK_HEADLESS) the native window is a token and the
    vsync event ticks at 60 Hz from a host thread. */
 #include "runtime.h"
-#include "../../third_party/d2r_gfx/host/front.h"
+#include "d2r_gfx/host/front.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -131,8 +131,9 @@ void runtime_vr_resolution_probe(void) { fprintf(stderr, "[totk] probe-vr-resolu
 /* The prompt icon atlases (totk_prompt_icons.m) are Metal textures this backend never registers. */
 void totk_prompt_remove_pool(const void *memory, size_t size) { (void)memory; (void)size; }
 /* zeldaVR/gfx/totk_vr.m without a headset streamer (its !TARGET_OS_OSX branch): the camera hook's state and the eye distance. */
-#include "../../zeldaVR/runtime/vr_camera.h"
+#include "zeldaVR/runtime/vr_camera.h"
 vr_cam_state *g_vr_headlook;
 void vr_camera_control_read(vr_cam_state *out) { memset(out, 0, sizeof *out); }
 int vr_ipd_pct(void) { return 100; }
+void vr_b2_present_eye(int eye) { (void)eye; }
 void runtime_vpool_probe(void) { fprintf(stderr, "[totk] probe-vpool: Metal-only\n"); exit(2); }
