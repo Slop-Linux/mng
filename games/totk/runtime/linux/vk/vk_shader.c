@@ -203,6 +203,7 @@ static vshader *load(const char *dir, const char *variant, int stage, const uint
         vk_rbind b = {0}; int set, binding;
         if (!strncmp(line, "cbuf ", 5) && sscanf(line + 5, "%d %d %d", &set, &binding, &b.slot) == 3) b.kind = RB_CBUF;
         else if (!strncmp(line, "sbuf ", 5) && sscanf(line + 5, "%d %d %d %d %d %d", &set, &binding, &b.slot, &b.cb_slot, &b.cb_off, &b.flags) == 6) b.kind = RB_SBUF;
+        else if (!strncmp(line, "mesh ", 5)) { sscanf(line + 5, "%d %*d %d", &s->mesh_kind, &s->mesh_task); continue; }
         else if ((!strncmp(line, "tex ", 4) || !strncmp(line, "img ", 4)) &&
                  sscanf(line + 4, "%d %d %d %d %d %d %d %d %d", &set, &binding, &b.stype, &b.cbuf_slot, &b.handle, &b.array, &b.separate, &b.flags, &b.format) == 9) b.kind = line[0] == 't' ? RB_TEX : RB_IMG;
         else continue;
@@ -236,8 +237,8 @@ static vshader *load(const char *dir, const char *variant, int stage, const uint
     memset(arena_cpu + off, 0, bi.size); if (c1_len) memcpy(arena_cpu + off, c1, c1_len);
     s->c1_len = c1_len;
     /* layout of this stage's set: its bindings (vertex / compute: set 0 with Ryujinx's support buffer at binding 0) */
-    VkDescriptorSetLayoutBinding lb[128]; int nl = 0; int set = stage == 1 ? 1 : 0;
-    if (set == 0) lb[nl++] = (VkDescriptorSetLayoutBinding){0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_ALL, NULL};
+    VkDescriptorSetLayoutBinding lb[128]; int nl = 0; int set = stage == 1 ? 1 : stage == 3 ? 3 : 0;   /* task: set 3 (draw_mesh) */
+    if (set == 0 || set == 3) lb[nl++] = (VkDescriptorSetLayoutBinding){0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_ALL, NULL};
     for (int i = 0; i < s->nb && nl < 128; i++) {
         if (s->b[i].set != set) { VKLOG("【红】%s: binding %u in set %u, expected %d", variant, s->b[i].binding, s->b[i].set, set); continue; }
         lb[nl++] = (VkDescriptorSetLayoutBinding){s->b[i].binding, desc_type(&s->b[i]), (uint32_t)s->b[i].array, VK_SHADER_STAGE_ALL, NULL};

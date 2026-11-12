@@ -36,6 +36,7 @@ typedef struct {
     PFN_vkCmdSetLineRasterizationModeEXT CmdSetLineRasterizationModeEXT;
     PFN_vkCmdSetDepthClipEnableEXT CmdSetDepthClipEnableEXT;
     PFN_vkCmdSetProvokingVertexModeEXT CmdSetProvokingVertexModeEXT;
+    PFN_vkCmdDrawMeshTasksEXT CmdDrawMeshTasksEXT; PFN_vkCmdDrawMeshTasksIndirectEXT CmdDrawMeshTasksIndirectEXT;
     PFN_vkCmdPushDescriptorSetKHR CmdPushDescriptorSetKHR;
     PFN_vkGetMemoryHostPointerPropertiesEXT GetMemoryHostPointerPropertiesEXT;
 } vk_ctx;
@@ -121,6 +122,7 @@ typedef struct vshader {
     char fout[8], attr[16];    /* each fragment output's / vertex input's class as translated ('f' / 'u' / 's', 0 none) */
     struct vshader *rt_next; uint32_t rt_key;   /* the variant retyped to other targets / vertex formats (vk_retype.c), by their classes */
     int pool;                  /* reads the NVN2 descriptor pools (vk_pool.c): its pipeline layouts have set VK_POOL_SET */
+    int mesh_kind, mesh_task;  /* vk.txt "mesh": 1 task, 2 mesh shader (MeshSpirv.cs); a mesh shader reading a task payload */
 } vshader;
 /* the bound state's answers, as the translation request names them (NULL: not answered) */
 typedef struct { const char *tex[128], *img_type[32], *img_fmt[32], *attr[16], *fout[8]; } vk_answers;

@@ -416,9 +416,17 @@ static partial class ShaderService
         {
             // <variant>.spv and <variant>.res.json (bindings with their Maxwell constant-buffer slots, storage-buffer address
             // words and texture handles); FP64 is lowered, the device has no shaderFloat64
-            job["set"] = stage == "ps" ? 1 : 0;
+            job["set"] = stage == "ps" ? 1 : stage == "ts" ? 3 : 0;   // task: set 3 beside the mesh stage's set 0 (vk_replay.c draw_mesh)
             job["softfloat64"] = true;
             Translate(job);
+            if (mesh)
+            {
+                // the compute translation as a Vulkan task / mesh shader (MeshSpirv.cs); vk.txt says which, its thread count and
+                // whether a mesh shader reads a task payload (vk_replay.c draw_mesh)
+                string spvPath = Path.Combine(outDir, variant + ".spv"), txt = Path.Combine(outDir, variant + ".vk.txt");
+                File.WriteAllBytes(spvPath, MeshSpirv.Convert(File.ReadAllBytes(spvPath), meshInfo, Truthy(Get(rq, "depth_minus_w"))));
+                File.AppendAllText(txt, $"mesh {(stage == "ts" ? 1 : 2)} {meshInfo.Threads} {(meshInfo.Task ? 1 : 0)} {meshInfo.MaxV} {meshInfo.MaxP} {meshInfo.Primitive.Count}\n");
+            }
             return;
         }
         Translate(job);

@@ -488,9 +488,11 @@ static pair_t *g_pairs[1024];
 typedef struct comp_t { vshader *cs; VkShaderEXT sh; VkPipelineLayout pl; struct comp_t *next; } comp_t;
 static uint64_t g_mk[2];   /* shader objects created, ns (long-frame log) */
 static comp_t *g_comps[256];
-static VkShaderEXT make_shader(vshader *s, VkShaderStageFlagBits stage, VkShaderStageFlags next, VkDescriptorSetLayout *layouts, int nl) {
-    VkShaderCreateInfoEXT ci = {.sType = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT, .stage = stage, .nextStage = next, .codeType = VK_SHADER_CODE_TYPE_SPIRV_EXT,
-        .codeSize = s->nwords * 4, .pCode = s->spv, .pName = "main", .setLayoutCount = (uint32_t)nl, .pSetLayouts = layouts};
+static VkShaderEXT make_shader_ex(vshader *s, VkShaderStageFlagBits stage, VkShaderStageFlags next, VkDescriptorSetLayout *layouts, int nl, const VkPushConstantRange *pc, VkShaderCreateFlagsEXT flags);
+static VkShaderEXT make_shader(vshader *s, VkShaderStageFlagBits stage, VkShaderStageFlags next, VkDescriptorSetLayout *layouts, int nl) { return make_shader_ex(s, stage, next, layouts, nl, NULL, 0); }
+static VkShaderEXT make_shader_ex(vshader *s, VkShaderStageFlagBits stage, VkShaderStageFlags next, VkDescriptorSetLayout *layouts, int nl, const VkPushConstantRange *pc, VkShaderCreateFlagsEXT flags) {
+    VkShaderCreateInfoEXT ci = {.sType = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT, .flags = flags, .stage = stage, .nextStage = next, .codeType = VK_SHADER_CODE_TYPE_SPIRV_EXT,
+        .codeSize = s->nwords * 4, .pCode = s->spv, .pName = "main", .setLayoutCount = (uint32_t)nl, .pSetLayouts = layouts, .pushConstantRangeCount = pc ? 1 : 0, .pPushConstantRanges = pc};
     uint64_t t0_ = clock_gettime_nsec_np(CLOCK_MONOTONIC); VkShaderEXT o; VkResult r = V.CreateShadersEXT(V.dev, 1, &ci, NULL, &o); g_mk[0]++; g_mk[1] += clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0_;
     if (r != VK_SUCCESS) { VKLOG("【红】shader %s (stage %d) did not compile: %d", s->key, s->stage, r); return VK_NULL_HANDLE; }
     return o;
@@ -559,7 +561,7 @@ static VkBuffer g_cs_bank_buf; static VkDeviceSize g_cs_bank_off;   /* the compu
 static void driver_bank(uint8_t *d, int bank, int stage) {
     memset(d, 0, 0xA00);
     if (bank == 0) {
-        int base = stage == 0 ? 0x110 : stage == 5 ? 0x310 : 0x510;
+        int base = stage == 0 ? 0x110 : stage == 5 ? 0x310 : stage == 3 ? 0x670 : stage == 4 ? 0x770 : 0x510;   /* task 0x670, mesh 0x770 (nvn_mtl.m driver_bank_fill) */
         for (int r = 0; r < 16; r++) { uint64_t a = S.ssbo[stage][r].addr; uint32_t n = (uint32_t)S.ssbo[stage][r].size; memcpy(d + base + 16 * r, &a, 8); memcpy(d + base + 16 * r + 8, &n, 4); }
         if (stage == 5) { memcpy(d + 0x200, g_grid, 12); memcpy(d + 4, g_grid, 12);   /* the group counts: NVN at 0x200, NVN2 at 4 (nvn_mtl.m driver_bank_fill) */
             for (int r = 0; r < 16; r++) { uint64_t a = S.ubo[5][r].addr; uint32_t n = (uint32_t)S.ubo[5][r].size; memcpy(d + 0x210 + 16 * r, &a, 8); memcpy(d + 0x210 + 16 * r + 8, &n, 4); } }
@@ -611,7 +613,7 @@ static int g_fbp_bind[8], g_fbp_att[8], g_nfbp, g_fb_bad;   /* fragment stage: t
 static VkDescriptorSet stage_set(vshader *s, int stage, int set, VkDescriptorSetLayout layout) {
     VkWriteDescriptorSet w[MAXW]; VkDescriptorBufferInfo bi[MAXW]; VkDescriptorImageInfo ii[MAXW]; VkBufferView tb[MAXW]; int nw = 0, nb = 0, ni = 0, nt = 0;
     VkDescriptorSet ds = dset_alloc(layout);
-    if (set == 0) { bi[nb] = (VkDescriptorBufferInfo){g_support, 0, 4096}; w[nw++] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[nb++]}; }
+    if (set == 0 || set == 3) { bi[nb] = (VkDescriptorBufferInfo){g_support, 0, 4096}; w[nw++] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[nb++]}; }
     for (int i = 0; i < s->nb && nw < MAXW - 1; i++) {
         const vk_rbind *b = &s->b[i];
         if (b->set != set) continue;
@@ -637,7 +639,7 @@ static VkDescriptorSet stage_set(vshader *s, int stage, int set, VkDescriptorSet
         } else if (b->kind == RB_SBUF) {
             uint64_t addr = 0, size = 0; int off = b->cb_off * 4;
             if (b->cb_slot == 0) {
-                int base = stage == 0 ? 0x110 : stage == 5 ? 0x310 : 0x510;
+                int base = stage == 0 ? 0x110 : stage == 5 ? 0x310 : stage == 3 ? 0x670 : stage == 4 ? 0x770 : 0x510;   /* task 0x670, mesh 0x770 (nvn_mtl.m driver_bank_fill) */
                 if (stage == 5 && off >= 0x210 && off < 0x310) { const p_bind_buf *u = &S.ubo[5][(off - 0x210) / 16]; addr = u->addr; size = u->size; }
                 else if (off >= base && off < base + 0x100) { const p_bind_buf *u = &S.ssbo[stage][(off - base) / 16]; addr = u->addr; size = u->size; }
             } else if (b->cb_slot >= 3 && b->cb_slot <= 18) {
@@ -972,8 +974,120 @@ static void pp_note(vshader *vs, vshader *fs) {
 #ifdef GAME_OOT
 static void nb_note_draw(void);
 #endif
+#ifdef GAME_NS2
+/* ---------- NVN2 task / mesh draws (nvnCommandBufferDrawMeshTasks[Indirect]; nvn_mesh_tasks.inc) ----------
+   The translator turned the stages into Vulkan task / mesh shaders (MeshSpirv.cs): the mesh shader's resources in set 0,
+   the fragment shader's in set 1, the pools in set 2, the task shader's in set 3; the draw's first workgroup in a push
+   constant. */
+typedef struct mpair_t { vshader *ts, *ms, *fs; VkShaderEXT sh[3]; VkPipelineLayout pl; int pool; struct mpair_t *next; } mpair_t;
+static mpair_t *g_mpairs[256];
+static const VkPushConstantRange g_mesh_pc = {VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT, 0, 4};
+static mpair_t *mpair_get(vshader *ts, vshader *ms, vshader *fs) {
+    unsigned h = (unsigned)(((uintptr_t)ms >> 4) ^ ((uintptr_t)fs >> 2) ^ ((uintptr_t)ts >> 6)) & 255;
+    for (mpair_t *p = g_mpairs[h]; p; p = p->next) if (p->ts == ts && p->ms == ms && p->fs == fs) return p;
+    mpair_t *p = calloc(1, sizeof *p); p->ts = ts; p->ms = ms; p->fs = fs;
+    p->pool = ms->pool || (fs && fs->pool) || (ts && ts->pool);
+    VkDescriptorSetLayout l[4] = {ms->layout, fs ? fs->layout : V.empty_layout, p->pool ? vk_pool_layout() : V.empty_layout, ts ? ts->layout : V.empty_layout};
+    VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 4, .pSetLayouts = l, .pushConstantRangeCount = 1, .pPushConstantRanges = &g_mesh_pc};
+    VKCHECK(vkCreatePipelineLayout(V.dev, &pli, NULL, &p->pl));
+    if (ts) p->sh[0] = make_shader_ex(ts, VK_SHADER_STAGE_TASK_BIT_EXT, VK_SHADER_STAGE_MESH_BIT_EXT, l, 4, &g_mesh_pc, 0);
+    p->sh[1] = make_shader_ex(ms, VK_SHADER_STAGE_MESH_BIT_EXT, fs ? VK_SHADER_STAGE_FRAGMENT_BIT : 0, l, 4, &g_mesh_pc, ts ? 0 : VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT);
+    if (fs) p->sh[2] = make_shader_ex(fs, VK_SHADER_STAGE_FRAGMENT_BIT, 0, l, 4, &g_mesh_pc, 0);
+    p->next = g_mpairs[h]; g_mpairs[h] = p; return p;
+}
+static uint64_t g_mesh_draws, g_mesh_indirect, g_mind_scans;
+/* Indirect mesh draws read {task count, first task} (the NV_mesh_shader ABI, nvn_mesh_tasks.inc); Vulkan wants {x, y, z}.
+   The copy that makes the grid cannot run inside a render pass, so at the first indirect mesh draw of a pass segment the
+   pass ends once and the records of every indirect mesh draw up to the op that ends the segment are converted together.
+   Their producers (compute) cannot run inside the pass, so the records are final by then. */
+typedef struct { uint64_t rec, pass; VkBuffer buf; VkDeviceSize off; uint32_t first; } mind_t;
+static mind_t g_mind[256]; static int g_nmind;
+static int mind_scan(const uint8_t *p, int depth) {   /* 0: the segment ends */
+    for (;;) {
+        op_hdr h; memcpy(&h, p, sizeof h); const void *a = p + 8;
+        switch (h.op) {
+            case OP_END: return 1;
+            case OP_JUMP: memcpy(&p, a, 8); continue;
+            case OP_CALL: { const uint8_t *t; memcpy(&t, a, 8); if (depth < 8 && !mind_scan(t, depth + 1)) return 0; break; }
+            case OP_DRAW: { const p_draw *d = a;
+                if (d->prim != 0x40 || !d->ind || g_nmind == 256) break;
+                int have = 0; for (int i = 0; i < g_nmind; i++) have |= g_mind[i].rec == d->ind && g_mind[i].pass == g_passes;
+                if (have) break;
+                VkBuffer ib; VkDeviceSize io;
+                if (!vk_pool_find(d->ind, 8, &ib, &io)) VKDIE("mesh indirect arguments %#llx are not in a pool", (unsigned long long)d->ind);
+                vk_span g = vk_ring(12, 16); uint32_t one[2] = {1, 1}; memcpy(g.cpu + 4, one, 8);
+                VkBufferCopy c = {io, g.off, 4}; vkCmdCopyBuffer(vk_cb(), ib, g.buf, 1, &c);
+                mind_t m = {d->ind, g_passes + 1, g.buf, g.off}; memcpy(&m.first, (const uint8_t *)(uintptr_t)d->ind + 4, 4);
+                g_mind[g_nmind++] = m; break; }
+            case OP_SET_RT: if (!same_rt(a, &S.rt)) return 0; break;
+            case OP_DISPATCH: case OP_COPY_B2B: case OP_COPY_B2T: case OP_COPY_T2B: case OP_COPY_T2T: case OP_CLEAR_TEX: case OP_CLEAR_BUF: return 0;
+            default: break;
+        }
+        p += h.size;
+    }
+}
+static const mind_t *mind_get(uint64_t rec) {
+    for (int i = 0; i < g_nmind; i++) if (g_mind[i].rec == rec && g_mind[i].pass == g_passes) return &g_mind[i];
+    return NULL;
+}
+static void draw_mesh(const p_draw *d) {
+    vshader *ts = stage_shader(3), *ms = stage_shader(4), *fs = stage_shader(1);
+    if (!ms || ms->mesh_kind != 2 || (ts && ts->mesh_kind != 1) || (ms->mesh_task && !ts)) { g_skips[2]++; return; }
+    if (!d->ind && d->count <= 0) return;
+    if (!pass_begin()) return;
+#ifdef GAME_OOT
+    nb_note_draw();
+#endif
+    VkDescriptorSet sets[4];
+    sets[0] = stage_set(ms, 4, 0, ms->layout);
+    sets[1] = fs ? stage_set(fs, 1, 1, fs->layout) : dset_alloc(V.empty_layout);
+    sets[3] = ts ? stage_set(ts, 3, 3, ts->layout) : dset_alloc(V.empty_layout);
+    mpair_t *p = mpair_get(ts, ms, fs);
+    if (!p->sh[1] || (fs && !p->sh[2]) || (ts && !p->sh[0])) { g_skips[3]++; return; }
+    if (p->pool) vk_pool_sync();
+    sets[2] = p->pool ? vk_pool_set() : dset_alloc(V.empty_layout);
+    if (!g_pass_open && !pass_begin()) return;
+    if (g_pclr_hit) { if (g_pass_recorded) { end_pass(6); pclr_flush(); if (!pass_begin()) return; } else pclr_flush(); }
+    if (g_pass_recorded && g_pass_nodepth && (S.ds.dt || S.ds.dw || S.ds.st)) { end_pass(5); if (!pass_begin()) return; }
+    pass_record();
+    VkCommandBuffer cb = vk_cb();
+    VkShaderStageFlagBits st[7] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_TASK_BIT_EXT, VK_SHADER_STAGE_MESH_BIT_EXT, VK_SHADER_STAGE_FRAGMENT_BIT};
+    VkShaderEXT sh[7] = {VK_NULL_HANDLE, p->sh[0], p->sh[1], p->sh[2]}; int ns = 4;
+    if (has_tess() & 1) { st[ns++] = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT; st[ns++] = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT; }
+    if (has_tess() & 2) st[ns++] = VK_SHADER_STAGE_GEOMETRY_BIT;
+    V.CmdBindShadersEXT(cb, (uint32_t)ns, st, sh);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pl, 0, 4, sets, 0, NULL);
+    g_dyn_hash[D_SHADERS] = g_dyn_hash[D_SETS] = 0;   /* the next vertex draw binds its own again */
+    set_dynamic(cb);
+    uint32_t first = (uint32_t)d->first;
+    if (d->ind) {
+        const mind_t *m = mind_get(d->ind);
+        if (!m) {   /* the segment's records, converted before the pass resumes */
+            end_pass(4); g_nmind = 0; g_mind_scans++;
+            mind_scan(g_op, 0); full_barrier();
+            if (!pass_begin()) return;
+            pass_record(); cb = vk_cb();
+            V.CmdBindShadersEXT(cb, (uint32_t)ns, st, sh); vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pl, 0, 4, sets, 0, NULL); set_dynamic(cb);
+            m = mind_get(d->ind);
+        }
+        first = m->first;
+        vkCmdPushConstants(cb, p->pl, g_mesh_pc.stageFlags, 0, 4, &first);
+        V.CmdDrawMeshTasksIndirectEXT(cb, m->buf, m->off, 1, 12);
+        if (!g_mesh_indirect++) VKLOG("[mesh] first indirect mesh draw (first task %u)", first);
+        if (first) { static int said; if (!said++) VKLOG("【红】[mesh] an indirect mesh draw starts at task %u (read on the CPU when its pass began)", first); }
+    } else {
+        vkCmdPushConstants(cb, p->pl, g_mesh_pc.stageFlags, 0, 4, &first);
+        V.CmdDrawMeshTasksEXT(cb, (uint32_t)d->count, 1, 1);
+    }
+    if (!g_mesh_draws++) VKLOG("[mesh] first mesh draw: %d workgroups from %u (%s, %d threads)", d->count, first, ts ? "task + mesh" : "mesh", ms->local[0]);
+    g_draws++; g_frame_draws++;
+}
+#endif
 static void draw(const p_draw *d, const p_draw_idx *di) {
     if (S.render_disabled) { g_skips[1]++; return; }
+#ifdef GAME_NS2
+    if (d && d->prim == 0x40) { draw_mesh(d); return; }   /* nvnCommandBufferDrawMeshTasks */
+#endif
     vshader *vs = stage_shader(0), *fs = stage_shader(1);
     if (!vs) { g_skips[2]++; g_q_skipped |= g_q_counting; return; }
     if (!pass_begin()) return;
@@ -1023,10 +1137,11 @@ static void draw(const p_draw *d, const p_draw_idx *di) {
     }
     prev_fb = g_feedback;
     VkCommandBuffer cb = vk_cb();
-    VkShaderStageFlagBits stages[5] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, VK_SHADER_STAGE_GEOMETRY_BIT};
-    VkShaderEXT sh[5] = {p->sh[0], fs ? p->sh[1] : VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkShaderStageFlagBits stages[7] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, VK_SHADER_STAGE_GEOMETRY_BIT};
+    VkShaderEXT sh[7] = {p->sh[0], fs ? p->sh[1] : VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
     int ns = 2 + ((has_tess() & 1) ? 2 : 0); if (has_tess() & 2) { stages[ns] = VK_SHADER_STAGE_GEOMETRY_BIT; sh[ns] = VK_NULL_HANDLE; ns++; }
     if (!(has_tess() & 1) && (has_tess() & 2)) { stages[2] = VK_SHADER_STAGE_GEOMETRY_BIT; }
+    stages[ns++] = VK_SHADER_STAGE_TASK_BIT_EXT; stages[ns++] = VK_SHADER_STAGE_MESH_BIT_EXT;   /* the task / mesh stages a mesh draw bound (draw_mesh) */
     if (dyn_changed(D_SHADERS, sh, sizeof sh)) V.CmdBindShadersEXT(cb, (uint32_t)ns, stages, sh);
     { uint64_t k_[3] = {(uint64_t)p->pl, (uint64_t)sets[0], (uint64_t)sets[1]}; if (dyn_changed(D_SETS, k_, sizeof k_)) vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pl, 0, 2, sets, 0, NULL); }
     if (p->pool) { vk_pool_sync(); VkDescriptorSet ps = vk_pool_set(); vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pl, VK_POOL_SET, 1, &ps, 0, NULL); }

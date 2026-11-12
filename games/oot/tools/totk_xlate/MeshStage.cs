@@ -88,6 +88,9 @@ sealed class MeshStage
         string path=Path.Combine(outDir,(string)rq["variant"]+".mesh.code");File.WriteAllBytes(path,code[0x80..]);job["code"]=path;
         job["local"]=new JsonArray(threads,1,1);job["shared"]=shared;job["stage_memory"]=new JsonArray(layout.Select(x=>(JsonNode)JsonValue.Create(x)).ToArray());
     }
+    // what MeshSpirv.cs exports (the Vulkan target)
+    public string Kind=>kind; public int Threads=>threads; public int Payload=>payload; public int MaxV=>maxV; public int MaxP=>maxP; public bool Task=>task;
+    public List<(int n,int c)> Vertex=>vertex; public List<(int n,int c)> Primitive=>primitive; public int[] Layout=>layout;
     public JsonObject Reflection()=>new(){["kind"]=kind,["threads"]=threads,["payload"]=payload,["task"]=task,["device"]=Device,["byte_stores"]=ByteStores};
     static List<string> Params(string t) {
         var r=new List<string>();int depth=0,at=0;

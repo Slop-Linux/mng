@@ -52,11 +52,13 @@ void vk_init(void) {
         VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
         VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME,
         VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,   /* float atomic add: NVN2 shaders (the translator's float views, patch 0029) */
+        VK_EXT_MESH_SHADER_EXTENSION_NAME,           /* NVN2 task / mesh stages (vk_replay.c draw_mesh) */
         VK_KHR_SWAPCHAIN_EXTENSION_NAME};   /* last: left out without a window */
     uint32_t ndext = sizeof dext / sizeof *dext - (g_surface ? 0 : 1);
     /* every feature the device has in these structures (the queried chain is the enabled one), minus robust buffer / image
        access (a cost the game does not need; null descriptors stay) */
-    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT af = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
+    VkPhysicalDeviceMeshShaderFeaturesEXT msf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT af = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT, .pNext = &msf};
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, .pNext = &af};
     VkPhysicalDeviceProvokingVertexFeaturesEXT pv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT, .pNext = &lr};
     VkPhysicalDeviceDepthClipEnableFeaturesEXT dce = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT, .pNext = &pv};
@@ -72,6 +74,8 @@ void vk_init(void) {
     VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f11};
     vkGetPhysicalDeviceFeatures2(V.phys, &f2);
     f2.features.robustBufferAccess = 0; rb2.robustBufferAccess2 = 0; rb2.robustImageAccess2 = 0; f13.robustImageAccess = 0;
+    msf.multiviewMeshShader = 0; msf.primitiveFragmentShadingRateMeshShader = 0;   /* they need features this device does not enable */
+    if (!msf.meshShader || !msf.taskShader) VKDIE("the device lacks task / mesh shaders");
     if (!so.shaderObject || !rb2.nullDescriptor || !vid.vertexInputDynamicState || !f13.dynamicRendering || !f12.timelineSemaphore) VKDIE("the device lacks shader objects, null descriptors, dynamic vertex input, dynamic rendering or timeline semaphores");
     VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f2, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .enabledExtensionCount = ndext, .ppEnabledExtensionNames = dext};
     VKCHECK(vkCreateDevice(V.phys, &dci, NULL, &V.dev));
@@ -80,7 +84,7 @@ void vk_init(void) {
     P(CmdSetVertexInputEXT); P(CreateShadersEXT); P(DestroyShaderEXT); P(CmdBindShadersEXT); P(CmdSetColorBlendEnableEXT); P(CmdSetColorBlendEquationEXT);
     P(CmdSetColorWriteMaskEXT); P(CmdSetPolygonModeEXT); P(CmdSetRasterizationSamplesEXT); P(CmdSetSampleMaskEXT); P(CmdSetAlphaToCoverageEnableEXT);
     P(CmdSetDepthClampEnableEXT); P(CmdSetLogicOpEnableEXT); P(CmdSetLogicOpEXT); P(CmdPushDescriptorSetKHR); P(GetMemoryHostPointerPropertiesEXT);
-    P(CmdSetTessellationDomainOriginEXT); P(CmdSetDepthClipEnableEXT); P(CmdSetProvokingVertexModeEXT);
+    P(CmdSetTessellationDomainOriginEXT); P(CmdSetDepthClipEnableEXT); P(CmdSetProvokingVertexModeEXT); P(CmdDrawMeshTasksEXT); P(CmdDrawMeshTasksIndirectEXT);
 #undef P
     VkSemaphoreTypeCreateInfo st = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
     VkSemaphoreCreateInfo sci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &st};

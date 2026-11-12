@@ -148,6 +148,9 @@ static vtex *tex_make(const tex_t *t) {
     if (ff & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;   /* decals read it in the tile (vk_fbread.c) */
     if (ff & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     if ((ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && v->samples == 1) u |= VK_IMAGE_USAGE_STORAGE_BIT;
+    /* g16 (vulkan-g16 rwd7kkndi2xn): a losslessly compressed colour image written by vkCmdCopyBufferToImage samples as flat
+       16x16 tiles (stale compression metadata; Ocarina's movie planes). Storage usage keeps the driver from compressing it. */
+    if ((ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && v->samples == 1) u |= VK_IMAGE_USAGE_STORAGE_BIT;
     /* no MUTABLE_FORMAT (the driver keeps such images uncompressed, as Metal does for PixelFormatView): an sRGB / linear pair
        gets it with a format list of the two; a view in another format recreates the image (tex_mutable) */
     VkFormat pair = fmt_pair(vf->vk); VkImageFormatListCreateInfo fl = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, .viewFormatCount = 2, .pViewFormats = (VkFormat[]){vf->vk, pair}};
