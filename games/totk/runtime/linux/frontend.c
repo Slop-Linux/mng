@@ -2,6 +2,11 @@
    graphics backend's (SDL3 + Vulkan); without one (null backend, TOTK_HEADLESS) the native window is a token and the
    vsync event ticks at 60 Hz from a host thread. */
 #include "runtime.h"
+#ifdef GAME_OOT
+#define GAME_WINDOW_TITLE "Ocarina of Time — Linux"
+#else
+#define GAME_WINDOW_TITLE "Breath of the Wild — Linux"
+#endif
 #include "d2r_gfx/host/front.h"
 #include <pthread.h>
 #include <stdatomic.h>
@@ -110,7 +115,7 @@ void runtime_front_run(void (*callback)(void)) {
         SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");   /* SIGTERM ends the process as without SDL */
         if (!SDL_Init(SDL_INIT_VIDEO)) runtime_fail("SDL video");
         int w = 1920, h = 1080; const char *e = getenv("TOTK_WINDOW_SIZE"); if (e) sscanf(e, "%dx%d", &w, &h);
-        vk_sdl_window = SDL_CreateWindow("Breath of the Wild — Linux", w, h, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);   /* buffers at the output's pixel size (fractional scale) */
+        vk_sdl_window = SDL_CreateWindow(GAME_WINDOW_TITLE, w, h, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);   /* buffers at the output's pixel size (fractional scale) */
         if (!vk_sdl_window) { fprintf(stderr, "[totk] SDL window: %s\n", SDL_GetError()); runtime_fail("window"); }
         pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 64u << 20);
         pthread_t th; if (pthread_create(&th, &a, game_thread, (void *)callback)) runtime_fail("game thread");
